@@ -1,13 +1,16 @@
-name: Build jar
+name: Build jars
 on:
   push:
   workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project: [radiant-alert, flabebe-alert]
     defaults:
       run:
-        working-directory: radiant-alert
+        working-directory: ${{ matrix.project }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -20,5 +23,5 @@ jobs:
       - run: gradle build
       - uses: actions/upload-artifact@v4
         with:
-          name: radiant-alert-jar
-          path: radiant-alert/build/libs/radiant-alert-*.jar
+          name: ${{ matrix.project }}-jar
+          path: ${{ matrix.project }}/build/libs/${{ matrix.project }}-*.jar

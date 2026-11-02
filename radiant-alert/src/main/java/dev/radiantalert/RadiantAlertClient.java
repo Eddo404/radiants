@@ -104,7 +104,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         Formatting color = radiant ? Formatting.AQUA : shiny ? Formatting.YELLOW : Formatting.LIGHT_PURPLE;
         long dist = Math.round(client.player.distanceTo(e));
 
-        MutableText msg = Text.literal("✦ " + String.join(" + ", tags) + " spawned! ").formatted(color, Formatting.BOLD)
+        MutableText msg = Text.literal("[ALERT] " + String.join(" + ", tags) + " spawned! ").formatted(color, Formatting.BOLD)
             .append(Text.empty().append(e.getPokemon().getSpecies().getTranslatedName()).formatted(Formatting.WHITE))
             .append(Text.literal(String.format(" at %d, %d, %d (%d blocks away)",
                     e.getBlockX(), e.getBlockY(), e.getBlockZ(), dist)).formatted(Formatting.GRAY));

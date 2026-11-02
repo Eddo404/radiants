@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "flabebealert",
+  "version": "${version}",
+  "name": "Flabebe Alert (test)",
+  "description": "Test mod: sends a chat message when a wild Flabebe spawns near you.",
+  "authors": ["You"],
+  "environment": "client",
+  "entrypoints": { "client": ["dev.flabebealert.FlabebeAlertClient"] },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.1",
+    "fabric-api": "*",
+    "cobblemon": "*"
+  }
+}

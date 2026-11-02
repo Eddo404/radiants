@@ -7,10 +7,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        project: [radiant-alert, flabebe-alert]
+        include:
+          - name: radiant-alert
+            dir: radiant-alert
+          - name: flabebe-alert
+            dir: flabebe-alert/flabebe-alert
     defaults:
       run:
-        working-directory: ${{ matrix.project }}
+        working-directory: ${{ matrix.dir }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -23,5 +27,5 @@ jobs:
       - run: gradle build
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.project }}-jar
-          path: ${{ matrix.project }}/build/libs/${{ matrix.project }}-*.jar
+          name: ${{ matrix.name }}-jar
+          path: ${{ matrix.dir }}/build/libs/${{ matrix.name }}-*.jar

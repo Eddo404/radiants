@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "radiantalert",
+  "version": "${version}",
+  "name": "Radiant Alert",
+  "description": "Sends a chat message when a Radiant Pokémon spawns near you.",
+  "authors": ["You"],
+  "environment": "client",
+  "entrypoints": { "client": ["dev.radiantalert.RadiantAlertClient"] },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.1",
+    "fabric-api": "*",
+    "cobblemon": "*"
+  }
+}

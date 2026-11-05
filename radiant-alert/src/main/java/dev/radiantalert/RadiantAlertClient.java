@@ -18,6 +18,8 @@ import net.minecraft.util.Formatting;
 import net.minecraft.util.Identifier;
 
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class RadiantAlertClient implements ClientModInitializer {
 
@@ -36,8 +38,12 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Wormhole entities: alert if the entity type id contains one of these words. */
     private static final Set<String> WORMHOLE_ENTITY_WORDS = Set.of("wormhole");
 
-    /** Wormhole chat announcements: alert if a chat message contains one of these words. */
+    /** Wormhole chat announcements: message must contain one of these words AND the word "open". */
     private static final Set<String> WORMHOLE_CHAT_WORDS = Set.of("wormhole");
+
+    /** Ignore wormholes below this tier (1 = alert for all). Messages look like "A tier 2 Ultra Wormhole has opened nearby!" */
+    private static final int MIN_WORMHOLE_TIER = 1;
+    private static final Pattern TIER_PATTERN = Pattern.compile("tier\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
     // -----------------------------------------
 
     private static final int MAX_WAIT_TICKS = 60;
@@ -63,16 +69,12 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
         });
 
-        // Wormhole announcements sent by the server as chat/system messages
+        // Wormhole announcements: servers send these either as system messages or as chat messages
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
-            if (!ALERT_WORMHOLE || overlay) return;
-            String text = message.getString();
-            if (text.startsWith("✦")) return; // our own alerts
-            String lower = text.toLowerCase(Locale.ROOT);
-            for (String word : WORMHOLE_CHAT_WORDS) {
-                if (lower.contains(word)) { announceWormholeChat(MinecraftClient.getInstance(), text); break; }
-            }
+            if (!overlay) handleWormholeChat(message.getString());
         });
+        ClientReceiveMessageEvents.CHAT.register((message, signed, sender, params, timestamp) ->
+            handleWormholeChat(message.getString()));
 
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
 
@@ -161,13 +163,28 @@ public class RadiantAlertClient implements ClientModInitializer {
         client.player.playSound(SoundEvents.BLOCK_END_PORTAL_SPAWN, 0.6f, 1.2f);
     }
 
-    private void announceWormholeChat(MinecraftClient client, String original) {
+    private void handleWormholeChat(String text) {
+        if (!ALERT_WORMHOLE || text.startsWith("✦")) return; // ignore our own alerts
+        String lower = text.toLowerCase(Locale.ROOT);
+        boolean match = false;
+        for (String word : WORMHOLE_CHAT_WORDS) {
+            if (lower.contains(word)) { match = true; break; }
+        }
+        if (!match || !lower.contains("open")) return;
+
+        MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
+
+        Matcher m = TIER_PATTERN.matcher(text);
+        int tier = m.find() ? Integer.parseInt(m.group(1)) : -1;
+        if (tier != -1 && tier < MIN_WORMHOLE_TIER) return;
+
         long now = System.currentTimeMillis();
         if (now - lastChatAlert < CHAT_COOLDOWN_MS) return;
         lastChatAlert = now;
-        MutableText msg = Text.literal("✦ Wormhole alert: ").formatted(Formatting.RED, Formatting.BOLD)
-            .append(Text.literal(original).formatted(Formatting.GRAY));
+
+        String label = tier == -1 ? "Wormhole" : "Tier " + tier + " Wormhole";
+        MutableText msg = Text.literal("✦ " + label + " opened nearby!").formatted(Formatting.RED, Formatting.BOLD);
         client.player.sendMessage(msg, false);
         client.player.playSound(SoundEvents.BLOCK_END_PORTAL_SPAWN, 0.6f, 1.2f);
     }

@@ -71,9 +71,8 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private static final int MAX_WAIT_TICKS = 60;
     private static final int MAX_REMEMBERED = 500;
-    private static final long RECORD_MS = 120000;
     private static final int RECORD_CHAT_LINES = 25;
-    private static final int RECORD_FILE_LINES = 2000;
+    private static final int RECORD_FILE_LINES = 10000;
     private static final String SPY_NAME = "radiantalert_spy";
 
     private record Pending(PokemonEntity entity, int[] ticks) {}
@@ -85,7 +84,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private final List<Seen> wormholesSeen = new ArrayList<>();
 
     private volatile boolean spyInstalled = false;
-    private volatile long recordUntil = 0;
+    private volatile boolean recording = false;
     private final Set<String> recordSeen = new HashSet<>();
     private int recordShown = 0;
     private int recordWritten = 0;
@@ -137,7 +136,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 .then(ClientCommandManager.literal("status").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
                     if (c.player != null) c.player.sendMessage(Text.literal("[RadiantAlert] packet watcher installed: " + spyInstalled
-                        + " | recording: " + (System.currentTimeMillis() < recordUntil)), false);
+                        + " | recording: " + recording), false);
                     return 1;
                 }))));
     }
@@ -279,9 +278,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     info = new Info("particle:" + type, List.of(), new double[]{pp.getX(), pp.getY(), pp.getZ()}, pp.getCount());
                 }
                 if (info != null) {
-                    boolean recording = System.currentTimeMillis() < recordUntil;
+                    boolean rec = recording;
                     boolean wormhole = ALERT_WORMHOLE && matchesWormhole(info);
-                    if (recording || wormhole) {
+                    if (rec || wormhole) {
                         final Info finalInfo = info;
                         MinecraftClient.getInstance().execute(() -> handleInfo(finalInfo, wormhole));
                     }
@@ -326,7 +325,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void handleInfo(Info info, boolean wormhole) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
-        if (System.currentTimeMillis() < recordUntil) record(client, info);
+        if (recording) record(client, info);
         if (wormhole) onWormholePacket(client, info);
     }
 
@@ -334,9 +333,9 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void toggleRecord(MinecraftClient client) {
         if (client.player == null) return;
-        if (System.currentTimeMillis() < recordUntil) {
-            recordUntil = 0;
-            client.player.sendMessage(Text.literal("[RadiantAlert] Recording stopped."), false);
+        if (recording) {
+            recording = false;
+            client.player.sendMessage(Text.literal("[RadiantAlert] Recording stopped. Results are in radiantalert-record.txt in your Minecraft folder."), false);
             return;
         }
         if (!spyInstalled) {
@@ -346,8 +345,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         recordSeen.clear();
         recordShown = 0;
         recordWritten = 0;
-        recordUntil = System.currentTimeMillis() + RECORD_MS;
-        client.player.sendMessage(Text.literal("[RadiantAlert] Recording server packets for 2 minutes. Wait for a wormhole to open near you. "
+        recording = true;
+        client.player.sendMessage(Text.literal("[RadiantAlert] Recording server packets until you stop it. Wait for a wormhole to open near you. "
             + "Everything is saved to radiantalert-record.txt in your Minecraft folder; the first " + RECORD_CHAT_LINES
             + " new kinds are also shown here. Run /radiantalert record again to stop."), false);
         writeRecord("---- new recording " + new Date() + " ----");

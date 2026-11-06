@@ -59,10 +59,11 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /**
      * Wormhole as a server packet (particle effect etc.): alert if a packet's id or any of its
-     * text/identifier values contains one of these words. Use /radiantalert record to find the real
-     * name, then add it here (lowercase).
+     * text/identifier values contains one of these words (lowercase).
+     * "us_portal_rift" is Delta's wormhole effect; it comes in several colours
+     * (us_portal_rift_red, ..._blue, etc.) and this matches all of them.
      */
-    private static final Set<String> WORMHOLE_PACKET_WORDS = Set.of("wormhole");
+    private static final Set<String> WORMHOLE_PACKET_WORDS = Set.of("wormhole", "us_portal_rift");
 
     /** One wormhole sends many packets: ignore repeats within this distance (blocks) and time (ms). */
     private static final double DEDUPE_RADIUS = 12;
@@ -232,7 +233,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             lastUnknownPosAlert = now;
             MutableText msg = Text.literal("✦ Wormhole spotted! ").formatted(Formatting.RED, Formatting.BOLD)
                 .append(Text.literal("(position unknown) ").formatted(Formatting.GRAY))
-                .append(Text.literal("[" + info.id() + "]").formatted(Formatting.DARK_GRAY));
+                .append(Text.literal("[" + describe(info) + "]").formatted(Formatting.DARK_GRAY));
             client.player.sendMessage(msg, false);
             client.player.playSound(SoundEvents.BLOCK_END_PORTAL_SPAWN, 0.6f, 1.2f);
             return;
@@ -240,12 +241,30 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         double[] p = info.pos();
         wormholesSeen.removeIf(s -> now - s.time() > DEDUPE_MS);
-        for (Seen s : wormholesSeen) {
+        for (int i = 0; i < wormholesSeen.size(); i++) {
+            Seen s = wormholesSeen.get(i);
             double dx = s.x() - p[0], dy = s.y() - p[1], dz = s.z() - p[2];
-            if (Math.sqrt(dx * dx + dy * dy + dz * dz) < DEDUPE_RADIUS) return; // same wormhole
+            if (Math.sqrt(dx * dx + dy * dy + dz * dz) < DEDUPE_RADIUS) {
+                // same wormhole still sending effects: refresh its timer, don't alert again
+                wormholesSeen.set(i, new Seen(s.x(), s.y(), s.z(), now));
+                return;
+            }
         }
         wormholesSeen.add(new Seen(p[0], p[1], p[2], now));
-        announceWormhole(client, p[0], p[1], p[2], info.id());
+        announceWormhole(client, p[0], p[1], p[2], describe(info));
+    }
+
+    /** Short label for the alert: the matching effect name, e.g. "us_portal_rift_red". */
+    private static String describe(Info info) {
+        for (String text : info.strings()) {
+            if (containsAny(text, WORMHOLE_PACKET_WORDS)) {
+                int eq = text.indexOf('=');
+                String v = eq >= 0 ? text.substring(eq + 1) : text;
+                int colon = v.indexOf(':');
+                return colon >= 0 ? v.substring(colon + 1) : v;
+            }
+        }
+        return info.id();
     }
 
     // ------------------------- Packet watcher -------------------------
@@ -303,7 +322,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 try {
                     f.setAccessible(true);
                     Object v = f.get(payload);
-                    if (v instanceof Identifier || (v instanceof String s && s.length() <= 120)) {
+                    if (v instanceof Identifier || (v instanceof String s && s.length() <= 600)) {
                         strings.add(f.getName() + "=" + v);
                     } else if (v instanceof Vec3d vec && pos == null) {
                         pos = new double[]{vec.x, vec.y, vec.z};

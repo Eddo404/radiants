@@ -7,6 +7,8 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientEntityEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -20,14 +22,21 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 
 /**
- * Test mod: alerts when a wild Flabebe spawns. With auto-catch switched on
- * (/flabebealert auto) it also walks up to it and throws Poke Balls at it.
+ * Test mod: alerts when a wild Flabebe spawns. With auto-catch switched on (/flabebealert auto)
+ * it walks up to it, throws a Poke Ball, then WAITS for the result (caught or broke free)
+ * before doing anything else. /flabebealert listen records a timeline of what the game does,
+ * so the detection can be tuned.
  */
 public class FlabebeAlertClient implements ClientModInitializer {
 
@@ -36,21 +45,36 @@ public class FlabebeAlertClient implements ClientModInitializer {
 
     /** Stop walking and start throwing once this close (blocks) and the Pokémon is in view. */
     private static final double THROW_RANGE = 5.0;
-    /** Ticks to wait between throws (20 ticks = 1 second). */
-    private static final int THROW_COOLDOWN_TICKS = 80;
     /** Give up after this many balls. */
     private static final int MAX_THROWS = 6;
-    /** Give up after this long in total (ticks). */
-    private static final int MAX_AUTO_TICKS = 20 * 90;
+    /** Give up after this long in total (ticks, 20 = 1 second). */
+    private static final int MAX_AUTO_TICKS = 20 * 240;
     /** Don't chase anything further away than this (blocks). */
     private static final double MAX_APPROACH_DISTANCE = 80;
     /** Balls to use, in order. Must be in your hotbar. Add cobblemon:master_ball etc. if you want them used. */
     private static final List<String> BALL_PRIORITY = List.of(
         "cobblemon:poke_ball", "cobblemon:great_ball", "cobblemon:ultra_ball");
+
+    // How the result is worked out after a throw
+    /** How long to wait for the ball to show up in the world after throwing. */
+    private static final int BALL_APPEAR_TIMEOUT_TICKS = 40;
+    /** If the ball can't be seen at all, fall back to waiting this long before the next throw. */
+    private static final int FALLBACK_WAIT_TICKS = 100;
+    /** Pokémon gone this long after the ball vanished = caught. */
+    private static final int RESULT_ABSENT_TICKS = 60;
+    /** Pokémon back in the world this long = it broke free / the ball missed. */
+    private static final int BACK_PRESENT_TICKS = 15;
+    /** Never wait longer than this for a result. */
+    private static final int MAX_RESULT_TICKS = 20 * 15;
+    /** Short pause after it breaks free, before throwing again. */
+    private static final int ESCAPE_DELAY_TICKS = 20;
     // ------------------------------------------
 
     private static final int MAX_WAIT_TICKS = 60;
     private static final int MAX_REMEMBERED = 500;
+    private static final int LISTEN_MAX_LINES = 6000;
+
+    private enum Phase { READY, WAIT_BALL, WAIT_RESULT }
 
     private record Pending(PokemonEntity entity, int[] ticks) {}
 
@@ -66,10 +90,23 @@ public class FlabebeAlertClient implements ClientModInitializer {
     private boolean autoEnabled = false;
     private PokemonEntity target = null;
     private String targetName = "";
+    private Vec3d lastTargetPos = Vec3d.ZERO;
     private int autoTicks, throwsDone, throwCooldown, switchWait, stuckCheck;
     private float startHealth;
     private Vec3d lastCheckPos = Vec3d.ZERO;
     private boolean keysHeld = false;
+
+    // throw-result tracking
+    private Phase phase = Phase.READY;
+    private int phaseTicks, presentTicks, absentTicks;
+    private Entity ball = null;
+    private boolean sawAbsent = false;
+
+    // listener
+    private boolean listening = false;
+    private long listenStart = 0;
+    private int listenLines = 0;
+    private int listenTick = 0;
 
     @Override
     public void onInitializeClient() {
@@ -77,7 +114,15 @@ public class FlabebeAlertClient implements ClientModInitializer {
             if (entity instanceof PokemonEntity pe && !alerted.contains(pe.getUuid())) {
                 pending.add(new Pending(pe, new int[]{0}));
             }
+            onEntityLoad(entity);
         });
+        ClientEntityEvents.ENTITY_UNLOAD.register((entity, world) -> onEntityUnload(entity));
+
+        ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
+            if (!overlay) listenLog("MESSAGE " + message.getString());
+        });
+        ClientReceiveMessageEvents.CHAT.register((message, signed, sender, params, timestamp) ->
+            listenLog("CHAT " + message.getString()));
 
         ClientTickEvents.START_CLIENT_TICK.register(this::autoTick);
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
@@ -106,6 +151,10 @@ public class FlabebeAlertClient implements ClientModInitializer {
                 .then(ClientCommandManager.literal("catch").executes(ctx -> {
                     catchNearest(MinecraftClient.getInstance());
                     return 1;
+                }))
+                .then(ClientCommandManager.literal("listen").executes(ctx -> {
+                    toggleListen(MinecraftClient.getInstance());
+                    return 1;
                 }))));
     }
 
@@ -113,6 +162,8 @@ public class FlabebeAlertClient implements ClientModInitializer {
 
     private void tick(MinecraftClient client) {
         if (client.player == null || client.world == null) { pending.clear(); return; }
+
+        if (listening && ++listenTick % 5 == 0) snapshot(client);
 
         Iterator<Pending> it = pending.iterator();
         while (it.hasNext()) {
@@ -142,6 +193,49 @@ public class FlabebeAlertClient implements ClientModInitializer {
         client.player.playSound(SoundEvents.ENTITY_PLAYER_LEVELUP, 1.0f, 1.5f);
     }
 
+    // ------------------------- Entity events (ball tracking + listener) -------------------------
+
+    private static String entityId(Entity entity) {
+        return Registries.ENTITY_TYPE.getId(entity.getType()).toString();
+    }
+
+    private static boolean isBallId(String id) {
+        return id.startsWith("cobblemon:") && id.contains("ball");
+    }
+
+    private void onEntityLoad(Entity entity) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return;
+        String id = entityId(entity);
+
+        if (listening && entity != client.player && !id.equals("minecraft:item") && !id.equals("minecraft:experience_orb")
+                && entity.squaredDistanceTo(client.player) < 48 * 48) {
+            String extra = entity instanceof PokemonEntity pe ? " (" + pe.getPokemon().getSpecies().getName() + ")" : "";
+            listenLog(String.format("LOAD %s%s at %.1f, %.1f, %.1f", id, extra, entity.getX(), entity.getY(), entity.getZ()));
+        }
+
+        // The ball we just threw has appeared in the world
+        if (target != null && phase == Phase.WAIT_BALL && ball == null && isBallId(id)
+                && entity.squaredDistanceTo(client.player) < 100) {
+            ball = entity;
+            phase = Phase.WAIT_RESULT;
+            phaseTicks = 0;
+            say(client, "Ball #" + throwsDone + " is in the air.");
+        }
+    }
+
+    private void onEntityUnload(Entity entity) {
+        if (!listening) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null || entity == client.player) return;
+        String id = entityId(entity);
+        if (id.equals("minecraft:item") || id.equals("minecraft:experience_orb")) return;
+        if (entity.squaredDistanceTo(client.player) > 48 * 48) return;
+        String extra = entity instanceof PokemonEntity pe ? " (" + pe.getPokemon().getSpecies().getName() + ")" : "";
+        listenLog(String.format("UNLOAD %s%s reason=%s at %.1f, %.1f, %.1f", id, extra,
+            entity.getRemovalReason(), entity.getX(), entity.getY(), entity.getZ()));
+    }
+
     // ------------------------- Auto-catch -------------------------
 
     private void startAuto(MinecraftClient client, PokemonEntity e) {
@@ -151,13 +245,17 @@ public class FlabebeAlertClient implements ClientModInitializer {
         }
         target = e;
         targetName = e.getPokemon().getSpecies().getName();
+        lastTargetPos = e.getPos();
         autoTicks = 0;
         throwsDone = 0;
         throwCooldown = 0;
         switchWait = 0;
         stuckCheck = 0;
+        phase = Phase.READY;
+        ball = null;
         startHealth = client.player.getHealth();
         lastCheckPos = client.player.getPos();
+        listenLog("AUTO start target=" + targetName);
         say(client, "Heading to " + targetName + ". Open chat and run /flabebealert stop to cancel.");
     }
 
@@ -178,30 +276,60 @@ public class FlabebeAlertClient implements ClientModInitializer {
         startAuto(client, nearest);
     }
 
+    /** The original Pokémon, or - if Cobblemon re-created it after a ball opened - a same-species one nearby. */
+    private PokemonEntity findTarget(MinecraftClient client) {
+        if (target != null && !target.isRemoved()) return target;
+        Vec3d c = lastTargetPos;
+        Box box = new Box(c.x - 12, c.y - 8, c.z - 12, c.x + 12, c.y + 8, c.z + 12);
+        PokemonEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, box,
+                x -> x.getOwnerUuid() == null && !x.isRemoved())) {
+            if (!pe.getPokemon().getSpecies().getName().equals(targetName)) continue;
+            double d = pe.squaredDistanceTo(c);
+            if (d < bestDist) { bestDist = d; best = pe; }
+        }
+        return best;
+    }
+
     private void autoTick(MinecraftClient client) {
         if (target == null) { releaseKeys(client); return; }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); target = null; return; }
         if (client.currentScreen != null) { releaseKeys(client); return; } // paused while chat/inventory/battle is open
 
-        if (target.isRemoved()) {
-            stopAuto(client, throwsDone > 0
-                ? targetName + " is gone after " + throwsDone + " ball(s) - probably caught!"
-                : targetName + " disappeared before I could throw.");
-            return;
-        }
         if (player.getHealth() > startHealth) startHealth = player.getHealth();
         if (player.getHealth() < startHealth || player.isOnFire()) { stopAuto(client, "Took damage - stopping."); return; }
         if (++autoTicks > MAX_AUTO_TICKS) { stopAuto(client, "Timed out."); return; }
 
-        double dist = player.distanceTo(target);
+        PokemonEntity current = findTarget(client);
+        if (current != null) {
+            target = current;
+            lastTargetPos = current.getPos();
+        }
+
+        // A ball is out: hold still and wait to see what happens to it
+        if (phase != Phase.READY) {
+            releaseKeys(client);
+            resolveTick(client, player, current);
+            return;
+        }
+
+        if (current == null) {
+            stopAuto(client, throwsDone > 0
+                ? targetName + " is no longer here after " + throwsDone + " ball(s) (caught, fled or despawned)."
+                : targetName + " disappeared before I could throw.");
+            return;
+        }
+
+        double dist = player.distanceTo(current);
         if (dist > MAX_APPROACH_DISTANCE) { stopAuto(client, "Too far away - stopping."); return; }
 
-        aimAt(player, target);
+        aimAt(player, current);
 
-        if (dist <= THROW_RANGE && player.canSee(target)) {
+        if (dist <= THROW_RANGE && player.canSee(current)) {
             releaseKeys(client);
-            throwTick(client, player);
+            throwTick(client, player, current);
         } else {
             walk(client, player);
         }
@@ -220,7 +348,7 @@ public class FlabebeAlertClient implements ClientModInitializer {
         keysHeld = true;
     }
 
-    private void throwTick(MinecraftClient client, ClientPlayerEntity player) {
+    private void throwTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
         stuckCheck = 0;
         lastCheckPos = player.getPos();
 
@@ -230,7 +358,7 @@ public class FlabebeAlertClient implements ClientModInitializer {
             return;
         }
         if (switchWait > 0) { switchWait--; return; }
-        if (angleError(player, target) > 4.0f) return; // wait until we're aimed at it
+        if (angleError(player, current) > 4.0f) return; // wait until we're aimed at it
 
         int slot = findBallSlot(player);
         if (slot < 0) { stopAuto(client, "No Poké Ball in your hotbar."); return; }
@@ -244,13 +372,83 @@ public class FlabebeAlertClient implements ClientModInitializer {
         client.interactionManager.interactItem(player, Hand.MAIN_HAND);
         player.swingHand(Hand.MAIN_HAND);
         throwsDone++;
-        throwCooldown = THROW_COOLDOWN_TICKS;
-        say(client, "Threw ball #" + throwsDone + " at " + targetName + ".");
+
+        // now wait for the result instead of throwing again on a timer
+        phase = Phase.WAIT_BALL;
+        phaseTicks = 0;
+        presentTicks = 0;
+        absentTicks = 0;
+        ball = null;
+        sawAbsent = false;
+        listenLog("THROW #" + throwsDone);
+        say(client, "Threw ball #" + throwsDone + " at " + targetName + ". Waiting for the result...");
+    }
+
+    /** Runs every tick while a ball is out. Decides: still flying, caught, or broke free. */
+    private void resolveTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        phaseTicks++;
+        boolean present = current != null;
+        if (present) {
+            presentTicks++;
+            absentTicks = 0;
+            aimAt(player, current);
+        } else {
+            absentTicks++;
+            presentTicks = 0;
+            if (absentTicks == 3 && !sawAbsent) {
+                sawAbsent = true;
+                listenLog("RESULT " + targetName + " vanished (into the ball?)");
+                say(client, targetName + " went into the ball...");
+            }
+        }
+
+        if (phase == Phase.WAIT_BALL) {
+            // we threw, but haven't seen a ball entity yet
+            if (phaseTicks > BALL_APPEAR_TIMEOUT_TICKS) {
+                say(client, "Couldn't see the ball - waiting " + (FALLBACK_WAIT_TICKS / 20) + "s before the next throw instead.");
+                listenLog("RESULT no ball entity seen, using fallback wait");
+                phase = Phase.READY;
+                throwCooldown = FALLBACK_WAIT_TICKS;
+            }
+            return;
+        }
+
+        // phase == WAIT_RESULT
+        boolean ballGone = ball == null || ball.isRemoved();
+
+        if (sawAbsent && present && presentTicks >= BACK_PRESENT_TICKS) { onEscaped(client); return; }
+        if (ballGone) {
+            if (present && presentTicks >= BACK_PRESENT_TICKS) { onEscaped(client); return; }
+            if (!present && absentTicks >= RESULT_ABSENT_TICKS) { onCaught(client); return; }
+        }
+        if (phaseTicks > MAX_RESULT_TICKS) {
+            if (present) onEscaped(client); else onCaught(client);
+        }
+    }
+
+    /** It broke free (or the ball missed). Put anything you want to happen then in here. */
+    private void onEscaped(MinecraftClient client) {
+        listenLog("RESULT escaped (sawAbsent=" + sawAbsent + ")");
+        say(client, targetName + (sawAbsent ? " broke free!" : " wasn't caught (the ball missed?).")
+            + " Used " + throwsDone + " of " + MAX_THROWS + " balls.");
+        phase = Phase.READY;
+        throwCooldown = ESCAPE_DELAY_TICKS;
+        ball = null;
+    }
+
+    /** It was caught. Put anything you want to happen then in here. */
+    private void onCaught(MinecraftClient client) {
+        listenLog("RESULT caught");
+        stopAuto(client, "✔ Caught " + targetName + " with ball #" + throwsDone + "!");
+        if (client.player != null) client.player.playSound(SoundEvents.ENTITY_PLAYER_LEVELUP, 1.0f, 1.0f);
     }
 
     private void stopAuto(MinecraftClient client, String message) {
         target = null;
+        phase = Phase.READY;
+        ball = null;
         releaseKeys(client);
+        listenLog("AUTO stop: " + message);
         say(client, message);
     }
 
@@ -314,6 +512,54 @@ public class FlabebeAlertClient implements ClientModInitializer {
     private static float angleError(ClientPlayerEntity player, Entity t) {
         float[] a = desiredAngles(player, t);
         return Math.max(Math.abs(MathHelper.wrapDegrees(a[0] - player.getYaw())), Math.abs(a[1] - player.getPitch()));
+    }
+
+    // ------------------------- Listener -------------------------
+
+    private void toggleListen(MinecraftClient client) {
+        if (client.player == null) return;
+        if (listening) {
+            listening = false;
+            say(client, "Listener stopped. Results are in flabebealert-listen.txt in your Minecraft folder.");
+            return;
+        }
+        listening = true;
+        listenStart = System.currentTimeMillis();
+        listenLines = 0;
+        listenTick = 0;
+        writeListen("---- new listen session " + new Date() + " ----");
+        say(client, "Listening. Throw a ball at a Pokémon (or start auto-catch) and let it finish, then run /flabebealert listen again. "
+            + "Everything is saved to flabebealert-listen.txt in your Minecraft folder.");
+    }
+
+    private void listenLog(String text) {
+        if (!listening) return;
+        if (listenLines++ > LISTEN_MAX_LINES) return;
+        double secs = (System.currentTimeMillis() - listenStart) / 1000.0;
+        writeListen(String.format("[+%.2fs] %s", secs, text));
+    }
+
+    private void writeListen(String line) {
+        try {
+            Path file = FabricLoader.getInstance().getGameDir().resolve("flabebealert-listen.txt");
+            Files.writeString(file, line + System.lineSeparator(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException ignored) {
+            // can't write the log - nothing more to do
+        }
+    }
+
+    /** Every 5 ticks: where the balls and nearby wild Pokémon are. */
+    private void snapshot(MinecraftClient client) {
+        for (Entity e : client.world.getEntities()) {
+            if (e.squaredDistanceTo(client.player) > 16 * 16) continue;
+            String id = entityId(e);
+            if (isBallId(id)) {
+                listenLog(String.format("BALL %s pos=%.1f, %.1f, %.1f", id, e.getX(), e.getY(), e.getZ()));
+            } else if (e instanceof PokemonEntity pe && pe.getOwnerUuid() == null) {
+                listenLog(String.format("POKEMON %s pos=%.1f, %.1f, %.1f invisible=%s",
+                    pe.getPokemon().getSpecies().getName(), e.getX(), e.getY(), e.getZ(), e.isInvisible()));
+            }
+        }
     }
 
     // ------------------------- Misc -------------------------

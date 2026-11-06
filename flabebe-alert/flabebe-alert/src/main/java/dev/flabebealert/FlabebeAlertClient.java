@@ -22,7 +22,6 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
@@ -34,9 +33,15 @@ import java.util.*;
 
 /**
  * Test mod: alerts when a wild Flabebe spawns. With auto-catch switched on (/flabebealert auto)
- * it walks up to it, throws a Poke Ball, then WAITS for the result (caught or broke free)
- * before doing anything else. /flabebealert listen records a timeline of what the game does,
- * so the detection can be tuned.
+ * it walks up to it, throws a Poke Ball, then WAITS for the result before doing anything else.
+ *
+ * How a throw is judged (worked out from a recorded timeline on Delta):
+ *  - the Pokemon turns invisible while it is inside the ball;
+ *  - caught       = the Pokemon entity is removed after it went into the ball;
+ *  - broke free   = the Pokemon becomes visible again and the ball is removed;
+ *  - missed       = the ball is removed and the Pokemon never went into it.
+ *
+ * /flabebealert listen records a timeline of what the game does, for tuning.
  */
 public class FlabebeAlertClient implements ClientModInitializer {
 
@@ -60,14 +65,16 @@ public class FlabebeAlertClient implements ClientModInitializer {
     private static final int BALL_APPEAR_TIMEOUT_TICKS = 40;
     /** If the ball can't be seen at all, fall back to waiting this long before the next throw. */
     private static final int FALLBACK_WAIT_TICKS = 100;
-    /** Pokémon gone this long after the ball vanished = caught. */
-    private static final int RESULT_ABSENT_TICKS = 60;
-    /** Pokémon back in the world this long = it broke free / the ball missed. */
-    private static final int BACK_PRESENT_TICKS = 15;
+    /** Pokémon visible again this long (and ball gone) = it broke free. */
+    private static final int ESCAPE_CONFIRM_TICKS = 3;
+    /** Ball gone this long and the Pokémon never went into it = the throw missed. */
+    private static final int MISS_CONFIRM_TICKS = 10;
     /** Never wait longer than this for a result. */
-    private static final int MAX_RESULT_TICKS = 20 * 15;
-    /** Short pause after it breaks free, before throwing again. */
+    private static final int MAX_RESULT_TICKS = 20 * 30;
+    /** Pause after it breaks free, before throwing again. */
     private static final int ESCAPE_DELAY_TICKS = 20;
+    /** Pause after a throw that missed or did nothing, before throwing again. */
+    private static final int FAILED_THROW_DELAY_TICKS = 40;
     // ------------------------------------------
 
     private static final int MAX_WAIT_TICKS = 60;
@@ -90,7 +97,6 @@ public class FlabebeAlertClient implements ClientModInitializer {
     private boolean autoEnabled = false;
     private PokemonEntity target = null;
     private String targetName = "";
-    private Vec3d lastTargetPos = Vec3d.ZERO;
     private int autoTicks, throwsDone, throwCooldown, switchWait, stuckCheck;
     private float startHealth;
     private Vec3d lastCheckPos = Vec3d.ZERO;
@@ -98,9 +104,9 @@ public class FlabebeAlertClient implements ClientModInitializer {
 
     // throw-result tracking
     private Phase phase = Phase.READY;
-    private int phaseTicks, presentTicks, absentTicks;
+    private int phaseTicks, visibleTicks, ballGoneTicks, goneTicks;
     private Entity ball = null;
-    private boolean sawAbsent = false;
+    private boolean captureStarted = false;
 
     // listener
     private boolean listening = false;
@@ -245,7 +251,6 @@ public class FlabebeAlertClient implements ClientModInitializer {
         }
         target = e;
         targetName = e.getPokemon().getSpecies().getName();
-        lastTargetPos = e.getPos();
         autoTicks = 0;
         throwsDone = 0;
         throwCooldown = 0;
@@ -276,22 +281,6 @@ public class FlabebeAlertClient implements ClientModInitializer {
         startAuto(client, nearest);
     }
 
-    /** The original Pokémon, or - if Cobblemon re-created it after a ball opened - a same-species one nearby. */
-    private PokemonEntity findTarget(MinecraftClient client) {
-        if (target != null && !target.isRemoved()) return target;
-        Vec3d c = lastTargetPos;
-        Box box = new Box(c.x - 12, c.y - 8, c.z - 12, c.x + 12, c.y + 8, c.z + 12);
-        PokemonEntity best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, box,
-                x -> x.getOwnerUuid() == null && !x.isRemoved())) {
-            if (!pe.getPokemon().getSpecies().getName().equals(targetName)) continue;
-            double d = pe.squaredDistanceTo(c);
-            if (d < bestDist) { bestDist = d; best = pe; }
-        }
-        return best;
-    }
-
     private void autoTick(MinecraftClient client) {
         if (target == null) { releaseKeys(client); return; }
         ClientPlayerEntity player = client.player;
@@ -302,11 +291,9 @@ public class FlabebeAlertClient implements ClientModInitializer {
         if (player.getHealth() < startHealth || player.isOnFire()) { stopAuto(client, "Took damage - stopping."); return; }
         if (++autoTicks > MAX_AUTO_TICKS) { stopAuto(client, "Timed out."); return; }
 
-        PokemonEntity current = findTarget(client);
-        if (current != null) {
-            target = current;
-            lastTargetPos = current.getPos();
-        }
+        // The same Pokémon entity stays in the world the whole time (it just turns invisible
+        // inside the ball), so we follow that one entity. Removed = gone.
+        PokemonEntity current = target.isRemoved() ? null : target;
 
         // A ball is out: hold still and wait to see what happens to it
         if (phase != Phase.READY) {
@@ -376,31 +363,21 @@ public class FlabebeAlertClient implements ClientModInitializer {
         // now wait for the result instead of throwing again on a timer
         phase = Phase.WAIT_BALL;
         phaseTicks = 0;
-        presentTicks = 0;
-        absentTicks = 0;
+        visibleTicks = 0;
+        ballGoneTicks = 0;
+        goneTicks = 0;
         ball = null;
-        sawAbsent = false;
+        captureStarted = false;
         listenLog("THROW #" + throwsDone);
         say(client, "Threw ball #" + throwsDone + " at " + targetName + ". Waiting for the result...");
     }
 
-    /** Runs every tick while a ball is out. Decides: still flying, caught, or broke free. */
+    /** Runs every tick while a ball is out. Decides: still going, caught, broke free, or missed. */
     private void resolveTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
         phaseTicks++;
-        boolean present = current != null;
-        if (present) {
-            presentTicks++;
-            absentTicks = 0;
-            aimAt(player, current);
-        } else {
-            absentTicks++;
-            presentTicks = 0;
-            if (absentTicks == 3 && !sawAbsent) {
-                sawAbsent = true;
-                listenLog("RESULT " + targetName + " vanished (into the ball?)");
-                say(client, targetName + " went into the ball...");
-            }
-        }
+        boolean gone = current == null;
+        boolean hidden = !gone && current.isInvisible();
+        if (!gone && !hidden) aimAt(player, current);
 
         if (phase == Phase.WAIT_BALL) {
             // we threw, but haven't seen a ball entity yet
@@ -416,23 +393,47 @@ public class FlabebeAlertClient implements ClientModInitializer {
         // phase == WAIT_RESULT
         boolean ballGone = ball == null || ball.isRemoved();
 
-        if (sawAbsent && present && presentTicks >= BACK_PRESENT_TICKS) { onEscaped(client); return; }
-        if (ballGone) {
-            if (present && presentTicks >= BACK_PRESENT_TICKS) { onEscaped(client); return; }
-            if (!present && absentTicks >= RESULT_ABSENT_TICKS) { onCaught(client); return; }
+        // The Pokémon turns invisible while it is inside the ball
+        if (hidden && !captureStarted) {
+            captureStarted = true;
+            listenLog("RESULT " + targetName + " went into the ball");
+            say(client, targetName + " went into the ball...");
         }
+
+        // Caught: the Pokémon entity is removed after it went into the ball
+        if (gone) {
+            goneTicks++;
+            if (captureStarted || (ballGone && goneTicks >= 20)) { onCaught(client); return; }
+        } else {
+            goneTicks = 0;
+        }
+
+        // Broke free: visible again and the ball has disappeared
+        if (captureStarted && !gone && !hidden) {
+            visibleTicks++;
+            if (ballGone && visibleTicks >= ESCAPE_CONFIRM_TICKS) { onEscaped(client, true); return; }
+        } else {
+            visibleTicks = 0;
+        }
+
+        // Missed: the ball is gone and the Pokémon never went into it
+        if (ballGone) ballGoneTicks++; else ballGoneTicks = 0;
+        if (!captureStarted && !gone && ballGone && ballGoneTicks >= MISS_CONFIRM_TICKS) { onEscaped(client, false); return; }
+
         if (phaseTicks > MAX_RESULT_TICKS) {
-            if (present) onEscaped(client); else onCaught(client);
+            if (gone) onCaught(client);
+            else if (!hidden) onEscaped(client, captureStarted);
+            else stopAuto(client, "Couldn't tell what happened to the ball - stopping.");
         }
     }
 
-    /** It broke free (or the ball missed). Put anything you want to happen then in here. */
-    private void onEscaped(MinecraftClient client) {
-        listenLog("RESULT escaped (sawAbsent=" + sawAbsent + ")");
-        say(client, targetName + (sawAbsent ? " broke free!" : " wasn't caught (the ball missed?).")
+    /** It broke free, or the ball missed. Put anything you want to happen then in here. */
+    private void onEscaped(MinecraftClient client, boolean brokeFree) {
+        listenLog("RESULT " + (brokeFree ? "broke free" : "missed"));
+        say(client, targetName + (brokeFree ? " broke free!" : " wasn't captured (the ball missed or was discarded).")
             + " Used " + throwsDone + " of " + MAX_THROWS + " balls.");
         phase = Phase.READY;
-        throwCooldown = ESCAPE_DELAY_TICKS;
+        throwCooldown = brokeFree ? ESCAPE_DELAY_TICKS : FAILED_THROW_DELAY_TICKS;
         ball = null;
     }
 

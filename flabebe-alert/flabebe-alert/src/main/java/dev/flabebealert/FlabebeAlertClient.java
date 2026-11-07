@@ -10,20 +10,27 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.shape.VoxelShape;
+import net.minecraft.world.RaycastContext;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -33,7 +40,9 @@ import java.util.*;
 
 /**
  * Test mod: alerts when a wild Flabebe spawns. With auto-catch switched on (/flabebealert auto)
- * it walks up to it, throws a Poke Ball, then WAITS for the result before doing anything else.
+ * it finds a route to the Pokemon (around walls, out of holes, up stairs - even if that means
+ * walking away from it first), stands a few blocks back, throws a Poke Ball, then WAITS for the
+ * result before doing anything else.
  *
  * How a throw is judged (worked out from a recorded timeline on Delta):
  *  - the Pokemon turns invisible while it is inside the ball;
@@ -48,8 +57,19 @@ public class FlabebeAlertClient implements ClientModInitializer {
     // ---------------- Settings ----------------
     private static final String SPECIES_PREFIX = "flab";
 
-    /** Stop walking and start throwing once this close (blocks) and the Pokémon is in view. */
-    private static final double THROW_RANGE = 5.0;
+    /** Throwing zone, in horizontal blocks from the Pokémon. Once inside, the wider "stay" band applies so it doesn't flip-flop. */
+    private static final double ZONE_MIN_ENTER = 3.0;
+    private static final double ZONE_MAX_ENTER = 5.5;
+    private static final double ZONE_MIN_STAY = 2.3;
+    private static final double ZONE_MAX_STAY = 6.5;
+    /** The route planner aims for a spot this far (horizontal blocks) from the Pokémon, with a clear view of it. */
+    private static final double GOAL_MIN = 3.3;
+    private static final double GOAL_MAX = 5.0;
+    /** How many map squares the route planner may look at before settling for the closest it found. */
+    private static final int PLAN_MAX_NODES = 15000;
+    /** Minimum gap between route plans (ticks). */
+    private static final int REPLAN_COOLDOWN_TICKS = 10;
+
     /** Give up after this many balls. */
     private static final int MAX_THROWS = 6;
     /** Give up after this long in total (ticks, 20 = 1 second). */
@@ -97,10 +117,18 @@ public class FlabebeAlertClient implements ClientModInitializer {
     private boolean autoEnabled = false;
     private PokemonEntity target = null;
     private String targetName = "";
-    private int autoTicks, throwsDone, throwCooldown, switchWait, stuckCheck;
+    private int autoTicks, throwsDone, throwCooldown, switchWait;
     private float startHealth;
-    private Vec3d lastCheckPos = Vec3d.ZERO;
     private boolean keysHeld = false;
+
+    // route following
+    private List<BlockPos> path = List.of();
+    private int pathIndex = 0;
+    private Vec3d planTargetPos = null;
+    private int replanCooldown = 0, failedPlans = 0, zoneOverrideTicks = 0, stuckTicks = 0, stuckStrikes = 0;
+    private double stuckX, stuckY, stuckZ;
+    private boolean zoneActive = false;
+    private final Set<Long> blockedNodes = new HashSet<>();
 
     // throw-result tracking
     private Phase phase = Phase.READY;
@@ -255,11 +283,24 @@ public class FlabebeAlertClient implements ClientModInitializer {
         throwsDone = 0;
         throwCooldown = 0;
         switchWait = 0;
-        stuckCheck = 0;
         phase = Phase.READY;
         ball = null;
         startHealth = client.player.getHealth();
-        lastCheckPos = client.player.getPos();
+
+        path = List.of();
+        pathIndex = 0;
+        planTargetPos = null;
+        replanCooldown = 0;
+        failedPlans = 0;
+        zoneOverrideTicks = 0;
+        stuckTicks = 0;
+        stuckStrikes = 0;
+        stuckX = client.player.getX();
+        stuckY = client.player.getY();
+        stuckZ = client.player.getZ();
+        zoneActive = false;
+        blockedNodes.clear();
+
         listenLog("AUTO start target=" + targetName);
         say(client, "Heading to " + targetName + ". Open chat and run /flabebealert stop to cancel.");
     }
@@ -309,37 +350,37 @@ public class FlabebeAlertClient implements ClientModInitializer {
             return;
         }
 
-        double dist = player.distanceTo(current);
-        if (dist > MAX_APPROACH_DISTANCE) { stopAuto(client, "Too far away - stopping."); return; }
+        if (player.distanceTo(current) > MAX_APPROACH_DISTANCE) { stopAuto(client, "Too far away - stopping."); return; }
 
-        aimAt(player, current);
+        if (throwCooldown > 0) throwCooldown--;
+        if (zoneOverrideTicks > 0) zoneOverrideTicks--;
 
-        if (dist <= THROW_RANGE && player.canSee(current)) {
+        if (inThrowZone(player, current) || zoneOverrideTicks > 0) {
+            // close enough, not too close, and in view: stand still and throw
             releaseKeys(client);
+            path = List.of();
+            aimAt(player, current);
             throwTick(client, player, current);
         } else {
-            walk(client, player);
+            followPath(client, player, current);
         }
     }
 
-    private void walk(MinecraftClient client, ClientPlayerEntity player) {
-        if (!isSafeAhead(client, player)) { stopAuto(client, "Cliff or lava ahead - stopped."); return; }
-        if (++stuckCheck >= 40) {
-            stuckCheck = 0;
-            if (player.getPos().squaredDistanceTo(lastCheckPos) < 1.0) { stopAuto(client, "Got stuck - stopping."); return; }
-            lastCheckPos = player.getPos();
-        }
-        client.options.forwardKey.setPressed(true);
-        client.options.sprintKey.setPressed(true);
-        client.options.jumpKey.setPressed(player.horizontalCollision || player.isTouchingWater());
-        keysHeld = true;
+    // ------------------------- Throwing -------------------------
+
+    /** Horizontal distance in the throwing band, roughly level with the Pokémon, and in view. */
+    private boolean inThrowZone(ClientPlayerEntity player, PokemonEntity t) {
+        double dx = t.getX() - player.getX();
+        double dz = t.getZ() - player.getZ();
+        double hd = Math.sqrt(dx * dx + dz * dz);
+        double lo = zoneActive ? ZONE_MIN_STAY : ZONE_MIN_ENTER;
+        double hi = zoneActive ? ZONE_MAX_STAY : ZONE_MAX_ENTER;
+        zoneActive = hd >= lo && hd <= hi && Math.abs(t.getY() - player.getY()) <= 3.5 && player.canSee(t);
+        return zoneActive;
     }
 
     private void throwTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
-        stuckCheck = 0;
-        lastCheckPos = player.getPos();
-
-        if (throwCooldown > 0) { throwCooldown--; return; }
+        if (throwCooldown > 0) return;
         if (throwsDone >= MAX_THROWS) {
             stopAuto(client, "Used " + MAX_THROWS + " balls and " + targetName + " is still here.");
             return;
@@ -435,6 +476,7 @@ public class FlabebeAlertClient implements ClientModInitializer {
         phase = Phase.READY;
         throwCooldown = brokeFree ? ESCAPE_DELAY_TICKS : FAILED_THROW_DELAY_TICKS;
         ball = null;
+        zoneActive = false; // it will probably be right next to us now: re-check the distance from scratch
     }
 
     /** It was caught. Put anything you want to happen then in here. */
@@ -448,6 +490,8 @@ public class FlabebeAlertClient implements ClientModInitializer {
         target = null;
         phase = Phase.READY;
         ball = null;
+        path = List.of();
+        zoneActive = false;
         releaseKeys(client);
         listenLog("AUTO stop: " + message);
         say(client, message);
@@ -478,19 +522,324 @@ public class FlabebeAlertClient implements ClientModInitializer {
         return -1;
     }
 
-    /** False if the spot just ahead has lava or no ground within 4 blocks below. */
-    private static boolean isSafeAhead(MinecraftClient client, ClientPlayerEntity player) {
-        Vec3d dir = Vec3d.fromPolar(0, player.getYaw());
-        Vec3d ahead = player.getPos().add(dir.multiply(1.5));
-        BlockPos base = BlockPos.ofFloored(ahead.x, ahead.y, ahead.z);
-        boolean ground = false;
-        for (int k = 0; k <= 4; k++) {
-            BlockPos pos = base.down(k);
-            BlockState state = client.world.getBlockState(pos);
-            if (state.getFluidState().isIn(FluidTags.LAVA)) return false;
-            if (k >= 1 && !state.getCollisionShape(client.world, pos).isEmpty()) ground = true;
+    // ------------------------- Route following -------------------------
+
+    private void followPath(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        if (replanCooldown > 0) replanCooldown--;
+
+        boolean noPath = path.isEmpty() || pathIndex >= path.size();
+        boolean targetMoved = planTargetPos == null || current.getPos().squaredDistanceTo(planTargetPos) > 9.0;
+        boolean offPath = !noPath && isOffPath(player, path.get(pathIndex));
+
+        if (noPath || targetMoved || offPath) {
+            if (replanCooldown > 0) { releaseKeys(client); return; }
+            replanCooldown = REPLAN_COOLDOWN_TICKS;
+            if (!replan(client, player, current)) return; // gave up
+            stuckTicks = 0;
+            stuckX = player.getX();
+            stuckY = player.getY();
+            stuckZ = player.getZ();
         }
-        return ground;
+        if (path.isEmpty() || pathIndex >= path.size()) { releaseKeys(client); return; }
+
+        // move on to the next waypoint once we're standing on the current one
+        BlockPos wp = path.get(pathIndex);
+        while (horizontalDistance(player, wp) < 0.5 && Math.abs(wp.getY() - player.getY()) < 1.5) {
+            pathIndex++;
+            if (pathIndex >= path.size()) { path = List.of(); releaseKeys(client); return; }
+            wp = path.get(pathIndex);
+        }
+
+        // not making progress for a second: block that square and plan a different route
+        if (++stuckTicks >= 20) {
+            double moved = Math.abs(player.getX() - stuckX) + Math.abs(player.getY() - stuckY) + Math.abs(player.getZ() - stuckZ);
+            stuckTicks = 0;
+            stuckX = player.getX();
+            stuckY = player.getY();
+            stuckZ = player.getZ();
+            if (moved < 0.4) {
+                stuckStrikes++;
+                if (stuckStrikes >= 6) { stopAuto(client, "Got stuck and couldn't find a way out - stopping."); return; }
+                blockedNodes.add(wp.asLong());
+                path = List.of();
+                replanCooldown = 0;
+                releaseKeys(client);
+                say(client, "Stuck - trying a different route.");
+                return;
+            } else if (stuckStrikes > 0) {
+                stuckStrikes--;
+            }
+        }
+
+        // steer toward the waypoint
+        double dx = wp.getX() + 0.5 - player.getX();
+        double dz = wp.getZ() + 0.5 - player.getZ();
+        double hd = Math.sqrt(dx * dx + dz * dz);
+        double dy = wp.getY() - player.getY();
+
+        float yaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0f;
+        player.setYaw(MathHelper.lerpAngleDegrees(0.5f, player.getYaw(), yaw));
+        player.setPitch(MathHelper.lerp(0.5f, player.getPitch(), 0.0f));
+        float yawError = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw()));
+
+        boolean forward = yawError < 60.0f;
+        boolean jump = player.isTouchingWater()
+            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || player.horizontalCollision));
+        boolean sprint = hd > 2.5 && dy < 0.3 && yawError < 15.0f;
+
+        client.options.forwardKey.setPressed(forward);
+        client.options.sprintKey.setPressed(sprint && forward);
+        client.options.jumpKey.setPressed(jump);
+        keysHeld = true;
+    }
+
+    private static double horizontalDistance(ClientPlayerEntity player, BlockPos p) {
+        double dx = p.getX() + 0.5 - player.getX();
+        double dz = p.getZ() + 0.5 - player.getZ();
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    private static boolean isOffPath(ClientPlayerEntity player, BlockPos wp) {
+        return horizontalDistance(player, wp) > 5.0 || Math.abs(wp.getY() - player.getY()) > 3.5;
+    }
+
+    /** Plans a new route. Returns false if auto-catch gave up. */
+    private boolean replan(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        planTargetPos = current.getPos();
+        Plan plan = new Pathfinder(client.world, player, current, blockedNodes).search();
+        listenLog("PLAN " + plan.status() + " steps=" + plan.nodes().size());
+
+        switch (plan.status()) {
+            case AT_GOAL -> {
+                // already standing in a good spot: just throw
+                path = List.of();
+                pathIndex = 0;
+                zoneOverrideTicks = 40;
+                failedPlans = 0;
+            }
+            case PATH, PARTIAL -> {
+                path = plan.nodes();
+                pathIndex = 0;
+                failedPlans = 0;
+            }
+            default -> {
+                path = List.of();
+                pathIndex = 0;
+                if (++failedPlans >= 3) {
+                    stopAuto(client, "Couldn't find a way to " + targetName + " - stopping.");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // ------------------------- Route planner (A*) -------------------------
+
+    private enum Status { PATH, PARTIAL, AT_GOAL, FAIL }
+
+    private record Plan(Status status, List<BlockPos> nodes) {}
+
+    private record Move(int x, int y, int z, double cost) {}
+
+    private static final class Node {
+        final BlockPos pos;
+        Node parent;
+        double g;
+        double f;
+        boolean closed;
+
+        Node(BlockPos pos, Node parent, double g) {
+            this.pos = pos;
+            this.parent = parent;
+            this.g = g;
+        }
+    }
+
+    private record Entry(Node node, double f) {}
+
+    /**
+     * Searches the loaded blocks for a way to a spot a few blocks from the Pokémon with a clear
+     * view of it. Moves: walk, walk diagonally, step up one block (jump), drop down up to three.
+     * It treats lava, fire, cactus, magma, berry bushes, cobwebs and powder snow as no-go, and it
+     * doesn't count deep water as ground. If the Pokémon is too far for one search, it returns a
+     * route to the closest point it found, and the next plan carries on from there.
+     */
+    private static final class Pathfinder {
+        private final ClientWorld world;
+        private final ClientPlayerEntity player;
+        private final double tx, ty, tz, targetEyeY;
+        private final Set<Long> blocked;
+        private final Map<Long, Boolean> standCache = new HashMap<>();
+        private final Map<Long, Boolean> goalCache = new HashMap<>();
+
+        Pathfinder(ClientWorld world, ClientPlayerEntity player, PokemonEntity target, Set<Long> blocked) {
+            this.world = world;
+            this.player = player;
+            this.tx = target.getX();
+            this.ty = target.getY();
+            this.tz = target.getZ();
+            this.targetEyeY = target.getEyeY();
+            this.blocked = blocked;
+        }
+
+        Plan search() {
+            BlockPos start = BlockPos.ofFloored(player.getX(), player.getY() + 0.05, player.getZ());
+            if (isGoal(start)) return new Plan(Status.AT_GOAL, List.of());
+
+            PriorityQueue<Entry> open = new PriorityQueue<>(Comparator.comparingDouble(Entry::f));
+            Map<Long, Node> nodes = new HashMap<>();
+            Node first = new Node(start, null, 0);
+            first.f = heuristic(start);
+            nodes.put(start.asLong(), first);
+            open.add(new Entry(first, first.f));
+
+            double startH = heuristic(start);
+            Node best = first;
+            double bestH = startH;
+            int expanded = 0;
+            List<Move> moves = new ArrayList<>();
+
+            while (!open.isEmpty() && expanded < PLAN_MAX_NODES) {
+                Entry entry = open.poll();
+                Node cur = entry.node();
+                if (cur.closed || entry.f() > cur.f + 1e-9) continue; // outdated queue entry
+                cur.closed = true;
+                expanded++;
+
+                if (cur != first && isGoal(cur.pos)) return new Plan(Status.PATH, build(cur));
+
+                double h = heuristic(cur.pos);
+                if (h < bestH) { bestH = h; best = cur; }
+
+                moves.clear();
+                generateMoves(cur.pos, moves);
+                for (Move m : moves) {
+                    BlockPos np = new BlockPos(m.x(), m.y(), m.z());
+                    long key = np.asLong();
+                    double ng = cur.g + m.cost();
+                    Node nb = nodes.get(key);
+                    if (nb == null) {
+                        nb = new Node(np, cur, ng);
+                        nb.f = ng + heuristic(np);
+                        nodes.put(key, nb);
+                        open.add(new Entry(nb, nb.f));
+                    } else if (!nb.closed && ng < nb.g) {
+                        nb.g = ng;
+                        nb.parent = cur;
+                        nb.f = ng + heuristic(np);
+                        open.add(new Entry(nb, nb.f));
+                    }
+                }
+            }
+
+            // no complete route within the search limit: head for the closest point found
+            if (best != first && bestH < startH - 1.0) return new Plan(Status.PARTIAL, build(best));
+            return new Plan(Status.FAIL, List.of());
+        }
+
+        private static List<BlockPos> build(Node end) {
+            List<BlockPos> out = new ArrayList<>();
+            for (Node n = end; n != null && n.parent != null; n = n.parent) out.add(n.pos);
+            Collections.reverse(out);
+            return out;
+        }
+
+        private double heuristic(BlockPos p) {
+            return Math.max(0.0, Math.hypot(p.getX() + 0.5 - tx, p.getZ() + 0.5 - tz) - GOAL_MAX);
+        }
+
+        /** A spot a few blocks from the Pokémon, roughly level with it, with nothing in the way. */
+        private boolean isGoal(BlockPos p) {
+            long key = p.asLong();
+            Boolean cached = goalCache.get(key);
+            if (cached != null) return cached;
+
+            double hd = Math.hypot(p.getX() + 0.5 - tx, p.getZ() + 0.5 - tz);
+            boolean ok = false;
+            if (hd >= GOAL_MIN && hd <= GOAL_MAX && Math.abs(p.getY() - ty) <= 3.0) {
+                Vec3d from = new Vec3d(p.getX() + 0.5, p.getY() + 1.62, p.getZ() + 0.5);
+                Vec3d to = new Vec3d(tx, targetEyeY, tz);
+                ok = world.raycast(new RaycastContext(from, to, RaycastContext.ShapeType.COLLIDER,
+                    RaycastContext.FluidHandling.NONE, player)).getType() == HitResult.Type.MISS;
+            }
+            goalCache.put(key, ok);
+            return ok;
+        }
+
+        private void generateMoves(BlockPos p, List<Move> out) {
+            int x = p.getX(), y = p.getY(), z = p.getZ();
+
+            int[][] cardinals = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            for (int[] d : cardinals) {
+                int nx = x + d[0], nz = z + d[1];
+                if (standable(nx, y, nz)) {
+                    out.add(new Move(nx, y, nz, 1.0));                       // walk
+                } else if (!passable(nx, y, nz)) {
+                    // blocked at foot level: maybe a one-block step up (needs room to jump)
+                    if (passable(x, y + 2, z) && standable(nx, y + 1, nz)) {
+                        out.add(new Move(nx, y + 1, nz, 1.6));
+                    }
+                } else if (passable(nx, y + 1, nz)) {
+                    // open, but nothing to stand on: maybe a drop of up to three blocks
+                    for (int drop = 1; drop <= 3; drop++) {
+                        int ny = y - drop;
+                        if (standable(nx, ny, nz)) { out.add(new Move(nx, ny, nz, 1.0 + 0.4 * drop)); break; }
+                        if (!passable(nx, ny, nz)) break;
+                    }
+                }
+            }
+
+            int[][] diagonals = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+            for (int[] d : diagonals) {
+                int nx = x + d[0], nz = z + d[1];
+                if (standable(nx, y, nz)
+                        && passable(nx, y, z) && passable(nx, y + 1, z)
+                        && passable(x, y, nz) && passable(x, y + 1, nz)) {
+                    out.add(new Move(nx, y, nz, 1.45));                      // walk diagonally (corners must be clear)
+                }
+            }
+        }
+
+        /** Can stand here: feet and head free, solid ground below, not a square we found to be a dead end. */
+        private boolean standable(int x, int y, int z) {
+            long key = BlockPos.asLong(x, y, z);
+            Boolean cached = standCache.get(key);
+            if (cached != null) return cached;
+            boolean ok = y > world.getBottomY() + 1 && y < world.getTopY() - 3
+                && !blocked.contains(key)
+                && passable(x, y, z) && passable(x, y + 1, z) && hasGround(x, y - 1, z);
+            standCache.put(key, ok);
+            return ok;
+        }
+
+        /** Free to be in: nothing solid (carpets and the like are fine) and nothing harmful. */
+        private boolean passable(int x, int y, int z) {
+            BlockPos pos = new BlockPos(x, y, z);
+            BlockState state = world.getBlockState(pos);
+            if (dangerous(state)) return false;
+            VoxelShape shape = state.getCollisionShape(world, pos);
+            return shape.isEmpty() || shape.getMax(Direction.Axis.Y) <= 0.1;
+        }
+
+        /** Solid to stand on, at most a full block high (so not a fence or wall). */
+        private boolean hasGround(int x, int y, int z) {
+            BlockPos pos = new BlockPos(x, y, z);
+            BlockState state = world.getBlockState(pos);
+            if (dangerous(state)) return false;
+            VoxelShape shape = state.getCollisionShape(world, pos);
+            return !shape.isEmpty() && shape.getMax(Direction.Axis.Y) <= 1.0001;
+        }
+
+        private static boolean dangerous(BlockState state) {
+            return state.getFluidState().isIn(FluidTags.LAVA)
+                || state.isIn(BlockTags.FIRE)
+                || state.isOf(Blocks.CACTUS)
+                || state.isOf(Blocks.MAGMA_BLOCK)
+                || state.isOf(Blocks.SWEET_BERRY_BUSH)
+                || state.isOf(Blocks.COBWEB)
+                || state.isOf(Blocks.POWDER_SNOW);
+        }
     }
 
     // ------------------------- Aiming -------------------------

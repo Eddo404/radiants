@@ -159,6 +159,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final double WORMHOLE_GOAL_RADIUS = 1.5;
     /** Counts as "at the wormhole" within this distance; from there it walks straight into the centre. */
     private static final double WORMHOLE_ARRIVE_RADIUS = 1.8;
+    /** The wormhole hangs above the ground, so jump ONCE when this close (blocks) to its centre. */
+    private static final double WORMHOLE_JUMP_DISTANCE = 1.3;
     private static final double WORMHOLE_MAX_DISTANCE = 150;
     private static final int WORMHOLE_WALK_TIMEOUT_TICKS = 20 * 90;
     private static final int WORMHOLE_PUSH_TICKS = 100;
@@ -175,6 +177,15 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final int RECORD_FILE_LINES = 10000;
     private static final int AUTO_LOG_MAX_LINES = 3000;
     private static final int LISTEN_MAX_LINES = 8000;
+    /** The listener leaves these out because they are just noise (their packets / entities). */
+    private static final List<String> LISTEN_IGNORED_PACKET_PREFIXES = List.of(
+        "chunky:", "cobblemon:set_pc_box", "cobblemon:set_party", "cobblemon:unvalidated_play_sound",
+        "delta:update_balance", "delta:cosmetics", "vivecraft:", "voicechat:", "xercapaint:", "axiom:",
+        "emotecraft:", "fabric:", "c:", "minecraft:register", "deltaclient:map_portraits", "deltaclient:client_settings");
+    private static final Set<String> LISTEN_IGNORED_ENTITIES = Set.of(
+        "minecraft:item_display", "minecraft:text_display", "minecraft:block_display", "minecraft:interaction",
+        "minecraft:armor_stand", "minecraft:item_frame", "minecraft:glow_item_frame", "minecraft:painting",
+        "minecraft:hopper_minecart", "minecraft:marker");
     private static final String SPY_NAME = "radiantalert_spy";
     private static final Pattern IDENTITY_OP = Pattern.compile("\"op\"\\s*:\\s*\"identity\"");
     private static final Pattern SERVER_NAME = Pattern.compile("\"server\"\\s*:\\s*\"([^\"]+)\"");
@@ -229,6 +240,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     private WStage wStage = WStage.WALK;
     private Vec3d wormholePos = Vec3d.ZERO;
     private int wTicks = 0;
+    private boolean wormholeJumped = false;
+    private long wArrivedAt = 0;
 
     // ---- route following ----
     private List<BlockPos> path = List.of();
@@ -245,6 +258,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     private volatile boolean listening = false;
     private long listenStart = 0;
     private int listenLines = 0;
+    private String lastListenText = null;
+    private int listenRepeats = 0;
     private String lastScreenName = "none";
 
     private static Set<UUID> cappedSet(int max) {
@@ -538,7 +553,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     // ============================== Chat and server hops ==============================
 
     private void onChatMessage(String text) {
-        listenLog("CHAT " + text);
+        if (!text.startsWith("[RadiantAlert]") && !text.startsWith("[rec]")) listenLog("CHAT " + text);
         String lower = text.toLowerCase(Locale.ROOT);
         if (task == Task.CATCH && lower.contains("cannot be captured")) {
             MinecraftClient client = MinecraftClient.getInstance();
@@ -564,13 +579,17 @@ public class RadiantAlertClient implements ClientModInitializer {
                 case WALK, PUSH -> {
                     wStage = WStage.ARRIVED;
                     wTicks = 0;
+                    wArrivedAt = now;
                     releaseKeys(client);
                     say(client, "Teleported! Waiting a moment, then sending out a Pokémon...");
                 }
-                case ENCOUNTER -> {
-                    wStage = WStage.FINISHED;
-                    wTicks = 0;
-                    say(client, "Teleported again - sending /" + HOME_COMMAND + " shortly.");
+                case ARRIVED, ENCOUNTER -> {
+                    // left the wormhole: go home (ignore the tail end of the first teleport)
+                    if (wStage == WStage.ENCOUNTER || now - wArrivedAt > 8000) {
+                        wStage = WStage.FINISHED;
+                        wTicks = 0;
+                        say(client, "Left the wormhole - sending /" + HOME_COMMAND + " shortly.");
+                    }
                 }
                 default -> { }
             }
@@ -859,6 +878,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 if (hd <= WORMHOLE_ARRIVE_RADIUS && Math.abs(player.getY() - wormholePos.y) <= 4.5) {
                     wStage = WStage.PUSH;
                     wTicks = 0;
+                    wormholeJumped = false;
                     path = List.of();
                     autoLog("WORMHOLE arrived, pushing in");
                     return;
@@ -870,12 +890,20 @@ public class RadiantAlertClient implements ClientModInitializer {
                     stopWormhole(client, "Reached the wormhole but wasn't teleported.");
                     return;
                 }
-                // walk straight into the centre
+                // walk toward the centre and jump exactly once when we're right at it
+                double hd = Math.hypot(player.getX() - wormholePos.x, player.getZ() - wormholePos.z);
                 float yaw = (float) Math.toDegrees(Math.atan2(wormholePos.z - player.getZ(), wormholePos.x - player.getX())) - 90.0f;
                 player.setYaw(MathHelper.lerpAngleDegrees(0.5f, player.getYaw(), yaw));
-                client.options.forwardKey.setPressed(true);
+
+                boolean jump = false;
+                if (!wormholeJumped && player.isOnGround() && hd <= WORMHOLE_JUMP_DISTANCE) {
+                    jump = true;
+                    wormholeJumped = true;
+                    autoLog("WORMHOLE jump");
+                }
+                client.options.forwardKey.setPressed(hd > 0.35);
                 client.options.sprintKey.setPressed(false);
-                client.options.jumpKey.setPressed(player.horizontalCollision && player.isOnGround());
+                client.options.jumpKey.setPressed(jump);
                 keysHeld = true;
             }
             case ARRIVED -> {
@@ -1327,7 +1355,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     boolean rec = recording;
                     boolean wormhole = ALERT_WORMHOLE && matchesWormhole(info);
                     boolean identity = info.id().equals("deltaclient:ultra_portal_state");
-                    boolean listen = listening && !info.id().startsWith("particle:");
+                    boolean listen = listening && !info.id().startsWith("particle:") && !isListenNoise(info.id());
                     if (rec || wormhole || identity || listen) {
                         final Info finalInfo = info;
                         MinecraftClient.getInstance().execute(() -> handleInfo(finalInfo, wormhole, identity));
@@ -1372,7 +1400,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void handleInfo(Info info, boolean wormhole, boolean identity) {
         if (identity) onIdentityInfo(info);
-        if (listening && !info.id().startsWith("particle:")) {
+        if (listening && !info.id().startsWith("particle:") && !isListenNoise(info.id())) {
             listenLog("PACKET " + info.id() + " " + info.strings()
                 + (info.pos() == null ? "" : String.format(" pos=%.0f,%.0f,%.0f", info.pos()[0], info.pos()[1], info.pos()[2])));
         }
@@ -1439,6 +1467,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         listenStart = System.currentTimeMillis();
         listenLines = 0;
+        lastListenText = null;
+        listenRepeats = 0;
         lastScreenName = screenName(client);
         appendToFile("radiantalert-listen.txt", "---- new listen session " + new Date() + " ----");
         listening = true;
@@ -1449,9 +1479,22 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void listenLog(String text) {
         if (!listening) return;
+        if (text.equals(lastListenText)) { listenRepeats++; return; } // collapse identical lines
+        if (listenRepeats > 0) {
+            appendToFile("radiantalert-listen.txt", "          (the line above repeated " + listenRepeats + " more times)");
+            listenRepeats = 0;
+        }
+        lastListenText = text;
         if (listenLines++ > LISTEN_MAX_LINES) return;
         double secs = (System.currentTimeMillis() - listenStart) / 1000.0;
         appendToFile("radiantalert-listen.txt", String.format("[+%.2fs] %s", secs, text));
+    }
+
+    private static boolean isListenNoise(String packetId) {
+        for (String prefix : LISTEN_IGNORED_PACKET_PREFIXES) {
+            if (packetId.startsWith(prefix)) return true;
+        }
+        return false;
     }
 
     private static String screenName(MinecraftClient client) {
@@ -1471,6 +1514,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (client.player == null || entity == client.player) return;
         String id = entityId(entity);
         if (id.equals("minecraft:item") || id.equals("minecraft:experience_orb")) return;
+        if (LISTEN_IGNORED_ENTITIES.contains(id) || id.startsWith("xercapaint:")) return;
         if (entity.squaredDistanceTo(client.player) > 40 * 40) return;
         String extra = entity instanceof PokemonEntity pe ? " (" + pe.getPokemon().getSpecies().getName() + ")" : "";
         listenLog(String.format("LOAD %s%s at %.1f, %.1f, %.1f", id, extra, entity.getX(), entity.getY(), entity.getZ()));

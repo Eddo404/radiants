@@ -67,6 +67,12 @@ import java.util.regex.Pattern;
  *                          then send "/home us" once caught
  *  /radiantalert wormhole  walk into wormholes, send out a Pokémon after the first teleport,
  *                          then send "/home us" after the second teleport
+ *  /radiantalert party     show what is in your party (and which one counts as a normal Hoopa)
+ *  /radiantalert items     list your inventory items and which ones the clean-up would drop
+ *  /radiantalert clean     dry run: show what the clean-up would drop ('clean go' really does it)
+ *  /radiantalert autoclean clean up automatically when about 5 slots are free
+ *  /radiantalert hoopa     send out a normal Hoopa from your party and put it on your shoulder
+ *  /radiantalert autohoopa do that automatically after you arrive somewhere
  *  /radiantalert stop      cancel everything
  *  /radiantalert listen    record a timeline (packets, chat, teleports, screens) to radiantalert-listen.txt,
  *                          handy when you switch servers and want to see what happens
@@ -169,6 +175,71 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Give up waiting for the second teleport after this long. */
     private static final int ENCOUNTER_TIMEOUT_TICKS = 20 * 60 * 20;
 
+    // --- Inventory clean-up (/radiantalert autoclean) ---
+    /** Command that takes you to the drop-off spot. No slash. */
+    private static final String DEPOSIT_COMMAND = "home deposit";
+    /** Clean up when this many inventory slots (or fewer) are free. */
+    private static final int INVENTORY_FREE_THRESHOLD = 5;
+    /** Send the home command ("home us") again after everything has been dropped. */
+    private static final boolean RETURN_HOME_AFTER_CLEAN = true;
+    /** Ticks between each drop (20 = 1 second). */
+    private static final int DROP_DELAY_TICKS = 4;
+    /** Don't start another clean-up for this long (ms) after one. */
+    private static final long CLEAN_COOLDOWN_MS = 120000;
+
+    /** Keep at most this many of these items (by id); extras are dropped. */
+    private static final Map<String, Integer> KEEP_AT_MOST = Map.of(
+        "cobblemon:beast_ball", 64,
+        "cobblemon:max_revive", 64);
+
+    /** Dropped by exact item id. */
+    private static final Set<String> JUNK_ITEM_IDS = Set.of(
+        "minecraft:golden_apple", "minecraft:enchanted_golden_apple", "minecraft:echo_shard",
+        "cobblemon:protein", "cobblemon:calcium", "cobblemon:iron", "cobblemon:zinc", "cobblemon:carbos",
+        "cobblemon:hp_up", "cobblemon:pp_up", "cobblemon:pp_max",
+        "cobblemon:rare_candy", "cobblemon:life_orb", "cobblemon:mirror_herb",
+        "cobblemon:exp_candy_xl", "cobblemon:hyper_potion",
+        "cobblemon:sweet_herba_mystica", "cobblemon:salty_herba_mystica", "cobblemon:spicy_herba_mystica",
+        "cobblemon:sour_herba_mystica", "cobblemon:bitter_herba_mystica");
+
+    /** Dropped when the item's display name is EXACTLY one of these (lowercase). */
+    private static final Set<String> JUNK_EXACT_NAMES = Set.of(
+        "protein", "calcium", "iron", "zinc", "carbos", "hp up", "pp up", "pp max",
+        "rare candy", "life orb", "mirror herb", "exp. candy xl", "exp candy xl", "hyper potion");
+
+    /** Dropped when the item's display name matches one of these (case-insensitive). */
+    private static final List<Pattern> JUNK_NAME_PATTERNS = List.of(
+        namePattern("\\bmemory\\b"),                          // memories
+        namePattern("\\bmeteorite\\b"),                       // meteorites
+        namePattern("\\bempty ring\\b"),                      // empty rings
+        namePattern("\\bpots?\\b"),                           // pots (not potions)
+        namePattern("^[a-z]{5,}ite( [xy])?$"),                  // mega stones, e.g. "Venusaurite", "Charizardite X"
+        namePattern("nihilego jelly"),
+        namePattern("gimmighoul.*pearl|pearl.*gimmighoul"),     // gimmighoul pearls
+        namePattern("\\bflutes?\\b"),                         // flutes
+        namePattern("eternal flower"),
+        namePattern("echo shard"),
+        namePattern("hyper berr(y|ies)"),
+        namePattern("\\w+ium z$|\\bz-?crystal"),                // z crystals, e.g. "Normalium Z"
+        namePattern("\\bfragments?\\b"),
+        namePattern("herba mystica"),
+        namePattern("sandwich"),
+        namePattern("golden apple"));
+
+    /** Never dropped, even though they look like a pattern above. */
+    private static final Set<String> JUNK_NAME_EXCEPTIONS = Set.of("eviolite", "ender pearl");
+
+    // --- Hoopa on your shoulder (/radiantalert autohoopa) ---
+    private static final String HOOPA_SPECIES = "hoopa";
+    /** A "normal" Hoopa may only have these aspects; anything else (delta, omega, unbound, ...) is not normal. */
+    private static final Set<String> NORMAL_HOOPA_ASPECTS = Set.of("confined", "shiny");
+    /** ...and its form name must be one of these (lowercase). */
+    private static final Set<String> NORMAL_HOOPA_FORMS = Set.of("normal", "confined");
+    /** After arriving somewhere, wait this long (ms) before the automatic Hoopa check. */
+    private static final long HOOPA_AFTER_ARRIVAL_MS = 6000;
+    /** After a successful Hoopa mount, don't run the automatic check again for this long (ms). */
+    private static final long HOOPA_RECHECK_MS = 30L * 60 * 1000;
+
     // ===============================================================================
 
     private static final int MAX_WAIT_TICKS = 60;
@@ -190,7 +261,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final Pattern IDENTITY_OP = Pattern.compile("\"op\"\\s*:\\s*\"identity\"");
     private static final Pattern SERVER_NAME = Pattern.compile("\"server\"\\s*:\\s*\"([^\"]+)\"");
 
-    private enum Task { IDLE, CATCH, WORMHOLE }
+    private enum Task { IDLE, CATCH, WORMHOLE, CLEAN, HOOPA }
     private enum Phase { READY, WAIT_BALL, WAIT_RESULT }
     private enum WStage { WALK, PUSH, ARRIVED, ENCOUNTER, FINISHED }
 
@@ -250,6 +321,26 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int replanCooldown = 0, failedPlans = 0, stuckTicks = 0, stuckStrikes = 0;
     private double stuckX, stuckY, stuckZ;
     private final Set<Long> blockedNodes = new HashSet<>();
+
+    // ---- inventory clean-up ----
+    private enum CStage { SEND_DEPOSIT, WAIT_ARRIVE, DROPPING }
+    private record DropAction(int slot, boolean wholeStack, String itemId, String name) {}
+    private boolean autoCleanEnabled = false;
+    private CStage cStage = CStage.SEND_DEPOSIT;
+    private int cTicks = 0, cArrivedAt = -1, dropDelay = 0, dropsDone = 0;
+    private Vec3d cStartPos = Vec3d.ZERO;
+    private final Deque<DropAction> dropQueue = new ArrayDeque<>();
+    private long cleanCooldownUntil = 0;
+    private int idleCheckTicks = 0;
+
+    // ---- Hoopa on the shoulder ----
+    private enum HStage { SELECT, PRESS, WAIT_OUT, SHOULDER }
+    private boolean autoHoopaEnabled = false;
+    private HStage hStage = HStage.SELECT;
+    private int hTicks = 0, hSlot = -1, hAttempts = 0;
+    private PokemonEntity hEntity = null;
+    private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
+    private boolean sneakHeld = false;
 
     // ---- action log ----
     private int autoLogLines = 0;
@@ -329,14 +420,56 @@ public class RadiantAlertClient implements ClientModInitializer {
                     MinecraftClient c = MinecraftClient.getInstance();
                     autoCatchEnabled = false;
                     autoWormholeEnabled = false;
+                    autoCleanEnabled = false;
+                    autoHoopaEnabled = false;
                     abortCurrent(c, "Stopped.");
-                    say(c, "Auto-catch and auto-wormhole are OFF.");
+                    say(c, "All automatic features are OFF.");
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("party").executes(ctx -> {
+                    showParty(MinecraftClient.getInstance());
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("items").executes(ctx -> {
+                    dumpItems(MinecraftClient.getInstance());
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("clean")
+                    .executes(ctx -> {
+                        showCleanPlan(MinecraftClient.getInstance());
+                        return 1;
+                    })
+                    .then(ClientCommandManager.literal("go").executes(ctx -> {
+                        startClean(MinecraftClient.getInstance(), false);
+                        return 1;
+                    })))
+                .then(ClientCommandManager.literal("autoclean").executes(ctx -> {
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    autoCleanEnabled = !autoCleanEnabled;
+                    say(c, autoCleanEnabled
+                        ? "Auto-clean ON: when " + INVENTORY_FREE_THRESHOLD + " or fewer slots are free I'll go to /" + DEPOSIT_COMMAND
+                            + " and drop the junk. Check the list first with /radiantalert clean."
+                        : "Auto-clean OFF.");
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("hoopa").executes(ctx -> {
+                    startHoopa(MinecraftClient.getInstance(), true);
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("autohoopa").executes(ctx -> {
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    autoHoopaEnabled = !autoHoopaEnabled;
+                    if (autoHoopaEnabled) hoopaDueAt = System.currentTimeMillis() + 2000;
+                    say(c, autoHoopaEnabled
+                        ? "Auto-Hoopa ON: after you arrive somewhere I'll put a normal Hoopa from your party on your shoulder."
+                        : "Auto-Hoopa OFF.");
                     return 1;
                 }))
                 .then(ClientCommandManager.literal("status").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
                     say(c, "packet watcher: " + spyInstalled + " | recording: " + recording + " | listening: " + listening
                         + " | auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
+                        + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
                         + " | server: " + lastServerName);
                     return 1;
@@ -366,6 +499,11 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
 
         if (client.player == null || client.world == null) { pending.clear(); return; }
+
+        if (++idleCheckTicks >= 20) {
+            idleCheckTicks = 0;
+            idleChecks(client);
+        }
 
         Iterator<Pending> it = pending.iterator();
         while (it.hasNext()) {
@@ -416,14 +554,21 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (player == null || client.world == null) { releaseKeys(client); return; }
         if (client.currentScreen != null) { releaseKeys(client); return; } // paused while chat/inventory/battle is open
 
-        if (task == Task.CATCH) catchTick(client, player);
-        else wormholeTick(client, player);
+        switch (task) {
+            case CATCH -> catchTick(client, player);
+            case WORMHOLE -> wormholeTick(client, player);
+            case CLEAN -> cleanTick(client, player);
+            case HOOPA -> hoopaTick(client, player);
+            default -> { }
+        }
     }
 
     private void abortCurrent(MinecraftClient client, String message) {
         switch (task) {
             case CATCH -> stopAuto(client, message);
             case WORMHOLE -> stopWormhole(client, message);
+            case CLEAN -> stopClean(client, message);
+            case HOOPA -> stopHoopa(client, message);
             default -> { }
         }
     }
@@ -572,6 +717,13 @@ public class RadiantAlertClient implements ClientModInitializer {
         autoLog("HOP (" + reason + ") task=" + task + (task == Task.WORMHOLE ? " stage=" + wStage : ""));
 
         MinecraftClient client = MinecraftClient.getInstance();
+        if (autoHoopaEnabled) hoopaDueAt = now + HOOPA_AFTER_ARRIVAL_MS;
+        if (task == Task.CLEAN && cStage == CStage.WAIT_ARRIVE) {
+            cArrivedAt = cTicks;
+            autoLog("CLEAN arrived at the drop-off");
+        } else if (task == Task.HOOPA) {
+            stopHoopa(client, "The server changed - stopping the Hoopa routine.");
+        }
         if (task == Task.CATCH) {
             stopAuto(client, "The server changed - stopping the catch.");
         } else if (task == Task.WORMHOLE) {
@@ -1448,6 +1600,442 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void writeRecord(String line) {
         if (recordWritten++ > RECORD_FILE_LINES) return;
         appendToFile("radiantalert-record.txt", line);
+    }
+
+    // ============================== Idle checks ==============================
+
+    private static Pattern namePattern(String regex) {
+        return Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
+    }
+
+    /** Once a second while idle: start a clean-up or the Hoopa routine if one is due. */
+    private void idleChecks(MinecraftClient client) {
+        if (!canStartTask() || client.currentScreen != null || client.player == null) return;
+        long now = System.currentTimeMillis();
+        if (autoCleanEnabled && now >= cleanCooldownUntil && freeSlots(client.player) <= INVENTORY_FREE_THRESHOLD) {
+            startClean(client, true);
+            return;
+        }
+        if (autoHoopaEnabled && hoopaDueAt != 0 && now >= hoopaDueAt && now >= hoopaCooldownUntil
+                && now - hoopaMountedAt > HOOPA_RECHECK_MS) {
+            hoopaDueAt = 0;
+            startHoopa(client, false);
+        }
+    }
+
+    // ============================== Party ==============================
+
+    private static Object invoke(Object target, String... names) throws Exception {
+        for (String name : names) {
+            try {
+                return target.getClass().getMethod(name).invoke(target);
+            } catch (NoSuchMethodException ignored) {
+                // try the next name
+            }
+        }
+        throw new NoSuchMethodException(String.join("/", names) + " on " + target.getClass().getName());
+    }
+
+    /** Cobblemon's client-side storage object (holds your party). Found by name so a version change can't break the build. */
+    private static Object partyStorage() throws Exception {
+        Class<?> clientClass = Class.forName("com.cobblemon.mod.common.client.CobblemonClient");
+        try {
+            return invoke(clientClass.getField("INSTANCE").get(null), "getStorage");
+        } catch (NoSuchFieldException | NoSuchMethodException e) {
+            return clientClass.getField("storage").get(null);
+        }
+    }
+
+    /** Your party in slot order; an empty slot is null. */
+    private static List<Pokemon> readParty() throws Exception {
+        Object party = invoke(partyStorage(), "getMyParty");
+        Object slots;
+        try {
+            slots = invoke(party, "getSlots");
+        } catch (NoSuchMethodException e) {
+            slots = party;
+        }
+        if (!(slots instanceof Iterable<?> iterable)) {
+            throw new IllegalStateException("the party is not a list: " + slots);
+        }
+        List<Pokemon> out = new ArrayList<>();
+        for (Object o : iterable) out.add(o instanceof Pokemon p ? p : null);
+        return out;
+    }
+
+    private static String describePokemon(Pokemon p) {
+        return p.getSpecies().getName() + " | form=" + p.getForm().getName() + " | aspects=" + p.getAspects()
+            + " | shiny=" + p.getShiny() + " | lvl " + p.getLevel();
+    }
+
+    private static boolean isNormalHoopa(Pokemon p) {
+        if (!p.getSpecies().getName().equalsIgnoreCase(HOOPA_SPECIES)) return false;
+        if (!NORMAL_HOOPA_FORMS.contains(p.getForm().getName().toLowerCase(Locale.ROOT))) return false;
+        for (String aspect : p.getAspects()) {
+            if (!NORMAL_HOOPA_ASPECTS.contains(aspect.toLowerCase(Locale.ROOT))) return false;
+        }
+        return true;
+    }
+
+    private void showParty(MinecraftClient client) {
+        if (client.player == null) return;
+        try {
+            List<Pokemon> party = readParty();
+            say(client, "Your party:");
+            for (int i = 0; i < party.size(); i++) {
+                Pokemon p = party.get(i);
+                String line = " " + (i + 1) + ". " + (p == null ? "(empty)"
+                    : describePokemon(p) + (isNormalHoopa(p) ? "   <- normal Hoopa" : ""));
+                client.player.sendMessage(Text.literal(line), false);
+                autoLog("PARTY" + line);
+            }
+        } catch (Throwable t) {
+            say(client, "Couldn't read your party: " + t);
+            autoLog("PARTY failed: " + t);
+            logPartyApi();
+        }
+    }
+
+    /** When reading the party fails, write down what Cobblemon's client classes really look like, so it can be fixed. */
+    private void logPartyApi() {
+        try {
+            Class<?> c = Class.forName("com.cobblemon.mod.common.client.CobblemonClient");
+            StringBuilder sb = new StringBuilder("API CobblemonClient methods/fields:");
+            for (java.lang.reflect.Method m : c.getMethods()) sb.append(' ').append(m.getName());
+            for (Field f : c.getFields()) sb.append(" field:").append(f.getName());
+            autoLog(sb.toString());
+            Object storage = partyStorage();
+            StringBuilder sb2 = new StringBuilder("API storage " + storage.getClass().getName() + " methods:");
+            for (java.lang.reflect.Method m : storage.getClass().getMethods()) sb2.append(' ').append(m.getName());
+            autoLog(sb2.toString());
+            Object party = invoke(storage, "getMyParty");
+            StringBuilder sb3 = new StringBuilder("API party " + party.getClass().getName() + " methods:");
+            for (java.lang.reflect.Method m : party.getClass().getMethods()) sb3.append(' ').append(m.getName());
+            autoLog(sb3.toString());
+        } catch (Throwable t) {
+            autoLog("API listing failed: " + t);
+        }
+    }
+
+    // ============================== Inventory clean-up ==============================
+
+    private static int freeSlots(ClientPlayerEntity player) {
+        int free = 0;
+        for (int i = 0; i < 36; i++) {
+            if (player.getInventory().getStack(i).isEmpty()) free++;
+        }
+        return free;
+    }
+
+    private static String itemIdOf(ItemStack stack) {
+        return Registries.ITEM.getId(stack.getItem()).toString();
+    }
+
+    private static String itemNameOf(ItemStack stack) {
+        return stack.getName().getString().trim();
+    }
+
+    private static boolean isJunk(ItemStack stack) {
+        if (stack.isEmpty()) return false;
+        String name = itemNameOf(stack).toLowerCase(Locale.ROOT);
+        if (JUNK_NAME_EXCEPTIONS.contains(name)) return false;
+        if (JUNK_ITEM_IDS.contains(itemIdOf(stack))) return true;
+        if (JUNK_EXACT_NAMES.contains(name)) return true;
+        for (Pattern pattern : JUNK_NAME_PATTERNS) {
+            if (pattern.matcher(name).find()) return true;
+        }
+        return false;
+    }
+
+    /** Everything that would be dropped right now: junk stacks whole, and the excess of the "keep at most" items. */
+    private static List<DropAction> buildDropActions(ClientPlayerEntity player) {
+        List<DropAction> actions = new ArrayList<>();
+        Map<String, List<int[]>> limited = new HashMap<>(); // id -> list of {slot, count}
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            String id = itemIdOf(s);
+            if (KEEP_AT_MOST.containsKey(id)) {
+                limited.computeIfAbsent(id, k -> new ArrayList<>()).add(new int[]{i, s.getCount()});
+            } else if (isJunk(s)) {
+                actions.add(new DropAction(i, true, id, itemNameOf(s)));
+            }
+        }
+        for (Map.Entry<String, List<int[]>> e : limited.entrySet()) {
+            int total = 0;
+            for (int[] st : e.getValue()) total += st[1];
+            int excess = total - KEEP_AT_MOST.get(e.getKey());
+            if (excess <= 0) continue;
+            e.getValue().sort(Comparator.<int[]>comparingInt(st -> st[1])); // smallest stacks go first
+            for (int[] st : e.getValue()) {
+                if (excess <= 0) break;
+                String name = itemNameOf(player.getInventory().getStack(st[0]));
+                if (st[1] <= excess) {
+                    actions.add(new DropAction(st[0], true, e.getKey(), name));
+                    excess -= st[1];
+                } else {
+                    for (int k = 0; k < excess; k++) actions.add(new DropAction(st[0], false, e.getKey(), name));
+                    excess = 0;
+                }
+            }
+        }
+        return actions;
+    }
+
+    /** /radiantalert items: every inventory stack with its id, name and whether it would be dropped. */
+    private void dumpItems(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null) return;
+        Set<Integer> dropSlots = new HashSet<>();
+        for (DropAction a : buildDropActions(player)) dropSlots.add(a.slot());
+
+        appendToFile("radiantalert-items.txt", "---- inventory " + new Date() + " ----");
+        int stacks = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            stacks++;
+            String comps = String.valueOf(s.getComponents());
+            if (comps.length() > 300) comps = comps.substring(0, 300) + "...";
+            appendToFile("radiantalert-items.txt", String.format("slot %2d | %s | \"%s\" | x%d | %s | %s",
+                i, itemIdOf(s), itemNameOf(s), s.getCount(), dropSlots.contains(i) ? "WOULD DROP" : "keep", comps));
+        }
+        say(client, "Saved " + stacks + " stacks (" + freeSlots(player) + " free slots) to radiantalert-items.txt in your Minecraft folder. "
+            + "Send it to me if the drop list needs fixing.");
+    }
+
+    /** /radiantalert clean (dry run): shows what would be dropped without doing anything. */
+    private void showCleanPlan(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null) return;
+        List<DropAction> actions = buildDropActions(player);
+        say(client, "Free slots: " + freeSlots(player) + " (clean-up starts at " + INVENTORY_FREE_THRESHOLD
+            + " or fewer). DRY RUN - nothing is dropped.");
+        if (actions.isEmpty()) {
+            say(client, "Nothing in your inventory matches the drop list.");
+            return;
+        }
+        Map<String, int[]> summary = new TreeMap<>();
+        for (DropAction a : actions) {
+            ItemStack s = player.getInventory().getStack(a.slot());
+            String label = a.name() + " (" + a.itemId() + ")";
+            summary.computeIfAbsent(label, k -> new int[]{0})[0] += a.wholeStack() ? s.getCount() : 1;
+        }
+        for (Map.Entry<String, int[]> e : summary.entrySet()) {
+            player.sendMessage(Text.literal(" - " + e.getKey() + " x" + e.getValue()[0]), false);
+        }
+        say(client, "Run /radiantalert clean go to do it now, or /radiantalert autoclean to do it automatically.");
+    }
+
+    private void startClean(MinecraftClient client, boolean auto) {
+        ClientPlayerEntity player = client.player;
+        if (player == null) return;
+        if (task != Task.IDLE) { say(client, "Busy with something else right now."); return; }
+        List<DropAction> actions = buildDropActions(player);
+        if (actions.isEmpty()) {
+            cleanCooldownUntil = System.currentTimeMillis() + CLEAN_COOLDOWN_MS;
+            say(client, "Inventory is nearly full (" + freeSlots(player) + " free) but nothing matches the drop list - skipping.");
+            return;
+        }
+        task = Task.CLEAN;
+        cStage = CStage.SEND_DEPOSIT;
+        cTicks = 0;
+        cArrivedAt = -1;
+        dropsDone = 0;
+        dropDelay = 0;
+        dropQueue.clear();
+        autoLog("CLEAN start (" + (auto ? "auto" : "manual") + ") free=" + freeSlots(player) + " actions=" + actions.size());
+        say(client, "Inventory nearly full (" + freeSlots(player) + " free): going to /" + DEPOSIT_COMMAND
+            + " to drop " + actions.size() + " item action(s). Open chat and run /radiantalert stop to cancel.");
+    }
+
+    private void cleanTick(MinecraftClient client, ClientPlayerEntity player) {
+        cTicks++;
+        switch (cStage) {
+            case SEND_DEPOSIT -> {
+                cStartPos = player.getPos();
+                player.networkHandler.sendChatCommand(DEPOSIT_COMMAND);
+                autoLog("SENT /" + DEPOSIT_COMMAND);
+                cStage = CStage.WAIT_ARRIVE;
+                cTicks = 0;
+                cArrivedAt = -1;
+            }
+            case WAIT_ARRIVE -> {
+                // arrival = a server switch (onServerHop) or being moved more than 5 blocks
+                if (cArrivedAt < 0 && player.getPos().squaredDistanceTo(cStartPos) > 25.0) {
+                    cArrivedAt = cTicks;
+                    autoLog("CLEAN moved to the drop-off");
+                }
+                boolean timedOut = cTicks > 20 * 20;
+                if ((cArrivedAt >= 0 && cTicks - cArrivedAt >= 40) || timedOut) {
+                    if (timedOut) say(client, "Didn't notice the teleport - dropping here.");
+                    dropQueue.clear();
+                    dropQueue.addAll(buildDropActions(player));
+                    autoLog("CLEAN dropping " + dropQueue.size() + " action(s)");
+                    cStage = CStage.DROPPING;
+                    cTicks = 0;
+                    dropDelay = 0;
+                    dropsDone = 0;
+                    player.setPitch(-10.0f); // look a little up so the items fly well away
+                }
+            }
+            case DROPPING -> {
+                if (dropDelay > 0) { dropDelay--; return; }
+                DropAction a = dropQueue.poll();
+                if (a == null) { finishClean(client); return; }
+                if (client.interactionManager == null) return;
+                ItemStack s = player.getInventory().getStack(a.slot());
+                // skip anything that changed since it was planned
+                if (s.isEmpty() || !itemIdOf(s).equals(a.itemId()) || !itemNameOf(s).equals(a.name())) return;
+                int screenSlot = a.slot() < 9 ? 36 + a.slot() : a.slot();
+                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot,
+                    a.wholeStack() ? 1 : 0, SlotActionType.THROW, player);
+                dropsDone++;
+                dropDelay = DROP_DELAY_TICKS;
+            }
+        }
+    }
+
+    private void finishClean(MinecraftClient client) {
+        int n = dropsDone;
+        cleanCooldownUntil = System.currentTimeMillis() + CLEAN_COOLDOWN_MS;
+        stopClean(client, "Dropped " + n + " item action(s).");
+        if (RETURN_HOME_AFTER_CLEAN) sendHome(client);
+    }
+
+    private void stopClean(MinecraftClient client, String message) {
+        task = Task.IDLE;
+        dropQueue.clear();
+        autoLog("CLEAN stop: " + message);
+        say(client, message);
+    }
+
+    // ============================== Hoopa on the shoulder ==============================
+
+    private PokemonEntity findOwnHoopa(MinecraftClient client) {
+        if (client.player == null || client.world == null) return null;
+        PokemonEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                client.player.getBoundingBox().expand(12),
+                x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved()
+                    && x.getPokemon().getSpecies().getName().equalsIgnoreCase(HOOPA_SPECIES))) {
+            double d = pe.squaredDistanceTo(client.player);
+            if (d < bestDist) { bestDist = d; best = pe; }
+        }
+        return best;
+    }
+
+    private void startHoopa(MinecraftClient client, boolean manual) {
+        ClientPlayerEntity player = client.player;
+        if (player == null) return;
+        if (task != Task.IDLE) {
+            if (manual) say(client, "Busy with something else right now.");
+            return;
+        }
+        hoopaCooldownUntil = System.currentTimeMillis() + 60000;
+
+        List<Pokemon> party;
+        try {
+            party = readParty();
+        } catch (Throwable t) {
+            say(client, "Couldn't read your party: " + t);
+            autoLog("HOOPA party read failed: " + t);
+            logPartyApi();
+            return;
+        }
+        int slot = -1;
+        for (int i = 0; i < party.size(); i++) {
+            Pokemon p = party.get(i);
+            if (p != null && isNormalHoopa(p)) { slot = i; break; }
+        }
+        if (slot < 0) {
+            if (manual) say(client, "No normal Hoopa in your party (run /radiantalert party to see what it found).");
+            return;
+        }
+
+        hSlot = slot;
+        hAttempts = 0;
+        hTicks = 0;
+        hEntity = findOwnHoopa(client);
+        task = Task.HOOPA;
+        hStage = hEntity != null ? HStage.SHOULDER : HStage.SELECT;
+        autoLog("HOOPA start slot=" + (slot + 1) + " alreadyOut=" + (hEntity != null));
+        say(client, hEntity != null
+            ? "Your Hoopa is already out - putting it on your shoulder."
+            : "Sending out your Hoopa (party slot " + (slot + 1) + ").");
+    }
+
+    private void hoopaTick(MinecraftClient client, ClientPlayerEntity player) {
+        hTicks++;
+        switch (hStage) {
+            case SELECT -> {
+                try {
+                    Object storage = partyStorage();
+                    storage.getClass().getMethod("setSelectedSlot", int.class).invoke(storage, hSlot);
+                } catch (Throwable t) {
+                    autoLog("HOOPA could not select the party slot: " + t);
+                    logPartyApi();
+                    stopHoopa(client, "Couldn't select the party slot (" + t + "). Details are in radiantalert-auto.txt.");
+                    return;
+                }
+                hStage = HStage.PRESS;
+                hTicks = 0;
+            }
+            case PRESS -> {
+                if (hTicks >= 5) {
+                    pressSendOutKey();
+                    hStage = HStage.WAIT_OUT;
+                    hTicks = 0;
+                }
+            }
+            case WAIT_OUT -> {
+                hEntity = findOwnHoopa(client);
+                if (hEntity != null) {
+                    hStage = HStage.SHOULDER;
+                    hTicks = 0;
+                } else if (hTicks > 100) {
+                    stopHoopa(client, "Hoopa didn't come out.");
+                }
+            }
+            case SHOULDER -> {
+                if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
+                if (hTicks == 1) {                       // crouch first
+                    client.options.sneakKey.setPressed(true);
+                    sneakHeld = true;
+                }
+                if (hTicks == 4 && !hEntity.isRemoved() && client.interactionManager != null) {
+                    client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND); // crouch + right-click
+                    autoLog("HOOPA interact attempt " + (hAttempts + 1));
+                }
+                if (hTicks > 4 && hEntity.isRemoved()) {
+                    hoopaMountedAt = System.currentTimeMillis();
+                    stopHoopa(client, "Hoopa is on your shoulder.");
+                    return;
+                }
+                if (hTicks >= 14) {
+                    hAttempts++;
+                    if (hAttempts >= 3) {
+                        stopHoopa(client, "Couldn't put Hoopa on your shoulder (tried 3 times).");
+                        return;
+                    }
+                    hTicks = 0;
+                    client.options.sneakKey.setPressed(false);
+                    sneakHeld = false;
+                }
+            }
+        }
+    }
+
+    private void stopHoopa(MinecraftClient client, String message) {
+        task = Task.IDLE;
+        hEntity = null;
+        if (sneakHeld) {
+            client.options.sneakKey.setPressed(false);
+            sneakHeld = false;
+        }
+        autoLog("HOOPA stop: " + message);
+        say(client, message);
     }
 
     // ============================== Listener (/radiantalert listen) ==============================

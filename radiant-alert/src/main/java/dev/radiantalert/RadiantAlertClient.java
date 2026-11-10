@@ -38,6 +38,7 @@ import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.HitResult;
@@ -240,12 +241,25 @@ public class RadiantAlertClient implements ClientModInitializer {
         namePattern("\\bflutes?\\b"),                         // flutes
         namePattern("eternal flower"),
         namePattern("echo shard"),
-        namePattern("hyper berr(y|ies)"),
+        namePattern("hyper.*berr(y|ies)"),                      // hyper berries
         namePattern("\\w+ium z$|\\bz-?crystal"),                // z crystals, e.g. "Normalium Z"
         namePattern("\\bfragments?\\b"),
         namePattern("herba mystica"),
         namePattern("sandwich"),
+        namePattern("\\bfossils?\\b"),                          // fossils
+        namePattern("charged apri"),                            // charged apri juice
         namePattern("golden apple"));
+
+    /** Dropped when the item's registry id matches one of these (fossils and the vanilla ores / minerals). */
+    private static final List<Pattern> JUNK_ID_PATTERNS = List.of(
+        Pattern.compile("^cobblemon:.*fossil.*$"),                                                        // fossils
+        Pattern.compile("^minecraft:(deepslate_)?(coal|iron|copper|gold|diamond|emerald|lapis|redstone)_ore$"), // ores
+        Pattern.compile("^minecraft:(nether_gold_ore|nether_quartz_ore|ancient_debris)$"),
+        Pattern.compile("^minecraft:raw_(iron|copper|gold)(_block)?$"),                                   // raw metal
+        Pattern.compile("^minecraft:(iron|gold|copper|netherite)_ingot$"),                                // ingots
+        Pattern.compile("^minecraft:(iron|gold)_nugget$"),
+        Pattern.compile("^minecraft:(coal|iron|gold|copper|diamond|emerald|lapis|redstone|netherite)_block$"), // mineral blocks
+        Pattern.compile("^minecraft:(coal|diamond|emerald|lapis_lazuli|redstone|quartz|netherite_scrap)$"));  // gems and dusts
 
     /** Never dropped, even though they look like a pattern above. */
     private static final Set<String> JUNK_NAME_EXCEPTIONS = Set.of("eviolite", "ender pearl");
@@ -253,13 +267,13 @@ public class RadiantAlertClient implements ClientModInitializer {
     // --- Hoopa on your shoulder (/radiantalert autohoopa) ---
     private static final String HOOPA_SPECIES = "hoopa";
     /** A "normal" Hoopa may only have these aspects; anything else (delta, omega, unbound, ...) is not normal. */
-    private static final Set<String> NORMAL_HOOPA_ASPECTS = Set.of("confined", "shiny");
+    private static final Set<String> NORMAL_HOOPA_ASPECTS = Set.of("confined", "shiny", "genderless", "male", "female");
     /** ...and its form name must be one of these (lowercase). */
     private static final Set<String> NORMAL_HOOPA_FORMS = Set.of("normal", "confined");
     /** After arriving somewhere, wait this long (ms) before the automatic Hoopa check. */
     private static final long HOOPA_AFTER_ARRIVAL_MS = 6000;
     /** After a successful Hoopa mount, don't run the automatic check again for this long (ms). */
-    private static final long HOOPA_RECHECK_MS = 30L * 60 * 1000;
+    private static final long HOOPA_RECHECK_MS = 15000;
 
     // ===============================================================================
 
@@ -355,10 +369,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int idleCheckTicks = 0;
 
     // ---- Hoopa on the shoulder ----
-    private enum HStage { SELECT, PRESS, WAIT_OUT, SHOULDER }
+    private enum HStage { SELECT, PRESS, WAIT_OUT, APPROACH, SHOULDER }
     private boolean autoHoopaEnabled = false;
     private HStage hStage = HStage.SELECT;
-    private int hTicks = 0, hSlot = -1, hAttempts = 0;
+    private int hTicks = 0, hSlot = -1, hAttempts = 0, hPrevSlot = -1;
     private PokemonEntity hEntity = null;
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
     private boolean sneakHeld = false;
@@ -2088,9 +2102,19 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    /** The Pokémon's current state as Cobblemon names it: roughly Inactive (in the party), Active (out) or Shouldered. */
+    private static String pokemonState(Pokemon p) {
+        try {
+            Object state = invoke(p, "getState");
+            return state == null ? "?" : state.getClass().getSimpleName();
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
     private static String describePokemon(Pokemon p) {
         return p.getSpecies().getName() + " | form=" + p.getForm().getName() + " | aspects=" + p.getAspects()
-            + " | shiny=" + p.getShiny() + " | lvl " + p.getLevel();
+            + " | shiny=" + p.getShiny() + " | lvl " + p.getLevel() + " | state=" + pokemonState(p);
     }
 
     private static boolean isNormalHoopa(Pokemon p) {
@@ -2166,6 +2190,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (JUNK_NAME_EXCEPTIONS.contains(name)) return false;
         if (JUNK_ITEM_IDS.contains(itemIdOf(stack))) return true;
         if (JUNK_EXACT_NAMES.contains(name)) return true;
+        String id = itemIdOf(stack);
+        for (Pattern pattern : JUNK_ID_PATTERNS) {
+            if (pattern.matcher(id).find()) return true;
+        }
         for (Pattern pattern : JUNK_NAME_PATTERNS) {
             if (pattern.matcher(name).find()) return true;
         }
@@ -2378,13 +2406,21 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
 
+        String state = pokemonState(party.get(slot));
+        if (state.toLowerCase(Locale.ROOT).contains("shoulder")) {
+            autoLog("HOOPA already on the shoulder (state=" + state + ")");
+            if (manual) say(client, "Your Hoopa is already on your shoulder.");
+            return;
+        }
+
         hSlot = slot;
         hAttempts = 0;
         hTicks = 0;
+        hPrevSlot = -1;
         hEntity = findOwnHoopa(client);
         task = Task.HOOPA;
-        hStage = hEntity != null ? HStage.SHOULDER : HStage.SELECT;
-        autoLog("HOOPA start slot=" + (slot + 1) + " alreadyOut=" + (hEntity != null));
+        hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
+        autoLog("HOOPA start slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null));
         say(client, hEntity != null
             ? "Your Hoopa is already out - putting it on your shoulder."
             : "Sending out your Hoopa (party slot " + (slot + 1) + ").");
@@ -2421,10 +2457,34 @@ public class RadiantAlertClient implements ClientModInitializer {
             case WAIT_OUT -> {
                 hEntity = findOwnHoopa(client);
                 if (hEntity != null) {
-                    hStage = HStage.SHOULDER;
+                    hStage = HStage.APPROACH;
                     hTicks = 0;
                 } else if (hTicks > 100) {
                     stopHoopa(client, "Hoopa didn't come out.");
+                }
+            }
+            case APPROACH -> {
+                // wait for the send-out animation, and get within reach (about 3 blocks) of it
+                if (hEntity == null || hEntity.isRemoved()) hEntity = findOwnHoopa(client);
+                if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
+                boolean tooFar = player.distanceTo(hEntity) > 2.4f;
+                if (tooFar && hTicks < 100) {
+                    aimAt(player, hEntity);
+                    client.options.forwardKey.setPressed(true);
+                    client.options.sprintKey.setPressed(false);
+                    keysHeld = true;
+                } else if (hTicks >= 20) {
+                    releaseKeys(client);
+                    // use an empty hand for the right-click if there is a free hotbar slot
+                    hPrevSlot = player.getInventory().selectedSlot;
+                    for (int i = 0; i < 9; i++) {
+                        if (player.getInventory().getStack(i).isEmpty()) {
+                            player.getInventory().selectedSlot = i;
+                            break;
+                        }
+                    }
+                    hStage = HStage.SHOULDER;
+                    hTicks = 0;
                 }
             }
             case SHOULDER -> {
@@ -2433,9 +2493,18 @@ public class RadiantAlertClient implements ClientModInitializer {
                     client.options.sneakKey.setPressed(true);
                     sneakHeld = true;
                 }
+                if (hTicks == 3 && !hEntity.isRemoved() && player.distanceTo(hEntity) > 2.9f) {
+                    // it wandered off while we crouched: go back to it
+                    client.options.sneakKey.setPressed(false);
+                    sneakHeld = false;
+                    hStage = HStage.APPROACH;
+                    hTicks = 0;
+                    return;
+                }
                 if (hTicks == 4 && !hEntity.isRemoved() && client.interactionManager != null) {
-                    client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND); // crouch + right-click
-                    autoLog("HOOPA interact attempt " + (hAttempts + 1));
+                    ActionResult result = client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND); // crouch + right-click
+                    autoLog(String.format("HOOPA interact attempt %d: distance=%.1f sneaking=%s result=%s",
+                        hAttempts + 1, (double) player.distanceTo(hEntity), player.isSneaking(), result));
                 }
                 if (hTicks > 4 && hEntity.isRemoved()) {
                     hoopaMountedAt = System.currentTimeMillis();
@@ -2445,7 +2514,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 if (hTicks >= 14) {
                     hAttempts++;
                     if (hAttempts >= 3) {
-                        stopHoopa(client, "Couldn't put Hoopa on your shoulder (tried 3 times).");
+                        stopHoopa(client, "Couldn't put Hoopa on your shoulder (tried 3 times). See radiantalert-auto.txt.");
                         return;
                     }
                     hTicks = 0;
@@ -2459,9 +2528,14 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void stopHoopa(MinecraftClient client, String message) {
         task = Task.IDLE;
         hEntity = null;
+        releaseKeys(client);
         if (sneakHeld) {
             client.options.sneakKey.setPressed(false);
             sneakHeld = false;
+        }
+        if (hPrevSlot >= 0 && client.player != null) {
+            client.player.getInventory().selectedSlot = hPrevSlot;
+            hPrevSlot = -1;
         }
         autoLog("HOOPA stop: " + message);
         say(client, message);

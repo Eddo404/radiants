@@ -12,16 +12,19 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientEntityEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.ClientConnection;
 import net.minecraft.network.packet.CustomPayload;
@@ -56,6 +59,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -67,6 +71,9 @@ import java.util.regex.Pattern;
  *                          then send "/home us" once caught
  *  /radiantalert wormhole  walk into wormholes, send out a Pokémon after the first teleport,
  *                          then send "/home us" after the second teleport
+ *                          (at the end of a wormhole it also catches an Ultra Beast with Beast Balls,
+ *                          and if you die inside the wormhole it respawns you, re-equips a chestplate and
+ *                          sends your first Pokémon out again with R, then carries on)
  *  /radiantalert party     show what is in your party (and which one counts as a normal Hoopa)
  *  /radiantalert items     list your inventory items and which ones the clean-up would drop
  *  /radiantalert clean     dry run: show what the clean-up would drop ('clean go' really does it)
@@ -156,7 +163,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** How many map squares the route planner may look at before settling for the closest it found. */
     private static final int PLAN_MAX_NODES = 15000;
     /** Minimum gap between route plans (ticks). */
-    private static final int REPLAN_COOLDOWN_TICKS = 10;
+    private static final int REPLAN_COOLDOWN_TICKS = 5;
 
     // --- Wormhole run ---
     /** Key pressed after the first teleport to send out a Pokémon (Cobblemon's default is R). */
@@ -174,6 +181,20 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final int AFTER_TELEPORT_WAIT_TICKS = 60;
     /** Give up waiting for the second teleport after this long. */
     private static final int ENCOUNTER_TIMEOUT_TICKS = 20 * 60 * 20;
+
+    // --- Ultra Beast at the end of a wormhole ---
+    /** Species that count as Ultra Beasts (lowercase). */
+    private static final Set<String> ULTRA_BEASTS = Set.of(
+        "nihilego", "buzzwole", "pheromosa", "xurkitree", "celesteela", "kartana",
+        "guzzlord", "poipole", "naganadel", "stakataka", "blacephalon");
+    /** The only ball used on them. No limit on how many. */
+    private static final String BEAST_BALL_ID = "cobblemon:beast_ball";
+    /**
+     * The wormhole battle is automatic; once it's won you land on the spawn server and an Ultra Beast MAY appear
+     * (not every time). Wait this long (ticks, 20 = 1 second) there, checking for one, before going home.
+     */
+    private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 3;
+    private static final double ULTRA_BEAST_SEARCH_RADIUS = 64;
 
     // --- Inventory clean-up (/radiantalert autoclean) ---
     /** Command that takes you to the drop-off spot. No slash. */
@@ -342,6 +363,16 @@ public class RadiantAlertClient implements ClientModInitializer {
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
     private boolean sneakHeld = false;
 
+    // ---- Ultra Beast catch, death handling, route start ----
+    private boolean ubCatch = false;
+    private long lastHomeSentAt = 0;
+    private final Set<UUID> ubHandled = cappedSet(50);
+    private boolean respawnPending = false;
+    private boolean respawnContinuesRun = false;
+    private long lastRespawnAt = 0;
+    private int deathTicks = 0, respawnTicks = 0;
+    private Vec3d routeStart = Vec3d.ZERO;
+
     // ---- action log ----
     private int autoLogLines = 0;
 
@@ -422,6 +453,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoWormholeEnabled = false;
                     autoCleanEnabled = false;
                     autoHoopaEnabled = false;
+                    ubCatch = false;
                     abortCurrent(c, "Stopped.");
                     say(c, "All automatic features are OFF.");
                     return 1;
@@ -505,6 +537,48 @@ public class RadiantAlertClient implements ClientModInitializer {
             idleChecks(client);
         }
 
+        // Dying: respawn, put a chestplate back on, and
+        //  - inside the wormhole (a life is lost, the run goes on): send your first Pokémon out again with R;
+        //  - anywhere else during a wormhole run: the run is over, so go home.
+        if (client.currentScreen instanceof DeathScreen && (task == Task.WORMHOLE || autoWormholeEnabled)) {
+            if (++deathTicks >= 20) {
+                deathTicks = 0;
+                boolean insideWormhole = task == Task.WORMHOLE && (wStage == WStage.ARRIVED || wStage == WStage.ENCOUNTER);
+                respawnContinuesRun = insideWormhole;
+                autoLog("DEATH detected - respawning (task=" + task + ", insideWormhole=" + insideWormhole + ")");
+                if (insideWormhole) {
+                    say(client, "You died in the wormhole - respawning, then sending your first Pokémon out again.");
+                } else {
+                    ubCatch = false;
+                    abortCurrent(client, "You died - respawning.");
+                }
+                lastRespawnAt = System.currentTimeMillis();
+                client.player.requestRespawn();
+                client.setScreen(null);
+                respawnPending = true;
+                respawnTicks = 0;
+            }
+        } else {
+            deathTicks = 0;
+        }
+        if (respawnPending && client.currentScreen == null && client.player.isAlive()) {
+            if (++respawnTicks >= 40) {
+                respawnPending = false;
+                lastRespawnAt = System.currentTimeMillis();
+                ensureChestplate(client);
+                if (respawnContinuesRun && task == Task.WORMHOLE) {
+                    trySelectPartySlot(0);        // the first Pokémon
+                    pressSendOutKey();            // R
+                    wStage = WStage.ENCOUNTER;    // keep waiting for the battle to finish
+                    wTicks = 0;
+                    autoLog("DEATH recovered: sent out the first Pokémon again");
+                    say(client, "Sent your first Pokémon out again.");
+                } else {
+                    sendHome(client);
+                }
+            }
+        }
+
         Iterator<Pending> it = pending.iterator();
         while (it.hasNext()) {
             Pending p = it.next();
@@ -518,6 +592,13 @@ public class RadiantAlertClient implements ClientModInitializer {
 
             // Shiny Nihilego etc.: can't be caught, ignore completely
             if (pokemon.getShiny() && IGNORED_SHINY_SPECIES.contains(species)) {
+                it.remove();
+                alerted.add(e.getUuid());
+                continue;
+            }
+
+            // Ultra Beasts don't spawn naturally in Ultra Space (the ones there can't be caught): ignore them there
+            if (ULTRA_BEASTS.contains(species) && inUltraSpace(client)) {
                 it.remove();
                 alerted.add(e.getUuid());
                 continue;
@@ -725,7 +806,10 @@ public class RadiantAlertClient implements ClientModInitializer {
             stopHoopa(client, "The server changed - stopping the Hoopa routine.");
         }
         if (task == Task.CATCH) {
+            ubCatch = false;
             stopAuto(client, "The server changed - stopping the catch.");
+        } else if (task == Task.WORMHOLE && (respawnPending || now - lastRespawnAt < 6000)) {
+            autoLog("HOP ignored (just respawned)");
         } else if (task == Task.WORMHOLE) {
             switch (wStage) {
                 case WALK, PUSH -> {
@@ -765,7 +849,10 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void sendHome(MinecraftClient client) {
         if (client.player == null) return;
-        homeCooldownUntil = System.currentTimeMillis() + HOME_COOLDOWN_MS;
+        long now = System.currentTimeMillis();
+        if (now - lastHomeSentAt < 5000) return; // already sent a moment ago
+        lastHomeSentAt = now;
+        homeCooldownUntil = now + HOME_COOLDOWN_MS;
         client.player.networkHandler.sendChatCommand(HOME_COMMAND);
         autoLog("SENT /" + HOME_COMMAND);
         say(client, "Sent /" + HOME_COMMAND);
@@ -774,11 +861,22 @@ public class RadiantAlertClient implements ClientModInitializer {
     // ============================== Catching ==============================
 
     private void startCatch(MinecraftClient client, PokemonEntity e, boolean radiant) {
+        beginCatch(client, e, radiant, false);
+    }
+
+    /** An Ultra Beast at the end of a wormhole: Beast Balls only, no ball limit, then home. */
+    private void startUltraBeastCatch(MinecraftClient client, PokemonEntity e) {
+        beginCatch(client, e, false, true);
+    }
+
+    private void beginCatch(MinecraftClient client, PokemonEntity e, boolean radiant, boolean ultraBeast) {
         if (client.player.distanceTo(e) > MAX_APPROACH_DISTANCE) {
             say(client, "Too far away to chase (more than " + (int) MAX_APPROACH_DISTANCE + " blocks).");
+            if (ultraBeast) sendHome(client);
             return;
         }
         task = Task.CATCH;
+        ubCatch = ultraBeast;
         target = e;
         targetName = e.getPokemon().getSpecies().getName();
         allowPremiumBalls = radiant;
@@ -791,10 +889,15 @@ public class RadiantAlertClient implements ClientModInitializer {
         zoneActive = false;
         zoneOverrideTicks = 0;
         resetRoute(client);
-        autoLog("CATCH start " + targetName + " radiant=" + radiant);
-        say(client, "Heading to " + (radiant ? "Radiant " : "Shiny ") + targetName
-            + (radiant ? " (Master/Ancient Origin balls allowed)." : " (no Master/Ancient Origin balls).")
-            + " Open chat and run /radiantalert stop to cancel.");
+        autoLog("CATCH start " + targetName + " radiant=" + radiant + " ultraBeast=" + ultraBeast);
+        if (ultraBeast) {
+            client.player.playSound(SoundEvents.ENTITY_PLAYER_LEVELUP, 1.0f, 0.8f);
+            say(client, "ULTRA BEAST! Heading to " + targetName + " - Beast Balls until it's caught.");
+        } else {
+            say(client, "Heading to " + (radiant ? "Radiant " : "Shiny ") + targetName
+                + (radiant ? " (Master/Ancient Origin balls allowed)." : " (no Master/Ancient Origin balls).")
+                + " Open chat and run /radiantalert stop to cancel.");
+        }
     }
 
     private void catchTick(MinecraftClient client, ClientPlayerEntity player) {
@@ -847,7 +950,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void throwTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
         if (throwCooldown > 0) return;
-        if (!allowPremiumBalls && throwsDone >= MAX_BALLS_SHINY) {
+        if (!allowPremiumBalls && !ubCatch && throwsDone >= MAX_BALLS_SHINY) {
             // a plain shiny only gets MAX_BALLS_SHINY balls; then give up and go home
             stopAuto(client, "Used " + MAX_BALLS_SHINY + " balls on " + targetName + " - giving up.");
             sendHome(client);
@@ -858,9 +961,11 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         int slot = findBallIndex(player);
         if (slot < 0) {
-            stopAuto(client, allowPremiumBalls
-                ? "No usable ball anywhere in your inventory."
-                : "No usable ball anywhere in your inventory (Master/Ancient Origin balls are not used for shinies).");
+            stopAuto(client, ubCatch
+                ? "No Beast Ball anywhere in your inventory!"
+                : allowPremiumBalls
+                    ? "No usable ball anywhere in your inventory."
+                    : "No usable ball anywhere in your inventory (Master/Ancient Origin balls are not used for shinies).");
             return;
         }
         if (client.interactionManager == null) return;
@@ -897,6 +1002,13 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** Inventory index (0-8 hotbar, 9-35 main inventory) of the best allowed ball, or -1. The hotbar is checked first. */
     private int findBallIndex(ClientPlayerEntity player) {
+        if (ubCatch) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (!s.isEmpty() && itemIdOf(s).equals(BEAST_BALL_ID)) return i;
+            }
+            return -1;
+        }
         List<String> order = allowPremiumBalls ? BALLS_RADIANT : BALLS_SHINY;
         for (String wanted : order) {
             for (int i = 0; i < 36; i++) {
@@ -993,6 +1105,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void stopAuto(MinecraftClient client, String message) {
+        boolean goHome = ubCatch; // an Ultra Beast catch always ends by going home, however it ended
+        ubCatch = false;
         task = Task.IDLE;
         target = null;
         phase = Phase.READY;
@@ -1002,6 +1116,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         releaseKeys(client);
         autoLog("CATCH stop: " + message);
         say(client, message);
+        if (goHome) sendHome(client);
     }
 
     // ============================== Wormhole run ==============================
@@ -1016,6 +1131,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         wormholePos = pos;
         wTicks = 0;
         resetRoute(client);
+        ensureChestplate(client);
         autoLog(String.format("WORMHOLE start at %.1f, %.1f, %.1f", pos.x, pos.y, pos.z));
         say(client, "Walking to the wormhole. Open chat and run /radiantalert stop to cancel.");
     }
@@ -1074,12 +1190,58 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case FINISHED -> {
                 releaseKeys(client);
-                if (wTicks >= AFTER_TELEPORT_WAIT_TICKS) {
-                    stopWormhole(client, "Wormhole run finished.");
+                // an Ultra Beast may appear on the spawn server: it MUST be caught (Beast Balls) before going home
+                PokemonEntity beast = findUltraBeast(client);
+                if (beast != null) {
+                    ubHandled.add(beast.getUuid());
+                    task = Task.IDLE;
+                    path = List.of();
+                    startUltraBeastCatch(client, beast);
+                    return;
+                }
+                if (wTicks >= ULTRA_BEAST_WAIT_TICKS) {
+                    stopWormhole(client, "Wormhole run finished (no Ultra Beast showed up).");
                     sendHome(client);
                 }
             }
         }
+    }
+
+    /** The nearest wild Ultra Beast around you that we haven't already handled. */
+    private PokemonEntity findUltraBeast(MinecraftClient client) {
+        if (client.player == null || client.world == null) return null;
+        if (inUltraSpace(client)) return null; // they don't spawn naturally there
+        PokemonEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                client.player.getBoundingBox().expand(ULTRA_BEAST_SEARCH_RADIUS),
+                x -> x.getOwnerUuid() == null && !x.isRemoved() && !ubHandled.contains(x.getUuid())
+                    && ULTRA_BEASTS.contains(x.getPokemon().getSpecies().getName().toLowerCase(Locale.ROOT)))) {
+            double d = pe.squaredDistanceTo(client.player);
+            if (d < bestDist) { bestDist = d; best = pe; }
+        }
+        return best;
+    }
+
+    /** Puts a chestplate on if the chest slot is empty (shift-clicks one from your inventory into the armour slot). */
+    private void ensureChestplate(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.interactionManager == null) return;
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) return;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) {
+                int screenSlot = i < 9 ? 36 + i : i;
+                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
+                    SlotActionType.QUICK_MOVE, player);
+                autoLog("Equipped " + itemIdOf(s) + " from inventory slot " + i);
+                say(client, "Put on your chestplate (" + itemNameOf(s) + ").");
+                return;
+            }
+        }
+        autoLog("No chestplate found");
+        say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
     }
 
     private void stopWormhole(MinecraftClient client, String message) {
@@ -1129,9 +1291,18 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void followPath(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring) {
         if (replanCooldown > 0) replanCooldown--;
 
+        // just got hit (knockback): the old route is no good, plan a new one straight away
+        if (player.hurtTime >= 8) {
+            path = List.of();
+            replanCooldown = 0;
+            stuckTicks = 0;
+            stuckStrikes = 0;
+        }
+
         boolean noPath = path.isEmpty() || pathIndex >= path.size();
-        boolean goalMoved = planTargetPos == null || goal.squaredDistanceTo(planTargetPos) > 9.0;
-        boolean offPath = !noPath && isOffPath(player, path.get(pathIndex));
+        boolean goalMoved = planTargetPos == null || goal.squaredDistanceTo(planTargetPos) > 6.25;
+        boolean offPath = !noPath && isOffPath(player,
+            pathIndex == 0 ? routeStart : Vec3d.ofBottomCenter(path.get(pathIndex - 1)), path.get(pathIndex));
 
         if (noPath || goalMoved || offPath) {
             if (replanCooldown > 0) { releaseKeys(client); return; }
@@ -1144,32 +1315,46 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         if (path.isEmpty() || pathIndex >= path.size()) { releaseKeys(client); return; }
 
-        // move on to the next waypoint once we're standing on the current one
+        // move on to the next waypoint once we're standing on it, or if we've already run past it
         BlockPos wp = path.get(pathIndex);
-        while (horizontalDistance(player, wp) < 0.5 && Math.abs(wp.getY() - player.getY()) < 1.5) {
+        while (true) {
+            double hdCur = horizontalDistance(player, wp);
+            boolean reached = hdCur < 0.6 && Math.abs(wp.getY() - player.getY()) < 1.5;
+            boolean passed = false;
+            if (!reached && pathIndex + 1 < path.size()) {
+                BlockPos next = path.get(pathIndex + 1);
+                passed = next.getY() == wp.getY() && hdCur < 1.2 && horizontalDistance(player, next) < hdCur;
+            }
+            if (!reached && !passed) break;
             pathIndex++;
             if (pathIndex >= path.size()) { path = List.of(); releaseKeys(client); return; }
             wp = path.get(pathIndex);
         }
 
-        // not making progress for a second: block that square and plan a different route
-        if (++stuckTicks >= 20) {
+        // barely moving for half a second: re-plan; if it keeps happening, avoid the square just ahead of us
+        if (++stuckTicks >= 10) {
             double moved = Math.abs(player.getX() - stuckX) + Math.abs(player.getY() - stuckY) + Math.abs(player.getZ() - stuckZ);
             stuckTicks = 0;
             stuckX = player.getX();
             stuckY = player.getY();
             stuckZ = player.getZ();
-            if (moved < 0.4) {
+            if (moved < 0.25) {
                 stuckStrikes++;
-                if (stuckStrikes >= 6) { abortCurrent(client, "Got stuck and couldn't find a way out - stopping."); return; }
-                blockedNodes.add(wp.asLong());
+                if (stuckStrikes >= 8) { abortCurrent(client, "Got stuck and couldn't find a way out - stopping."); return; }
+                if (stuckStrikes >= 2) {
+                    double sx = wp.getX() + 0.5 - player.getX();
+                    double sz = wp.getZ() + 0.5 - player.getZ();
+                    double len = Math.max(0.001, Math.hypot(sx, sz));
+                    blockedNodes.add(BlockPos.asLong(MathHelper.floor(player.getX() + sx / len * 0.9),
+                        MathHelper.floor(player.getY() + 0.05), MathHelper.floor(player.getZ() + sz / len * 0.9)));
+                    say(client, "Stuck - trying a different route.");
+                }
                 path = List.of();
                 replanCooldown = 0;
                 releaseKeys(client);
-                say(client, "Stuck - trying a different route.");
                 return;
-            } else if (stuckStrikes > 0) {
-                stuckStrikes--;
+            } else {
+                stuckStrikes = 0;
             }
         }
 
@@ -1184,13 +1369,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         player.setPitch(MathHelper.lerp(0.5f, player.getPitch(), 0.0f));
         float yawError = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw()));
 
-        boolean forward = yawError < 60.0f;
+        // keep walking through turns; only stop to turn on the spot when facing almost the wrong way
+        boolean forward = yawError < 100.0f;
+        Vec3d vel = player.getVelocity();
+        boolean barelyMoving = vel.x * vel.x + vel.z * vel.z < 0.0025;
+        // jump for planned one-block steps, in water, or when pushing against something without moving
         boolean jump = player.isTouchingWater()
-            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || player.horizontalCollision));
-        boolean sprint = hd > 2.5 && dy < 0.3 && yawError < 15.0f;
+            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || (player.horizontalCollision && barelyMoving && forward)));
+        boolean sprint = forward && hd > 2.5 && dy < 0.3 && yawError < 15.0f;
 
         client.options.forwardKey.setPressed(forward);
-        client.options.sprintKey.setPressed(sprint && forward);
+        client.options.sprintKey.setPressed(sprint);
         client.options.jumpKey.setPressed(jump);
         keysHeld = true;
     }
@@ -1201,13 +1390,20 @@ public class RadiantAlertClient implements ClientModInitializer {
         return Math.sqrt(dx * dx + dz * dz);
     }
 
-    private static boolean isOffPath(ClientPlayerEntity player, BlockPos wp) {
-        return horizontalDistance(player, wp) > 5.0 || Math.abs(wp.getY() - player.getY()) > 3.5;
+    /** Off the route = far from the straight line between the previous waypoint and the current one. */
+    private static boolean isOffPath(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
+        double ax = from.x, az = from.z, bx = wp.getX() + 0.5, bz = wp.getZ() + 0.5;
+        double abx = bx - ax, abz = bz - az;
+        double len2 = abx * abx + abz * abz;
+        double t = len2 < 1e-6 ? 0 : Math.max(0, Math.min(1, ((player.getX() - ax) * abx + (player.getZ() - az) * abz) / len2));
+        double off = Math.hypot(player.getX() - (ax + abx * t), player.getZ() - (az + abz * t));
+        return off > 2.5 || Math.abs(wp.getY() - player.getY()) > 3.5;
     }
 
     /** Plans a new route. Returns false if the current task was given up. */
     private boolean replan(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring) {
         planTargetPos = goal;
+        routeStart = player.getPos();
         Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes).search();
         autoLog("PLAN " + plan.status() + " steps=" + plan.nodes().size());
 
@@ -1311,7 +1507,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 cur.closed = true;
                 expanded++;
 
-                if (cur != first && isGoal(cur.pos)) return new Plan(Status.PATH, build(cur));
+                if (cur != first && isGoal(cur.pos)) return new Plan(Status.PATH, smooth(start, build(cur)));
 
                 double h = heuristic(cur.pos);
                 if (h < bestH) { bestH = h; best = cur; }
@@ -1338,8 +1534,47 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
 
             // no complete route within the search limit: head for the closest point found
-            if (best != first && bestH < startH - 1.0) return new Plan(Status.PARTIAL, build(best));
+            if (best != first && bestH < startH - 1.0) return new Plan(Status.PARTIAL, smooth(start, build(best)));
             return new Plan(Status.FAIL, List.of());
+        }
+
+        /**
+         * A* routes on a grid come out as zig-zags. This skips waypoints whenever a straight, level
+         * line between two of them is clear (body-width wide), so the walk is smooth.
+         */
+        private List<BlockPos> smooth(BlockPos start, List<BlockPos> route) {
+            List<BlockPos> out = new ArrayList<>();
+            BlockPos from = start;
+            int i = 0;
+            while (i < route.size()) {
+                int best = i;
+                for (int j = i + 1; j < route.size() && j <= i + 14; j++) {
+                    if (route.get(j).getY() != from.getY() || route.get(j - 1).getY() != from.getY()) break;
+                    if (!straightWalk(from, route.get(j))) break;
+                    best = j;
+                }
+                out.add(route.get(best));
+                from = route.get(best);
+                i = best + 1;
+            }
+            return out;
+        }
+
+        /** True if you can walk in a straight line from a to b (same level): every point along it, body width included, is standable. */
+        private boolean straightWalk(BlockPos a, BlockPos b) {
+            double ax = a.getX() + 0.5, az = a.getZ() + 0.5, bx = b.getX() + 0.5, bz = b.getZ() + 0.5;
+            int steps = (int) Math.ceil(Math.hypot(bx - ax, bz - az) / 0.3);
+            int y = a.getY();
+            for (int k = 1; k < steps; k++) {
+                double t = (double) k / steps;
+                double x = ax + (bx - ax) * t, z = az + (bz - az) * t;
+                for (int sx = -1; sx <= 1; sx += 2) {
+                    for (int sz = -1; sz <= 1; sz += 2) {
+                        if (!standable(MathHelper.floor(x + sx * 0.3), y, MathHelper.floor(z + sz * 0.3))) return false;
+                    }
+                }
+            }
+            return true;
         }
 
         private static List<BlockPos> build(Node end) {
@@ -1525,12 +1760,22 @@ public class RadiantAlertClient implements ClientModInitializer {
         String id = payload.getId().id().toString();
         List<String> strings = new ArrayList<>();
         double[] pos = null;
+        Pokemon pokemonValue = null;   // for party packets
+        int slotValue = -1;
+        boolean thisPlayersParty = true;
         for (Class<?> k = payload.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
             for (Field f : k.getDeclaredFields()) {
                 if (Modifier.isStatic(f.getModifiers())) continue;
                 try {
                     f.setAccessible(true);
                     Object v = f.get(payload);
+                    if (v instanceof Pokemon pk) {
+                        pokemonValue = pk;
+                    } else if (v != null && v.getClass().getName().contains("PartyPosition")) {
+                        slotValue = readSlot(v);
+                    } else if (v instanceof Boolean flag && f.getName().toLowerCase(Locale.ROOT).contains("player")) {
+                        thisPlayersParty = flag;
+                    }
                     if (v instanceof Identifier || (v instanceof String s && s.length() <= 600)) {
                         strings.add(f.getName() + "=" + v);
                     } else if (v instanceof Vec3d vec && pos == null) {
@@ -1543,6 +1788,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
             }
         }
+        capturePartyPacket(id, pokemonValue, slotValue, thisPlayersParty);
         return new Info(id, strings, pos, 0);
     }
 
@@ -1648,6 +1894,42 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** Your party in slot order; an empty slot is null. */
     private static List<Pokemon> readParty() throws Exception {
+        Throwable firstError = null;
+
+        // 1) Cobblemon's own client-side storage
+        try {
+            List<Pokemon> fromStorage = readPartyFromStorage();
+            if (fromStorage.stream().anyMatch(Objects::nonNull)) {
+                partySource = "Cobblemon's client storage";
+                return fromStorage;
+            }
+        } catch (Throwable t) {
+            firstError = t;
+        }
+
+        // 2) search the objects reachable from CobblemonClient for a list of Pokémon
+        try {
+            List<Pokemon> found = searchPartyList();
+            if (found != null && found.stream().anyMatch(Objects::nonNull)) {
+                partySource = "an object search";
+                return found;
+            }
+        } catch (Throwable t) {
+            if (firstError == null) firstError = t;
+        }
+
+        // 3) the party packets the server sent when you joined (always available)
+        if (!PACKET_PARTY.isEmpty()) {
+            List<Pokemon> out = new ArrayList<>();
+            for (int i = 0; i < 6; i++) out.add(PACKET_PARTY.get(i));
+            partySource = "the party packets the server sent";
+            return out;
+        }
+        throw new IllegalStateException("couldn't find your party (" + firstError
+            + "; no party packets seen yet - switch servers or rejoin, then try again)");
+    }
+
+    private static List<Pokemon> readPartyFromStorage() throws Exception {
         Object party = invoke(partyStorage(), "getMyParty");
         Object slots;
         try {
@@ -1661,6 +1943,149 @@ public class RadiantAlertClient implements ClientModInitializer {
         List<Pokemon> out = new ArrayList<>();
         for (Object o : iterable) out.add(o instanceof Pokemon p ? p : null);
         return out;
+    }
+
+    /** Selects a party slot (the one the send-out key throws). Returns false if Cobblemon's API wasn't found. */
+    private static boolean trySelectPartySlot(int slot) {
+        try {
+            Object storage = partyStorage();
+            storage.getClass().getMethod("setSelectedSlot", int.class).invoke(storage, slot);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Ultra Beasts don't spawn naturally in Ultra Space (the dimension "ultraspace:ultraspace"). */
+    private static boolean inUltraSpace(MinecraftClient client) {
+        return client.world != null && client.world.getRegistryKey().getValue().getNamespace().equals("ultraspace");
+    }
+
+    /** Where the last successful party read came from. */
+    private static volatile String partySource = "?";
+
+    /** The party as the server sent it (slot -> Pokémon). Filled from the party packets as they arrive. */
+    private static final Map<Integer, Pokemon> PACKET_PARTY = new ConcurrentHashMap<>();
+
+    private static int readSlot(Object position) {
+        for (Field f : position.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers()) || f.getType() != int.class) continue;
+            try {
+                f.setAccessible(true);
+                return f.getInt(position);
+            } catch (Throwable ignored) {
+                // try the next field
+            }
+        }
+        return -1;
+    }
+
+    private static void capturePartyPacket(String id, Pokemon pokemon, int slot, boolean thisPlayersParty) {
+        switch (id) {
+            case "cobblemon:initialize_party" -> {
+                if (thisPlayersParty) PACKET_PARTY.clear();
+            }
+            case "cobblemon:set_party_pokemon" -> {
+                if (pokemon == null) return;
+                int target = slot;
+                if (target < 0) {
+                    target = 0;
+                    while (PACKET_PARTY.containsKey(target)) target++;
+                }
+                PACKET_PARTY.put(target, pokemon);
+            }
+            case "cobblemon:remove_party_pokemon" -> {
+                if (slot >= 0) PACKET_PARTY.remove(slot);
+            }
+            default -> { }
+        }
+    }
+
+    /** Last resort: walks the objects reachable from CobblemonClient looking for a list that holds Pokémon, preferring ones named "party". */
+    private static List<Pokemon> searchPartyList() throws Exception {
+        Class<?> root = Class.forName("com.cobblemon.mod.common.client.CobblemonClient");
+        Deque<Object[]> queue = new ArrayDeque<>(); // {object, path, depth}
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        try {
+            queue.add(new Object[]{root.getField("INSTANCE").get(null), "CobblemonClient", 0});
+        } catch (Throwable ignored) {
+            // not a Kotlin object: static fields below
+        }
+        for (Field f : root.getDeclaredFields()) {
+            if (!Modifier.isStatic(f.getModifiers())) continue;
+            try {
+                f.setAccessible(true);
+                Object v = f.get(null);
+                if (v != null) queue.add(new Object[]{v, "CobblemonClient." + f.getName(), 1});
+            } catch (Throwable ignored) {
+                // skip
+            }
+        }
+
+        List<Pokemon> best = null;
+        int bestScore = -1;
+        int budget = 4000;
+        while (!queue.isEmpty() && budget-- > 0) {
+            Object[] item = queue.poll();
+            Object obj = item[0];
+            String path = (String) item[1];
+            int depth = (Integer) item[2];
+            if (obj == null || obj instanceof Pokemon || !visited.add(obj)) continue;
+
+            Iterable<?> items = null;
+            if (obj instanceof Iterable<?> it) items = it;
+            else if (obj instanceof Map<?, ?> m) items = m.values();
+            else if (obj instanceof Object[] arr) items = Arrays.asList(arr);
+
+            if (items != null) {
+                List<Pokemon> list = new ArrayList<>();
+                boolean onlyPokemon = true;
+                boolean any = false;
+                int looked = 0;
+                for (Object o : items) {
+                    if (o instanceof Pokemon pk) { list.add(pk); any = true; }
+                    else if (o == null) list.add(null);
+                    else {
+                        onlyPokemon = false;
+                        if (depth < 5 && looked++ < 8) queue.add(new Object[]{o, path + "[]", depth + 1});
+                    }
+                }
+                if (onlyPokemon && any) {
+                    String lower = path.toLowerCase(Locale.ROOT);
+                    int score = (lower.contains("party") ? 10 : 1) + (list.size() <= 6 ? 3 : 0) - (lower.contains("pc") ? 5 : 0);
+                    if (score > bestScore) { bestScore = score; best = list; }
+                }
+                continue;
+            }
+
+            if (depth >= 4 || !obj.getClass().getName().startsWith("com.cobblemon")) continue;
+            for (Class<?> k = obj.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+                for (Field f : k.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(obj);
+                        if (v != null) queue.add(new Object[]{v, path + "." + f.getName(), depth + 1});
+                    } catch (Throwable ignored) {
+                        // skip
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Sends Cobblemon's own "send out Pokémon" packet for a party slot (what pressing R does). Returns false if that didn't work. */
+    private static boolean trySendOutPacket(int slot) {
+        try {
+            Class<?> c = Class.forName("com.cobblemon.mod.common.net.messages.server.SendOutPokemonPacket");
+            Object packet = c.getConstructor(int.class).newInstance(slot);
+            if (!(packet instanceof CustomPayload payload)) return false;
+            ClientPlayNetworking.send(payload);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static String describePokemon(Pokemon p) {
@@ -1681,7 +2106,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (client.player == null) return;
         try {
             List<Pokemon> party = readParty();
-            say(client, "Your party:");
+            say(client, "Your party (read from " + partySource + "):");
             for (int i = 0; i < party.size(); i++) {
                 Pokemon p = party.get(i);
                 String line = " " + (i + 1) + ". " + (p == null ? "(empty)"
@@ -1876,7 +2301,6 @@ public class RadiantAlertClient implements ClientModInitializer {
                     cTicks = 0;
                     dropDelay = 0;
                     dropsDone = 0;
-                    player.setPitch(-10.0f); // look a little up so the items fly well away
                 }
             }
             case DROPPING -> {
@@ -1970,13 +2394,18 @@ public class RadiantAlertClient implements ClientModInitializer {
         hTicks++;
         switch (hStage) {
             case SELECT -> {
-                try {
-                    Object storage = partyStorage();
-                    storage.getClass().getMethod("setSelectedSlot", int.class).invoke(storage, hSlot);
-                } catch (Throwable t) {
-                    autoLog("HOOPA could not select the party slot: " + t);
+                // the clean way: send the same packet that pressing R sends for that party slot
+                if (trySendOutPacket(hSlot)) {
+                    autoLog("HOOPA sent out via packet, slot " + (hSlot + 1));
+                    hStage = HStage.WAIT_OUT;
+                    hTicks = 0;
+                    return;
+                }
+                // otherwise: select the slot, then press R
+                if (!trySelectPartySlot(hSlot)) {
+                    autoLog("HOOPA could not send out or select the party slot");
                     logPartyApi();
-                    stopHoopa(client, "Couldn't select the party slot (" + t + "). Details are in radiantalert-auto.txt.");
+                    stopHoopa(client, "Couldn't send out or select that party slot. Details are in radiantalert-auto.txt.");
                     return;
                 }
                 hStage = HStage.PRESS;

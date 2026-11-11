@@ -14,10 +14,12 @@ import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.loader.api.FabricLoader;
+import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
+import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
@@ -53,6 +55,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.file.Files;
@@ -63,6 +66,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Radiant Alert: tells you about radiants, shinies, Lunala/Solgaleo and Ultra Wormholes, and can
@@ -372,7 +376,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private enum HStage { SELECT, PRESS, WAIT_OUT, APPROACH, SHOULDER }
     private boolean autoHoopaEnabled = false;
     private HStage hStage = HStage.SELECT;
-    private int hTicks = 0, hSlot = -1, hAttempts = 0, hPrevSlot = -1;
+    private int hTicks = 0, hSlot = -1, hAttempts = 0, hPrevSlot = -1, hGuiTicks = 0;
     private PokemonEntity hEntity = null;
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
     private boolean sneakHeld = false;
@@ -647,7 +651,15 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (task == Task.IDLE) { releaseKeys(client); return; }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); return; }
-        if (client.currentScreen != null) { releaseKeys(client); return; } // paused while chat/inventory/battle is open
+        if (client.currentScreen != null) {
+            // crouch + right-click on your Pokémon opens Cobblemon's interaction wheel: handle it instead of freezing behind it
+            if (task == Task.HOOPA && hStage == HStage.SHOULDER && hAttempts >= 2 && isCobblemonInteractScreen(client.currentScreen)) {
+                hoopaScreen(client);
+                return;
+            }
+            releaseKeys(client); // paused while chat/inventory/battle is open
+            return;
+        }
 
         switch (task) {
             case CATCH -> catchTick(client, player);
@@ -2417,6 +2429,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         hAttempts = 0;
         hTicks = 0;
         hPrevSlot = -1;
+        hGuiTicks = 0;
         hEntity = findOwnHoopa(client);
         task = Task.HOOPA;
         hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
@@ -2489,7 +2502,35 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case SHOULDER -> {
                 if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
-                if (hTicks == 1) {                       // crouch first
+
+                // Attempts 1 and 2: send the message the wheel's "shoulder" button sends (first with the
+                // entity's id, then with the Pokémon's id). No crouching, right-clicking or wheel needed.
+                if (hAttempts <= 1) {
+                    if (hTicks == 1 && !hEntity.isRemoved()) {
+                        UUID id = hAttempts == 0 ? hEntity.getUuid() : hEntity.getPokemon().getUuid();
+                        boolean sent = trySendShoulderPacket(id);
+                        autoLog("HOOPA shoulder packet attempt " + (hAttempts + 1) + " ("
+                            + (hAttempts == 0 ? "entity" : "pokemon") + " id) sent=" + sent);
+                        if (!sent) {                         // can't send it: use the wheel instead
+                            hAttempts = 2;
+                            hTicks = 0;
+                            return;
+                        }
+                    }
+                    if (hTicks > 1 && hEntity.isRemoved()) {
+                        hoopaMountedAt = System.currentTimeMillis();
+                        stopHoopa(client, "Hoopa is on your shoulder.");
+                        return;
+                    }
+                    if (hTicks >= 16) {
+                        hAttempts++;
+                        hTicks = 0;
+                    }
+                    return;
+                }
+
+                // Attempt 3: crouch + right-click opens Cobblemon's interaction wheel; hoopaScreen() clicks "shoulder" there
+                if (hTicks == 1) {
                     client.options.sneakKey.setPressed(true);
                     sneakHeld = true;
                 }
@@ -2502,27 +2543,243 @@ public class RadiantAlertClient implements ClientModInitializer {
                     return;
                 }
                 if (hTicks == 4 && !hEntity.isRemoved() && client.interactionManager != null) {
-                    ActionResult result = client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND); // crouch + right-click
-                    autoLog(String.format("HOOPA interact attempt %d: distance=%.1f sneaking=%s result=%s",
-                        hAttempts + 1, (double) player.distanceTo(hEntity), player.isSneaking(), result));
+                    ActionResult result = client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND);
+                    autoLog(String.format("HOOPA crouch + right-click: distance=%.1f sneaking=%s result=%s",
+                        (double) player.distanceTo(hEntity), player.isSneaking(), result));
                 }
                 if (hTicks > 4 && hEntity.isRemoved()) {
                     hoopaMountedAt = System.currentTimeMillis();
                     stopHoopa(client, "Hoopa is on your shoulder.");
                     return;
                 }
-                if (hTicks >= 14) {
-                    hAttempts++;
-                    if (hAttempts >= 3) {
-                        stopHoopa(client, "Couldn't put Hoopa on your shoulder (tried 3 times). See radiantalert-auto.txt.");
-                        return;
-                    }
-                    hTicks = 0;
-                    client.options.sneakKey.setPressed(false);
-                    sneakHeld = false;
+                if (hTicks >= 60) {
+                    stopHoopa(client, "Couldn't put Hoopa on your shoulder. See radiantalert-auto.txt (lines starting with HOOPA and DUMP).");
                 }
             }
         }
+    }
+
+    // ---- the shoulder message and Cobblemon's interaction wheel ----
+
+    private static Class<?> interactPacketClass = null;
+    private static boolean interactPacketSearched = false;
+
+    /** Finds Cobblemon's "interact with Pokémon" packet (the one built from a UUID and a true/false) by looking inside its jar. */
+    private Class<?> findInteractPacketClass() {
+        if (interactPacketSearched) return interactPacketClass;
+        interactPacketSearched = true;
+
+        List<String> candidates = new ArrayList<>();
+        try {
+            Optional<ModContainer> container = FabricLoader.getInstance().getModContainer("cobblemon");
+            if (container.isPresent()) {
+                for (Path root : container.get().getRootPaths()) {
+                    try (Stream<Path> walk = Files.walk(root)) {
+                        walk.forEach(path -> {
+                            Path fileName = path.getFileName();
+                            if (fileName == null) return;
+                            String n = fileName.toString();
+                            if (n.endsWith(".class") && n.contains("Interact") && n.contains("Packet") && !n.contains("$")) {
+                                String rel = root.relativize(path).toString().replace('\\', '/');
+                                candidates.add(rel.substring(0, rel.length() - ".class".length()).replace('/', '.'));
+                            }
+                        });
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            autoLog("HOOPA could not search the Cobblemon jar: " + t);
+        }
+
+        Class<?> best = null;
+        for (String name : candidates) {
+            try {
+                Class<?> c = Class.forName(name);
+                StringBuilder sb = new StringBuilder("HOOPA packet candidate " + name + " constructors:");
+                boolean fits = false;
+                for (Constructor<?> k : c.getConstructors()) {
+                    Class<?>[] types = k.getParameterTypes();
+                    sb.append(' ').append(Arrays.toString(types));
+                    if (types.length == 2 && types[0] == UUID.class && types[1] == boolean.class) fits = true;
+                }
+                autoLog(sb.toString());
+                if (fits && (best == null || c.getSimpleName().contains("Pokemon"))) best = c;
+            } catch (Throwable t) {
+                autoLog("HOOPA could not load " + name + ": " + t);
+            }
+        }
+        interactPacketClass = best;
+        autoLog("HOOPA interact packet class: " + (best == null ? "NOT FOUND (" + candidates.size() + " candidates)" : best.getName()));
+        return best;
+    }
+
+    private boolean trySendShoulderPacket(UUID pokemonId) {
+        try {
+            Class<?> c = findInteractPacketClass();
+            if (c == null) return false;
+            for (Constructor<?> k : c.getConstructors()) {
+                Class<?>[] types = k.getParameterTypes();
+                if (types.length == 2 && types[0] == UUID.class && types[1] == boolean.class) {
+                    Object packet = k.newInstance(pokemonId, true);
+                    if (packet instanceof CustomPayload payload) {
+                        ClientPlayNetworking.send(payload);
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            autoLog("HOOPA shoulder packet failed: " + t);
+        }
+        return false;
+    }
+
+    private static boolean isCobblemonInteractScreen(Screen screen) {
+        String name = screen.getClass().getName();
+        return name.startsWith("com.cobblemon") && name.toLowerCase(Locale.ROOT).contains("interact");
+    }
+
+    /** Runs while Cobblemon's interaction wheel is open: write down what it contains, click "shoulder", then close it. */
+    private void hoopaScreen(MinecraftClient client) {
+        hGuiTicks++;
+        Screen screen = client.currentScreen;
+        if (screen == null) { hGuiTicks = 0; return; }
+        if (hGuiTicks == 1) {
+            dumpObject("WHEEL", screen, 0, Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>()), new int[]{0});
+        }
+        if (hGuiTicks == 3) {
+            autoLog("HOOPA wheel: shoulder option triggered=" + tryClickShoulderOption(screen));
+        }
+        if (hGuiTicks >= 14) {                 // give it a moment, then close the wheel so we are not stuck behind it
+            hGuiTicks = 0;
+            client.setScreen(null);
+        }
+    }
+
+    /** Writes an object's fields (and the Cobblemon objects inside it) to the action log, so the wheel's structure can be read. */
+    private void dumpObject(String label, Object obj, int depth, Set<Object> seen, int[] lines) {
+        if (obj == null || depth > 2 || lines[0] > 150 || !seen.add(obj)) return;
+        autoLog("DUMP " + label + " : " + obj.getClass().getName());
+        lines[0]++;
+        for (Class<?> k = obj.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break; // skip the game's own base classes
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(obj);
+                    String text = String.valueOf(v);
+                    if (text.length() > 100) text = text.substring(0, 100) + "...";
+                    autoLog("DUMP   " + label + "." + f.getName() + " (" + f.getType().getSimpleName() + ") = " + text);
+                    lines[0]++;
+                    if (v instanceof Iterable<?> iterable) {
+                        int n = 0;
+                        for (Object o : iterable) {
+                            if (n++ >= 12) break;
+                            dumpObject(label + "." + f.getName() + "[" + (n - 1) + "]", o, depth + 1, seen, lines);
+                        }
+                    } else if (v != null && v.getClass().getName().startsWith("com.cobblemon")) {
+                        dumpObject(label + "." + f.getName(), v, depth + 1, seen, lines);
+                    }
+                } catch (Throwable ignored) {
+                    // skip fields we can't read
+                }
+            }
+        }
+    }
+
+    private boolean tryClickShoulderOption(Screen screen) {
+        try {
+            for (Object option : optionObjects(screen)) {
+                if (!optionLabel(option).contains("shoulder")) continue;
+                if (invokeOptionAction(option)) return true;
+            }
+        } catch (Throwable t) {
+            autoLog("HOOPA wheel click failed: " + t);
+        }
+        return false;
+    }
+
+    /** The objects held in the screen's lists and arrays (the wheel's options). */
+    private static List<Object> optionObjects(Object screen) {
+        List<Object> out = new ArrayList<>();
+        for (Class<?> k = screen.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break;
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(screen);
+                    if (v instanceof Iterable<?> iterable) {
+                        for (Object o : iterable) if (o != null) out.add(o);
+                    } else if (v instanceof Object[] array) {
+                        for (Object o : array) if (o != null) out.add(o);
+                    } else if (v instanceof Map<?, ?> map) {
+                        for (Object o : map.values()) if (o != null) out.add(o);
+                    }
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        return out;
+    }
+
+    /** All the text-like values on an option (names, ids, enum names), lowercased, to tell which one is "shoulder". */
+    private static String optionLabel(Object option) {
+        StringBuilder sb = new StringBuilder();
+        for (Class<?> k = option.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(option);
+                    if (v instanceof Text text) sb.append(text.getString()).append(' ');
+                    else if (v instanceof String || v instanceof Identifier || v instanceof Enum<?>) sb.append(v).append(' ');
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        sb.append(option.getClass().getSimpleName());
+        return sb.toString().toLowerCase(Locale.ROOT);
+    }
+
+    /** Runs the option's click action: a Runnable or a Kotlin lambda stored on it (fields named press/click/action first). */
+    private boolean invokeOptionAction(Object option) {
+        List<Object> actions = new ArrayList<>();
+        for (Class<?> k = option.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(option);
+                    if (v == null) continue;
+                    String n = f.getName().toLowerCase(Locale.ROOT);
+                    boolean named = n.contains("press") || n.contains("click") || n.contains("action")
+                        || n.contains("callback") || n.contains("handler");
+                    if (named) actions.add(0, v); else actions.add(v);
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        for (Object action : actions) {
+            try {
+                if (action instanceof Runnable runnable) {
+                    runnable.run();
+                    return true;
+                }
+                java.lang.reflect.Method invoke = action.getClass().getMethod("invoke");
+                invoke.setAccessible(true);
+                invoke.invoke(action);
+                return true;
+            } catch (NoSuchMethodException ignored) {
+                // not a function: try the next one
+            } catch (Throwable t) {
+                autoLog("HOOPA wheel action failed: " + t);
+            }
+        }
+        return false;
     }
 
     private void stopHoopa(MinecraftClient client, String message) {

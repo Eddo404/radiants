@@ -18,8 +18,12 @@ import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.screen.DeathScreen;
+import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
@@ -197,9 +201,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     /**
      * The wormhole battle is automatic; once it's won you land on the spawn server and an Ultra Beast MAY appear
      * (not every time). Wait this long (ticks, 20 = 1 second) there, checking for one, before going home.
+     * 15 seconds; raise it if they tend to show up later (the action log lists what was nearby each 2 seconds).
      */
-    private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 3;
-    private static final double ULTRA_BEAST_SEARCH_RADIUS = 64;
+    private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 15;
+    private static final double ULTRA_BEAST_SEARCH_RADIUS = 128;
 
     // --- Inventory clean-up (/radiantalert autoclean) ---
     /** Command that takes you to the drop-off spot. No slash. */
@@ -388,6 +393,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean respawnPending = false;
     private boolean respawnContinuesRun = false;
     private long lastRespawnAt = 0;
+    private int chestAttempts = 0;
+    private Screen lastUnblockScreen = null;
+    private int screenOpenTicks = 0;
+    private long lastEndBattleAt = 0;
     private int deathTicks = 0, respawnTicks = 0;
     private Vec3d routeStart = Vec3d.ZERO;
 
@@ -553,6 +562,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (++idleCheckTicks >= 20) {
             idleCheckTicks = 0;
             idleChecks(client);
+            chestCheck(client);
         }
 
         // Dying: respawn, put a chestplate back on, and
@@ -657,9 +667,12 @@ public class RadiantAlertClient implements ClientModInitializer {
                 hoopaScreen(client);
                 return;
             }
-            releaseKeys(client); // paused while chat/inventory/battle is open
+            releaseKeys(client);
+            unblockScreen(client); // close chat / menus, or end a battle, that would stop us from moving
             return;
         }
+        lastUnblockScreen = null;
+        screenOpenTicks = 0;
 
         switch (task) {
             case CATCH -> catchTick(client, player);
@@ -1202,6 +1215,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case ARRIVED -> {
                 releaseKeys(client);
+                if (wTicks == 10) ensureChestplate(client);
                 if (wTicks >= AFTER_TELEPORT_WAIT_TICKS) {
                     pressSendOutKey();
                     wStage = WStage.ENCOUNTER;
@@ -1216,6 +1230,10 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case FINISHED -> {
                 releaseKeys(client);
+                if (wTicks == 1) {
+                    say(client, "Checking for an Ultra Beast (up to " + (ULTRA_BEAST_WAIT_TICKS / 20) + " seconds)...");
+                }
+                if (wTicks % 40 == 0) logNearbyPokemon(client);
                 // an Ultra Beast may appear on the spawn server: it MUST be caught (Beast Balls) before going home
                 PokemonEntity beast = findUltraBeast(client);
                 if (beast != null) {
@@ -1249,25 +1267,64 @@ public class RadiantAlertClient implements ClientModInitializer {
         return best;
     }
 
-    /** Puts a chestplate on if the chest slot is empty (shift-clicks one from your inventory into the armour slot). */
+    /**
+     * Makes sure a chestplate is worn. Each call tries one thing and it is called again every second during a
+     * wormhole run until the chestplate is on: (1) shift-click it into the armour slot, (2) bring it to the
+     * hotbar, (3) right-click it from the hotbar (which equips it).
+     */
     private void ensureChestplate(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null) return;
-        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) return;
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) { chestAttempts = 0; return; }
+
+        int found = -1;
         for (int i = 0; i < 36; i++) {
             ItemStack s = player.getInventory().getStack(i);
             if (s.isEmpty()) continue;
             if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) {
-                int screenSlot = i < 9 ? 36 + i : i;
-                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
-                    SlotActionType.QUICK_MOVE, player);
-                autoLog("Equipped " + itemIdOf(s) + " from inventory slot " + i);
-                say(client, "Put on your chestplate (" + itemNameOf(s) + ").");
-                return;
+                found = i;
+                break;
             }
         }
-        autoLog("No chestplate found");
-        say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
+        if (found < 0) {
+            if (chestAttempts++ % 10 == 0) {
+                autoLog("CHEST no chestplate found in the inventory");
+                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
+            }
+            return;
+        }
+
+        int step = chestAttempts++ % 3;
+        ItemStack stack = player.getInventory().getStack(found);
+        int screenSlot = found < 9 ? 36 + found : found;
+        autoLog("CHEST step " + (step + 1) + ": " + itemIdOf(stack) + " from inventory slot " + found);
+        if (step == 0) {
+            say(client, "Putting on your chestplate (" + itemNameOf(stack) + ").");
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
+                SlotActionType.QUICK_MOVE, player);
+        } else if (step == 1) {
+            if (found >= 9) {
+                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot,
+                    player.getInventory().selectedSlot, SlotActionType.SWAP, player);
+            } else {
+                player.getInventory().selectedSlot = found;
+            }
+        } else {
+            ItemStack held = player.getMainHandStack();
+            if (!held.isEmpty() && (itemIdOf(held).endsWith("_chestplate")
+                    || itemNameOf(held).toLowerCase(Locale.ROOT).contains("chestplate"))) {
+                client.interactionManager.interactItem(player, Hand.MAIN_HAND); // right-click to wear it
+            } else if (found < 9) {
+                player.getInventory().selectedSlot = found;
+            }
+        }
+    }
+
+    /** Once a second during a wormhole run: if the chest slot is empty, try to put a chestplate on. */
+    private void chestCheck(MinecraftClient client) {
+        if (task != Task.WORMHOLE || client.currentScreen != null || client.player == null) return;
+        if (client.player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) ensureChestplate(client);
+        else chestAttempts = 0;
     }
 
     private void stopWormhole(MinecraftClient client, String message) {
@@ -1872,6 +1929,91 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void writeRecord(String line) {
         if (recordWritten++ > RECORD_FILE_LINES) return;
         appendToFile("radiantalert-record.txt", line);
+    }
+
+    // ============================== Menus in the way ==============================
+
+    /**
+     * While a task is running and a screen is open: close chat (only if nothing is typed in it) and menus like
+     * the inventory or Cobblemon's screens, as if pressing Esc; for a Cobblemon battle screen send /endbattle.
+     * Loading screens and the like are left alone. While waiting for the automatic wormhole battle, nothing is touched.
+     */
+    private void unblockScreen(MinecraftClient client) {
+        Screen screen = client.currentScreen;
+        if (screen == null) {
+            lastUnblockScreen = null;
+            screenOpenTicks = 0;
+            return;
+        }
+        if (screen != lastUnblockScreen) {
+            lastUnblockScreen = screen;
+            screenOpenTicks = 0;
+        }
+        screenOpenTicks++;
+
+        if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) return; // the battle is supposed to be running
+
+        String cls = screen.getClass().getName();
+        boolean cobblemon = cls.startsWith("com.cobblemon");
+        boolean battle = cobblemon && cls.toLowerCase(Locale.ROOT).contains("battle");
+
+        if (battle) {
+            boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH || wStage == WStage.FINISHED;
+            long now = System.currentTimeMillis();
+            if (mayEnd && screenOpenTicks >= 20 && now - lastEndBattleAt > 4000 && client.player != null) {
+                lastEndBattleAt = now;
+                client.player.networkHandler.sendChatCommand("endbattle");
+                autoLog("MENU battle screen in the way: sent /endbattle (" + cls + ")");
+                say(client, "In a battle - sending /endbattle so I can carry on.");
+            }
+            return;
+        }
+
+        if (screen instanceof ChatScreen chat) {
+            String typed = chatScreenText(chat);
+            boolean ready = typed == null ? screenOpenTicks >= 60 : typed.isEmpty() && screenOpenTicks >= 40;
+            if (ready) {
+                autoLog("MENU closing the chat screen");
+                screen.close();
+            }
+            return;
+        }
+
+        if (screen instanceof HandledScreen<?> || screen instanceof GameMenuScreen || cobblemon) {
+            if (screenOpenTicks >= 10) {
+                autoLog("MENU closing " + cls);
+                screen.close();
+            }
+        }
+        // anything else (loading screens, the death screen, ...) is left alone
+    }
+
+    /** What is typed in the chat box right now (null if it can't be read). */
+    private static String chatScreenText(ChatScreen screen) {
+        for (Field f : ChatScreen.class.getDeclaredFields()) {
+            if (f.getType() != TextFieldWidget.class) continue;
+            try {
+                f.setAccessible(true);
+                Object widget = f.get(screen);
+                if (widget instanceof TextFieldWidget field) return field.getText();
+            } catch (Throwable ignored) {
+                // try the next field
+            }
+        }
+        return null;
+    }
+
+    /** Writes the wild Pokémon around you (species @ distance) to the action log, to see what shows up at the end of a wormhole. */
+    private void logNearbyPokemon(MinecraftClient client) {
+        if (client.player == null || client.world == null) return;
+        List<String> found = new ArrayList<>();
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                client.player.getBoundingBox().expand(ULTRA_BEAST_SEARCH_RADIUS),
+                x -> x.getOwnerUuid() == null && !x.isRemoved())) {
+            found.add(pe.getPokemon().getSpecies().getName() + "@" + Math.round(pe.distanceTo(client.player)));
+        }
+        autoLog("UB CHECK +" + (wTicks / 20) + "s dim=" + client.world.getRegistryKey().getValue()
+            + " wild Pokémon nearby: " + found);
     }
 
     // ============================== Idle checks ==============================

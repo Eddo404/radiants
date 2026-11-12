@@ -2,6 +2,7 @@ package dev.radiantalert;
 
 import com.cobblemon.mod.common.entity.pokemon.PokemonEntity;
 import com.cobblemon.mod.common.pokemon.Pokemon;
+import com.google.common.collect.Multimap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -385,6 +386,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     private PokemonEntity hEntity = null;
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
     private boolean sneakHeld = false;
+    private boolean hWheelClicked = false;
+
+    // ---- chestplate test (/radiantalert chestplate) ----
+    private int chestTestStage = 0, chestTestTicks = 0, chestTestCalls = 0;
 
     // ---- Ultra Beast catch, death handling, route start ----
     private boolean ubCatch = false;
@@ -493,6 +498,10 @@ public class RadiantAlertClient implements ClientModInitializer {
                     dumpItems(MinecraftClient.getInstance());
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("chestplate").executes(ctx -> {
+                    startChestTest(MinecraftClient.getInstance());
+                    return 1;
+                }))
                 .then(ClientCommandManager.literal("clean")
                     .executes(ctx -> {
                         showCleanPlan(MinecraftClient.getInstance());
@@ -564,6 +573,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             idleChecks(client);
             chestCheck(client);
         }
+        if (chestTestStage != 0) chestTestTick(client);
 
         // Dying: respawn, put a chestplate back on, and
         //  - inside the wormhole (a life is lost, the run goes on): send your first Pokémon out again with R;
@@ -1317,6 +1327,66 @@ public class RadiantAlertClient implements ClientModInitializer {
             } else if (found < 9) {
                 player.getInventory().selectedSlot = found;
             }
+        }
+    }
+
+    /**
+     * /radiantalert chestplate: tests the equipping. If you are wearing a chestplate it is taken off first,
+     * then the same routine the wormhole run uses puts it back on, and the result is reported.
+     */
+    private void startChestTest(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.interactionManager == null) return;
+        if (client.currentScreen != null) { say(client, "Close any open menu first."); return; }
+        if (task != Task.IDLE) { say(client, "Busy with something else right now."); return; }
+        chestAttempts = 0;
+        chestTestCalls = 0;
+        chestTestTicks = 0;
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
+            say(client, "Chestplate test: taking your chestplate off first...");
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, 6, 0, SlotActionType.QUICK_MOVE, player);
+            chestTestStage = 1;
+        } else {
+            say(client, "Chestplate test: no chestplate is worn - putting one on.");
+            chestTestStage = 2;
+        }
+    }
+
+    private void chestTestTick(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.currentScreen != null) { chestTestStage = 0; return; }
+        chestTestTicks++;
+        boolean worn = !player.getEquippedStack(EquipmentSlot.CHEST).isEmpty();
+
+        if (chestTestStage == 1) {                       // waiting for it to come off
+            if (!worn) {
+                say(client, "Chestplate test: it's off. Now putting it back on...");
+                chestTestStage = 2;
+                chestTestTicks = 0;
+                chestAttempts = 0;
+            } else if (chestTestTicks > 40) {
+                say(client, "Chestplate test: couldn't take the chestplate off (is your inventory full?).");
+                chestTestStage = 0;
+            }
+            return;
+        }
+
+        // stage 2: putting it on, one step every half second
+        if (worn) {
+            say(client, "Chestplate test PASSED: the chestplate is on (after " + chestTestCalls + " step(s)).");
+            autoLog("CHEST test passed after " + chestTestCalls + " step(s)");
+            chestTestStage = 0;
+            return;
+        }
+        if (chestTestTicks % 10 == 1) {
+            if (chestTestCalls >= 6) {
+                say(client, "Chestplate test FAILED: it never went on. See the CHEST lines in radiantalert-auto.txt.");
+                autoLog("CHEST test failed");
+                chestTestStage = 0;
+                return;
+            }
+            chestTestCalls++;
+            ensureChestplate(client);
         }
     }
 
@@ -2572,6 +2642,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         hTicks = 0;
         hPrevSlot = -1;
         hGuiTicks = 0;
+        hWheelClicked = false;
         hEntity = findOwnHoopa(client);
         task = Task.HOOPA;
         hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
@@ -2788,11 +2859,14 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (hGuiTicks == 1) {
             dumpObject("WHEEL", screen, 0, Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>()), new int[]{0});
         }
-        if (hGuiTicks == 3) {
-            autoLog("HOOPA wheel: shoulder option triggered=" + tryClickShoulderOption(screen));
+        // the wheel builds its buttons a moment after opening, so keep trying for a few ticks
+        if (!hWheelClicked && (hGuiTicks == 3 || hGuiTicks == 6 || hGuiTicks == 9)) {
+            hWheelClicked = tryClickShoulderOption(screen);
+            autoLog("HOOPA wheel: shoulder button pressed=" + hWheelClicked + " (tick " + hGuiTicks + ")");
         }
-        if (hGuiTicks >= 14) {                 // give it a moment, then close the wheel so we are not stuck behind it
+        if (hGuiTicks >= 16) {                 // still open: close it so we are not stuck behind it
             hGuiTicks = 0;
+            hWheelClicked = false;
             client.setScreen(null);
         }
     }
@@ -2813,9 +2887,12 @@ public class RadiantAlertClient implements ClientModInitializer {
                     if (text.length() > 100) text = text.substring(0, 100) + "...";
                     autoLog("DUMP   " + label + "." + f.getName() + " (" + f.getType().getSimpleName() + ") = " + text);
                     lines[0]++;
-                    if (v instanceof Iterable<?> iterable) {
+                    Iterable<?> elems = v instanceof Multimap<?, ?> mm ? mm.values()
+                        : v instanceof Map<?, ?> map ? map.values()
+                        : v instanceof Iterable<?> it ? it : null;
+                    if (elems != null) {
                         int n = 0;
-                        for (Object o : iterable) {
+                        for (Object o : elems) {
                             if (n++ >= 12) break;
                             dumpObject(label + "." + f.getName() + "[" + (n - 1) + "]", o, depth + 1, seen, lines);
                         }
@@ -2831,9 +2908,14 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private boolean tryClickShoulderOption(Screen screen) {
         try {
-            for (Object option : optionObjects(screen)) {
-                if (!optionLabel(option).contains("shoulder")) continue;
-                if (invokeOptionAction(option)) return true;
+            List<Object> reachable = reachableObjects(screen, 4);
+            autoLog("HOOPA wheel: " + reachable.size() + " Cobblemon objects reachable from the screen");
+            for (Object o : reachable) {
+                if (o == screen) continue;
+                String label = optionLabel(o);
+                if (!label.contains("shoulder")) continue;
+                autoLog("HOOPA wheel: candidate " + o.getClass().getName() + " (" + label.trim() + ")");
+                if (invokeOptionAction(o)) return true;
             }
         } catch (Throwable t) {
             autoLog("HOOPA wheel click failed: " + t);
@@ -2841,29 +2923,51 @@ public class RadiantAlertClient implements ClientModInitializer {
         return false;
     }
 
-    /** The objects held in the screen's lists and arrays (the wheel's options). */
-    private static List<Object> optionObjects(Object screen) {
-        List<Object> out = new ArrayList<>();
-        for (Class<?> k = screen.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
-            if (k.getName().startsWith("net.minecraft")) break;
-            for (Field f : k.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(screen);
-                    if (v instanceof Iterable<?> iterable) {
-                        for (Object o : iterable) if (o != null) out.add(o);
-                    } else if (v instanceof Object[] array) {
-                        for (Object o : array) if (o != null) out.add(o);
-                    } else if (v instanceof Map<?, ?> map) {
-                        for (Object o : map.values()) if (o != null) out.add(o);
+    /** The Cobblemon objects reachable from the screen through fields, lists, maps and multimaps, a few levels deep. */
+    private static List<Object> reachableObjects(Object root, int maxDepth) {
+        List<Object> result = new ArrayList<>();
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Deque<Object[]> queue = new ArrayDeque<>(); // {object, depth}
+        queue.add(new Object[]{root, 0});
+        int budget = 2000;
+        while (!queue.isEmpty() && budget-- > 0) {
+            Object[] item = queue.poll();
+            Object obj = item[0];
+            int depth = (Integer) item[1];
+            if (obj == null || !seen.add(obj)) continue;
+
+            Iterable<?> elements = null;
+            if (obj instanceof Multimap<?, ?> multimap) elements = multimap.values();
+            else if (obj instanceof Map<?, ?> map) elements = map.values();
+            else if (obj instanceof Iterable<?> iterable) elements = iterable;
+            else if (obj instanceof Object[] array) elements = Arrays.asList(array);
+            if (elements != null) {
+                if (depth < maxDepth) {
+                    for (Object o : elements) {
+                        if (o != null) queue.add(new Object[]{o, depth + 1});
                     }
-                } catch (Throwable ignored) {
-                    // skip
+                }
+                continue;
+            }
+
+            if (!obj.getClass().getName().startsWith("com.cobblemon")) continue;
+            result.add(obj);
+            if (depth >= maxDepth) continue;
+            for (Class<?> k = obj.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+                if (k.getName().startsWith("net.minecraft")) break;
+                for (Field f : k.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(obj);
+                        if (v != null) queue.add(new Object[]{v, depth + 1});
+                    } catch (Throwable ignored) {
+                        // skip
+                    }
                 }
             }
         }
-        return out;
+        return result;
     }
 
     /** All the text-like values on an option (names, ids, enum names), lowercased, to tell which one is "shoulder". */

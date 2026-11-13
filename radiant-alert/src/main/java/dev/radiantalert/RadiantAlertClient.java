@@ -2,6 +2,7 @@ package dev.radiantalert;
 
 import com.cobblemon.mod.common.entity.pokemon.PokemonEntity;
 import com.cobblemon.mod.common.pokemon.Pokemon;
+import com.google.common.collect.Multimap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -14,10 +15,16 @@ import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.loader.api.FabricLoader;
+import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.screen.DeathScreen;
+import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
@@ -38,6 +45,7 @@ import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.HitResult;
@@ -52,6 +60,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.file.Files;
@@ -62,6 +71,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Radiant Alert: tells you about radiants, shinies, Lunala/Solgaleo and Ultra Wormholes, and can
@@ -192,9 +202,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     /**
      * The wormhole battle is automatic; once it's won you land on the spawn server and an Ultra Beast MAY appear
      * (not every time). Wait this long (ticks, 20 = 1 second) there, checking for one, before going home.
+     * 15 seconds; raise it if they tend to show up later (the action log lists what was nearby each 2 seconds).
      */
-    private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 3;
-    private static final double ULTRA_BEAST_SEARCH_RADIUS = 64;
+    private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 15;
+    private static final double ULTRA_BEAST_SEARCH_RADIUS = 128;
 
     // --- Inventory clean-up (/radiantalert autoclean) ---
     /** Command that takes you to the drop-off spot. No slash. */
@@ -240,12 +251,25 @@ public class RadiantAlertClient implements ClientModInitializer {
         namePattern("\\bflutes?\\b"),                         // flutes
         namePattern("eternal flower"),
         namePattern("echo shard"),
-        namePattern("hyper berr(y|ies)"),
+        namePattern("hyper.*berr(y|ies)"),                      // hyper berries
         namePattern("\\w+ium z$|\\bz-?crystal"),                // z crystals, e.g. "Normalium Z"
         namePattern("\\bfragments?\\b"),
         namePattern("herba mystica"),
         namePattern("sandwich"),
+        namePattern("\\bfossils?\\b"),                          // fossils
+        namePattern("charged apri"),                            // charged apri juice
         namePattern("golden apple"));
+
+    /** Dropped when the item's registry id matches one of these (fossils and the vanilla ores / minerals). */
+    private static final List<Pattern> JUNK_ID_PATTERNS = List.of(
+        Pattern.compile("^cobblemon:.*fossil.*$"),                                                        // fossils
+        Pattern.compile("^minecraft:(deepslate_)?(coal|iron|copper|gold|diamond|emerald|lapis|redstone)_ore$"), // ores
+        Pattern.compile("^minecraft:(nether_gold_ore|nether_quartz_ore|ancient_debris)$"),
+        Pattern.compile("^minecraft:raw_(iron|copper|gold)(_block)?$"),                                   // raw metal
+        Pattern.compile("^minecraft:(iron|gold|copper|netherite)_ingot$"),                                // ingots
+        Pattern.compile("^minecraft:(iron|gold)_nugget$"),
+        Pattern.compile("^minecraft:(coal|iron|gold|copper|diamond|emerald|lapis|redstone|netherite)_block$"), // mineral blocks
+        Pattern.compile("^minecraft:(coal|diamond|emerald|lapis_lazuli|redstone|quartz|netherite_scrap)$"));  // gems and dusts
 
     /** Never dropped, even though they look like a pattern above. */
     private static final Set<String> JUNK_NAME_EXCEPTIONS = Set.of("eviolite", "ender pearl");
@@ -253,13 +277,13 @@ public class RadiantAlertClient implements ClientModInitializer {
     // --- Hoopa on your shoulder (/radiantalert autohoopa) ---
     private static final String HOOPA_SPECIES = "hoopa";
     /** A "normal" Hoopa may only have these aspects; anything else (delta, omega, unbound, ...) is not normal. */
-    private static final Set<String> NORMAL_HOOPA_ASPECTS = Set.of("confined", "shiny");
+    private static final Set<String> NORMAL_HOOPA_ASPECTS = Set.of("confined", "shiny", "genderless", "male", "female");
     /** ...and its form name must be one of these (lowercase). */
     private static final Set<String> NORMAL_HOOPA_FORMS = Set.of("normal", "confined");
     /** After arriving somewhere, wait this long (ms) before the automatic Hoopa check. */
     private static final long HOOPA_AFTER_ARRIVAL_MS = 6000;
     /** After a successful Hoopa mount, don't run the automatic check again for this long (ms). */
-    private static final long HOOPA_RECHECK_MS = 30L * 60 * 1000;
+    private static final long HOOPA_RECHECK_MS = 15000;
 
     // ===============================================================================
 
@@ -355,13 +379,17 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int idleCheckTicks = 0;
 
     // ---- Hoopa on the shoulder ----
-    private enum HStage { SELECT, PRESS, WAIT_OUT, SHOULDER }
+    private enum HStage { SELECT, PRESS, WAIT_OUT, APPROACH, SHOULDER }
     private boolean autoHoopaEnabled = false;
     private HStage hStage = HStage.SELECT;
-    private int hTicks = 0, hSlot = -1, hAttempts = 0;
+    private int hTicks = 0, hSlot = -1, hAttempts = 0, hPrevSlot = -1, hGuiTicks = 0;
     private PokemonEntity hEntity = null;
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
     private boolean sneakHeld = false;
+    private boolean hWheelClicked = false;
+
+    // ---- chestplate test (/radiantalert chestplate) ----
+    private int chestTestStage = 0, chestTestTicks = 0, chestTestCalls = 0;
 
     // ---- Ultra Beast catch, death handling, route start ----
     private boolean ubCatch = false;
@@ -370,6 +398,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean respawnPending = false;
     private boolean respawnContinuesRun = false;
     private long lastRespawnAt = 0;
+    private int chestAttempts = 0;
+    private Screen lastUnblockScreen = null;
+    private int screenOpenTicks = 0;
+    private long lastEndBattleAt = 0;
     private int deathTicks = 0, respawnTicks = 0;
     private Vec3d routeStart = Vec3d.ZERO;
 
@@ -466,6 +498,10 @@ public class RadiantAlertClient implements ClientModInitializer {
                     dumpItems(MinecraftClient.getInstance());
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("chestplate").executes(ctx -> {
+                    startChestTest(MinecraftClient.getInstance());
+                    return 1;
+                }))
                 .then(ClientCommandManager.literal("clean")
                     .executes(ctx -> {
                         showCleanPlan(MinecraftClient.getInstance());
@@ -535,7 +571,9 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (++idleCheckTicks >= 20) {
             idleCheckTicks = 0;
             idleChecks(client);
+            chestCheck(client);
         }
+        if (chestTestStage != 0) chestTestTick(client);
 
         // Dying: respawn, put a chestplate back on, and
         //  - inside the wormhole (a life is lost, the run goes on): send your first Pokémon out again with R;
@@ -633,7 +671,18 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (task == Task.IDLE) { releaseKeys(client); return; }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); return; }
-        if (client.currentScreen != null) { releaseKeys(client); return; } // paused while chat/inventory/battle is open
+        if (client.currentScreen != null) {
+            // crouch + right-click on your Pokémon opens Cobblemon's interaction wheel: handle it instead of freezing behind it
+            if (task == Task.HOOPA && hStage == HStage.SHOULDER && hAttempts >= 2 && isCobblemonInteractScreen(client.currentScreen)) {
+                hoopaScreen(client);
+                return;
+            }
+            releaseKeys(client);
+            unblockScreen(client); // close chat / menus, or end a battle, that would stop us from moving
+            return;
+        }
+        lastUnblockScreen = null;
+        screenOpenTicks = 0;
 
         switch (task) {
             case CATCH -> catchTick(client, player);
@@ -1176,6 +1225,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case ARRIVED -> {
                 releaseKeys(client);
+                if (wTicks == 10) ensureChestplate(client);
                 if (wTicks >= AFTER_TELEPORT_WAIT_TICKS) {
                     pressSendOutKey();
                     wStage = WStage.ENCOUNTER;
@@ -1190,6 +1240,10 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case FINISHED -> {
                 releaseKeys(client);
+                if (wTicks == 1) {
+                    say(client, "Checking for an Ultra Beast (up to " + (ULTRA_BEAST_WAIT_TICKS / 20) + " seconds)...");
+                }
+                if (wTicks % 40 == 0) logNearbyPokemon(client);
                 // an Ultra Beast may appear on the spawn server: it MUST be caught (Beast Balls) before going home
                 PokemonEntity beast = findUltraBeast(client);
                 if (beast != null) {
@@ -1223,25 +1277,124 @@ public class RadiantAlertClient implements ClientModInitializer {
         return best;
     }
 
-    /** Puts a chestplate on if the chest slot is empty (shift-clicks one from your inventory into the armour slot). */
+    /**
+     * Makes sure a chestplate is worn. Each call tries one thing and it is called again every second during a
+     * wormhole run until the chestplate is on: (1) shift-click it into the armour slot, (2) bring it to the
+     * hotbar, (3) right-click it from the hotbar (which equips it).
+     */
     private void ensureChestplate(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null) return;
-        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) return;
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) { chestAttempts = 0; return; }
+
+        int found = -1;
         for (int i = 0; i < 36; i++) {
             ItemStack s = player.getInventory().getStack(i);
             if (s.isEmpty()) continue;
             if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) {
-                int screenSlot = i < 9 ? 36 + i : i;
-                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
-                    SlotActionType.QUICK_MOVE, player);
-                autoLog("Equipped " + itemIdOf(s) + " from inventory slot " + i);
-                say(client, "Put on your chestplate (" + itemNameOf(s) + ").");
-                return;
+                found = i;
+                break;
             }
         }
-        autoLog("No chestplate found");
-        say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
+        if (found < 0) {
+            if (chestAttempts++ % 10 == 0) {
+                autoLog("CHEST no chestplate found in the inventory");
+                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
+            }
+            return;
+        }
+
+        int step = chestAttempts++ % 3;
+        ItemStack stack = player.getInventory().getStack(found);
+        int screenSlot = found < 9 ? 36 + found : found;
+        autoLog("CHEST step " + (step + 1) + ": " + itemIdOf(stack) + " from inventory slot " + found);
+        if (step == 0) {
+            say(client, "Putting on your chestplate (" + itemNameOf(stack) + ").");
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
+                SlotActionType.QUICK_MOVE, player);
+        } else if (step == 1) {
+            if (found >= 9) {
+                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot,
+                    player.getInventory().selectedSlot, SlotActionType.SWAP, player);
+            } else {
+                player.getInventory().selectedSlot = found;
+            }
+        } else {
+            ItemStack held = player.getMainHandStack();
+            if (!held.isEmpty() && (itemIdOf(held).endsWith("_chestplate")
+                    || itemNameOf(held).toLowerCase(Locale.ROOT).contains("chestplate"))) {
+                client.interactionManager.interactItem(player, Hand.MAIN_HAND); // right-click to wear it
+            } else if (found < 9) {
+                player.getInventory().selectedSlot = found;
+            }
+        }
+    }
+
+    /**
+     * /radiantalert chestplate: tests the equipping. If you are wearing a chestplate it is taken off first,
+     * then the same routine the wormhole run uses puts it back on, and the result is reported.
+     */
+    private void startChestTest(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.interactionManager == null) return;
+        if (client.currentScreen != null) { say(client, "Close any open menu first."); return; }
+        if (task != Task.IDLE) { say(client, "Busy with something else right now."); return; }
+        chestAttempts = 0;
+        chestTestCalls = 0;
+        chestTestTicks = 0;
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
+            say(client, "Chestplate test: taking your chestplate off first...");
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, 6, 0, SlotActionType.QUICK_MOVE, player);
+            chestTestStage = 1;
+        } else {
+            say(client, "Chestplate test: no chestplate is worn - putting one on.");
+            chestTestStage = 2;
+        }
+    }
+
+    private void chestTestTick(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.currentScreen != null) { chestTestStage = 0; return; }
+        chestTestTicks++;
+        boolean worn = !player.getEquippedStack(EquipmentSlot.CHEST).isEmpty();
+
+        if (chestTestStage == 1) {                       // waiting for it to come off
+            if (!worn) {
+                say(client, "Chestplate test: it's off. Now putting it back on...");
+                chestTestStage = 2;
+                chestTestTicks = 0;
+                chestAttempts = 0;
+            } else if (chestTestTicks > 40) {
+                say(client, "Chestplate test: couldn't take the chestplate off (is your inventory full?).");
+                chestTestStage = 0;
+            }
+            return;
+        }
+
+        // stage 2: putting it on, one step every half second
+        if (worn) {
+            say(client, "Chestplate test PASSED: the chestplate is on (after " + chestTestCalls + " step(s)).");
+            autoLog("CHEST test passed after " + chestTestCalls + " step(s)");
+            chestTestStage = 0;
+            return;
+        }
+        if (chestTestTicks % 10 == 1) {
+            if (chestTestCalls >= 6) {
+                say(client, "Chestplate test FAILED: it never went on. See the CHEST lines in radiantalert-auto.txt.");
+                autoLog("CHEST test failed");
+                chestTestStage = 0;
+                return;
+            }
+            chestTestCalls++;
+            ensureChestplate(client);
+        }
+    }
+
+    /** Once a second during a wormhole run: if the chest slot is empty, try to put a chestplate on. */
+    private void chestCheck(MinecraftClient client) {
+        if (task != Task.WORMHOLE || client.currentScreen != null || client.player == null) return;
+        if (client.player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) ensureChestplate(client);
+        else chestAttempts = 0;
     }
 
     private void stopWormhole(MinecraftClient client, String message) {
@@ -1848,6 +2001,91 @@ public class RadiantAlertClient implements ClientModInitializer {
         appendToFile("radiantalert-record.txt", line);
     }
 
+    // ============================== Menus in the way ==============================
+
+    /**
+     * While a task is running and a screen is open: close chat (only if nothing is typed in it) and menus like
+     * the inventory or Cobblemon's screens, as if pressing Esc; for a Cobblemon battle screen send /endbattle.
+     * Loading screens and the like are left alone. While waiting for the automatic wormhole battle, nothing is touched.
+     */
+    private void unblockScreen(MinecraftClient client) {
+        Screen screen = client.currentScreen;
+        if (screen == null) {
+            lastUnblockScreen = null;
+            screenOpenTicks = 0;
+            return;
+        }
+        if (screen != lastUnblockScreen) {
+            lastUnblockScreen = screen;
+            screenOpenTicks = 0;
+        }
+        screenOpenTicks++;
+
+        if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) return; // the battle is supposed to be running
+
+        String cls = screen.getClass().getName();
+        boolean cobblemon = cls.startsWith("com.cobblemon");
+        boolean battle = cobblemon && cls.toLowerCase(Locale.ROOT).contains("battle");
+
+        if (battle) {
+            boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH || wStage == WStage.FINISHED;
+            long now = System.currentTimeMillis();
+            if (mayEnd && screenOpenTicks >= 20 && now - lastEndBattleAt > 4000 && client.player != null) {
+                lastEndBattleAt = now;
+                client.player.networkHandler.sendChatCommand("endbattle");
+                autoLog("MENU battle screen in the way: sent /endbattle (" + cls + ")");
+                say(client, "In a battle - sending /endbattle so I can carry on.");
+            }
+            return;
+        }
+
+        if (screen instanceof ChatScreen chat) {
+            String typed = chatScreenText(chat);
+            boolean ready = typed == null ? screenOpenTicks >= 60 : typed.isEmpty() && screenOpenTicks >= 40;
+            if (ready) {
+                autoLog("MENU closing the chat screen");
+                screen.close();
+            }
+            return;
+        }
+
+        if (screen instanceof HandledScreen<?> || screen instanceof GameMenuScreen || cobblemon) {
+            if (screenOpenTicks >= 10) {
+                autoLog("MENU closing " + cls);
+                screen.close();
+            }
+        }
+        // anything else (loading screens, the death screen, ...) is left alone
+    }
+
+    /** What is typed in the chat box right now (null if it can't be read). */
+    private static String chatScreenText(ChatScreen screen) {
+        for (Field f : ChatScreen.class.getDeclaredFields()) {
+            if (f.getType() != TextFieldWidget.class) continue;
+            try {
+                f.setAccessible(true);
+                Object widget = f.get(screen);
+                if (widget instanceof TextFieldWidget field) return field.getText();
+            } catch (Throwable ignored) {
+                // try the next field
+            }
+        }
+        return null;
+    }
+
+    /** Writes the wild Pokémon around you (species @ distance) to the action log, to see what shows up at the end of a wormhole. */
+    private void logNearbyPokemon(MinecraftClient client) {
+        if (client.player == null || client.world == null) return;
+        List<String> found = new ArrayList<>();
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                client.player.getBoundingBox().expand(ULTRA_BEAST_SEARCH_RADIUS),
+                x -> x.getOwnerUuid() == null && !x.isRemoved())) {
+            found.add(pe.getPokemon().getSpecies().getName() + "@" + Math.round(pe.distanceTo(client.player)));
+        }
+        autoLog("UB CHECK +" + (wTicks / 20) + "s dim=" + client.world.getRegistryKey().getValue()
+            + " wild Pokémon nearby: " + found);
+    }
+
     // ============================== Idle checks ==============================
 
     private static Pattern namePattern(String regex) {
@@ -2088,9 +2326,19 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    /** The Pokémon's current state as Cobblemon names it: roughly Inactive (in the party), Active (out) or Shouldered. */
+    private static String pokemonState(Pokemon p) {
+        try {
+            Object state = invoke(p, "getState");
+            return state == null ? "?" : state.getClass().getSimpleName();
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
     private static String describePokemon(Pokemon p) {
         return p.getSpecies().getName() + " | form=" + p.getForm().getName() + " | aspects=" + p.getAspects()
-            + " | shiny=" + p.getShiny() + " | lvl " + p.getLevel();
+            + " | shiny=" + p.getShiny() + " | lvl " + p.getLevel() + " | state=" + pokemonState(p);
     }
 
     private static boolean isNormalHoopa(Pokemon p) {
@@ -2166,6 +2414,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (JUNK_NAME_EXCEPTIONS.contains(name)) return false;
         if (JUNK_ITEM_IDS.contains(itemIdOf(stack))) return true;
         if (JUNK_EXACT_NAMES.contains(name)) return true;
+        String id = itemIdOf(stack);
+        for (Pattern pattern : JUNK_ID_PATTERNS) {
+            if (pattern.matcher(id).find()) return true;
+        }
         for (Pattern pattern : JUNK_NAME_PATTERNS) {
             if (pattern.matcher(name).find()) return true;
         }
@@ -2378,13 +2630,23 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
 
+        String state = pokemonState(party.get(slot));
+        if (state.toLowerCase(Locale.ROOT).contains("shoulder")) {
+            autoLog("HOOPA already on the shoulder (state=" + state + ")");
+            if (manual) say(client, "Your Hoopa is already on your shoulder.");
+            return;
+        }
+
         hSlot = slot;
         hAttempts = 0;
         hTicks = 0;
+        hPrevSlot = -1;
+        hGuiTicks = 0;
+        hWheelClicked = false;
         hEntity = findOwnHoopa(client);
         task = Task.HOOPA;
-        hStage = hEntity != null ? HStage.SHOULDER : HStage.SELECT;
-        autoLog("HOOPA start slot=" + (slot + 1) + " alreadyOut=" + (hEntity != null));
+        hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
+        autoLog("HOOPA start slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null));
         say(client, hEntity != null
             ? "Your Hoopa is already out - putting it on your shoulder."
             : "Sending out your Hoopa (party slot " + (slot + 1) + ").");
@@ -2421,47 +2683,362 @@ public class RadiantAlertClient implements ClientModInitializer {
             case WAIT_OUT -> {
                 hEntity = findOwnHoopa(client);
                 if (hEntity != null) {
-                    hStage = HStage.SHOULDER;
+                    hStage = HStage.APPROACH;
                     hTicks = 0;
                 } else if (hTicks > 100) {
                     stopHoopa(client, "Hoopa didn't come out.");
                 }
             }
+            case APPROACH -> {
+                // wait for the send-out animation, and get within reach (about 3 blocks) of it
+                if (hEntity == null || hEntity.isRemoved()) hEntity = findOwnHoopa(client);
+                if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
+                boolean tooFar = player.distanceTo(hEntity) > 2.4f;
+                if (tooFar && hTicks < 100) {
+                    aimAt(player, hEntity);
+                    client.options.forwardKey.setPressed(true);
+                    client.options.sprintKey.setPressed(false);
+                    keysHeld = true;
+                } else if (hTicks >= 20) {
+                    releaseKeys(client);
+                    // use an empty hand for the right-click if there is a free hotbar slot
+                    hPrevSlot = player.getInventory().selectedSlot;
+                    for (int i = 0; i < 9; i++) {
+                        if (player.getInventory().getStack(i).isEmpty()) {
+                            player.getInventory().selectedSlot = i;
+                            break;
+                        }
+                    }
+                    hStage = HStage.SHOULDER;
+                    hTicks = 0;
+                }
+            }
             case SHOULDER -> {
                 if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
-                if (hTicks == 1) {                       // crouch first
+
+                // Attempts 1 and 2: send the message the wheel's "shoulder" button sends (first with the
+                // entity's id, then with the Pokémon's id). No crouching, right-clicking or wheel needed.
+                if (hAttempts <= 1) {
+                    if (hTicks == 1 && !hEntity.isRemoved()) {
+                        UUID id = hAttempts == 0 ? hEntity.getUuid() : hEntity.getPokemon().getUuid();
+                        boolean sent = trySendShoulderPacket(id);
+                        autoLog("HOOPA shoulder packet attempt " + (hAttempts + 1) + " ("
+                            + (hAttempts == 0 ? "entity" : "pokemon") + " id) sent=" + sent);
+                        if (!sent) {                         // can't send it: use the wheel instead
+                            hAttempts = 2;
+                            hTicks = 0;
+                            return;
+                        }
+                    }
+                    if (hTicks > 1 && hEntity.isRemoved()) {
+                        hoopaMountedAt = System.currentTimeMillis();
+                        stopHoopa(client, "Hoopa is on your shoulder.");
+                        return;
+                    }
+                    if (hTicks >= 16) {
+                        hAttempts++;
+                        hTicks = 0;
+                    }
+                    return;
+                }
+
+                // Attempt 3: crouch + right-click opens Cobblemon's interaction wheel; hoopaScreen() clicks "shoulder" there
+                if (hTicks == 1) {
                     client.options.sneakKey.setPressed(true);
                     sneakHeld = true;
                 }
+                if (hTicks == 3 && !hEntity.isRemoved() && player.distanceTo(hEntity) > 2.9f) {
+                    // it wandered off while we crouched: go back to it
+                    client.options.sneakKey.setPressed(false);
+                    sneakHeld = false;
+                    hStage = HStage.APPROACH;
+                    hTicks = 0;
+                    return;
+                }
                 if (hTicks == 4 && !hEntity.isRemoved() && client.interactionManager != null) {
-                    client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND); // crouch + right-click
-                    autoLog("HOOPA interact attempt " + (hAttempts + 1));
+                    ActionResult result = client.interactionManager.interactEntity(player, hEntity, Hand.MAIN_HAND);
+                    autoLog(String.format("HOOPA crouch + right-click: distance=%.1f sneaking=%s result=%s",
+                        (double) player.distanceTo(hEntity), player.isSneaking(), result));
                 }
                 if (hTicks > 4 && hEntity.isRemoved()) {
                     hoopaMountedAt = System.currentTimeMillis();
                     stopHoopa(client, "Hoopa is on your shoulder.");
                     return;
                 }
-                if (hTicks >= 14) {
-                    hAttempts++;
-                    if (hAttempts >= 3) {
-                        stopHoopa(client, "Couldn't put Hoopa on your shoulder (tried 3 times).");
-                        return;
-                    }
-                    hTicks = 0;
-                    client.options.sneakKey.setPressed(false);
-                    sneakHeld = false;
+                if (hTicks >= 60) {
+                    stopHoopa(client, "Couldn't put Hoopa on your shoulder. See radiantalert-auto.txt (lines starting with HOOPA and DUMP).");
                 }
             }
         }
     }
 
+    // ---- the shoulder message and Cobblemon's interaction wheel ----
+
+    private static Class<?> interactPacketClass = null;
+    private static boolean interactPacketSearched = false;
+
+    /** Finds Cobblemon's "interact with Pokémon" packet (the one built from a UUID and a true/false) by looking inside its jar. */
+    private Class<?> findInteractPacketClass() {
+        if (interactPacketSearched) return interactPacketClass;
+        interactPacketSearched = true;
+
+        List<String> candidates = new ArrayList<>();
+        try {
+            Optional<ModContainer> container = FabricLoader.getInstance().getModContainer("cobblemon");
+            if (container.isPresent()) {
+                for (Path root : container.get().getRootPaths()) {
+                    try (Stream<Path> walk = Files.walk(root)) {
+                        walk.forEach(path -> {
+                            Path fileName = path.getFileName();
+                            if (fileName == null) return;
+                            String n = fileName.toString();
+                            if (n.endsWith(".class") && n.contains("Interact") && n.contains("Packet") && !n.contains("$")) {
+                                String rel = root.relativize(path).toString().replace('\\', '/');
+                                candidates.add(rel.substring(0, rel.length() - ".class".length()).replace('/', '.'));
+                            }
+                        });
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            autoLog("HOOPA could not search the Cobblemon jar: " + t);
+        }
+
+        Class<?> best = null;
+        for (String name : candidates) {
+            try {
+                Class<?> c = Class.forName(name);
+                StringBuilder sb = new StringBuilder("HOOPA packet candidate " + name + " constructors:");
+                boolean fits = false;
+                for (Constructor<?> k : c.getConstructors()) {
+                    Class<?>[] types = k.getParameterTypes();
+                    sb.append(' ').append(Arrays.toString(types));
+                    if (types.length == 2 && types[0] == UUID.class && types[1] == boolean.class) fits = true;
+                }
+                autoLog(sb.toString());
+                if (fits && (best == null || c.getSimpleName().contains("Pokemon"))) best = c;
+            } catch (Throwable t) {
+                autoLog("HOOPA could not load " + name + ": " + t);
+            }
+        }
+        interactPacketClass = best;
+        autoLog("HOOPA interact packet class: " + (best == null ? "NOT FOUND (" + candidates.size() + " candidates)" : best.getName()));
+        return best;
+    }
+
+    private boolean trySendShoulderPacket(UUID pokemonId) {
+        try {
+            Class<?> c = findInteractPacketClass();
+            if (c == null) return false;
+            for (Constructor<?> k : c.getConstructors()) {
+                Class<?>[] types = k.getParameterTypes();
+                if (types.length == 2 && types[0] == UUID.class && types[1] == boolean.class) {
+                    Object packet = k.newInstance(pokemonId, true);
+                    if (packet instanceof CustomPayload payload) {
+                        ClientPlayNetworking.send(payload);
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            autoLog("HOOPA shoulder packet failed: " + t);
+        }
+        return false;
+    }
+
+    private static boolean isCobblemonInteractScreen(Screen screen) {
+        String name = screen.getClass().getName();
+        return name.startsWith("com.cobblemon") && name.toLowerCase(Locale.ROOT).contains("interact");
+    }
+
+    /** Runs while Cobblemon's interaction wheel is open: write down what it contains, click "shoulder", then close it. */
+    private void hoopaScreen(MinecraftClient client) {
+        hGuiTicks++;
+        Screen screen = client.currentScreen;
+        if (screen == null) { hGuiTicks = 0; return; }
+        if (hGuiTicks == 1) {
+            dumpObject("WHEEL", screen, 0, Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>()), new int[]{0});
+        }
+        // the wheel builds its buttons a moment after opening, so keep trying for a few ticks
+        if (!hWheelClicked && (hGuiTicks == 3 || hGuiTicks == 6 || hGuiTicks == 9)) {
+            hWheelClicked = tryClickShoulderOption(screen);
+            autoLog("HOOPA wheel: shoulder button pressed=" + hWheelClicked + " (tick " + hGuiTicks + ")");
+        }
+        if (hGuiTicks >= 16) {                 // still open: close it so we are not stuck behind it
+            hGuiTicks = 0;
+            hWheelClicked = false;
+            client.setScreen(null);
+        }
+    }
+
+    /** Writes an object's fields (and the Cobblemon objects inside it) to the action log, so the wheel's structure can be read. */
+    private void dumpObject(String label, Object obj, int depth, Set<Object> seen, int[] lines) {
+        if (obj == null || depth > 2 || lines[0] > 150 || !seen.add(obj)) return;
+        autoLog("DUMP " + label + " : " + obj.getClass().getName());
+        lines[0]++;
+        for (Class<?> k = obj.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break; // skip the game's own base classes
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(obj);
+                    String text = String.valueOf(v);
+                    if (text.length() > 100) text = text.substring(0, 100) + "...";
+                    autoLog("DUMP   " + label + "." + f.getName() + " (" + f.getType().getSimpleName() + ") = " + text);
+                    lines[0]++;
+                    Iterable<?> elems = v instanceof Multimap<?, ?> mm ? mm.values()
+                        : v instanceof Map<?, ?> map ? map.values()
+                        : v instanceof Iterable<?> it ? it : null;
+                    if (elems != null) {
+                        int n = 0;
+                        for (Object o : elems) {
+                            if (n++ >= 12) break;
+                            dumpObject(label + "." + f.getName() + "[" + (n - 1) + "]", o, depth + 1, seen, lines);
+                        }
+                    } else if (v != null && v.getClass().getName().startsWith("com.cobblemon")) {
+                        dumpObject(label + "." + f.getName(), v, depth + 1, seen, lines);
+                    }
+                } catch (Throwable ignored) {
+                    // skip fields we can't read
+                }
+            }
+        }
+    }
+
+    private boolean tryClickShoulderOption(Screen screen) {
+        try {
+            List<Object> reachable = reachableObjects(screen, 4);
+            autoLog("HOOPA wheel: " + reachable.size() + " Cobblemon objects reachable from the screen");
+            for (Object o : reachable) {
+                if (o == screen) continue;
+                String label = optionLabel(o);
+                if (!label.contains("shoulder")) continue;
+                autoLog("HOOPA wheel: candidate " + o.getClass().getName() + " (" + label.trim() + ")");
+                if (invokeOptionAction(o)) return true;
+            }
+        } catch (Throwable t) {
+            autoLog("HOOPA wheel click failed: " + t);
+        }
+        return false;
+    }
+
+    /** The Cobblemon objects reachable from the screen through fields, lists, maps and multimaps, a few levels deep. */
+    private static List<Object> reachableObjects(Object root, int maxDepth) {
+        List<Object> result = new ArrayList<>();
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Deque<Object[]> queue = new ArrayDeque<>(); // {object, depth}
+        queue.add(new Object[]{root, 0});
+        int budget = 2000;
+        while (!queue.isEmpty() && budget-- > 0) {
+            Object[] item = queue.poll();
+            Object obj = item[0];
+            int depth = (Integer) item[1];
+            if (obj == null || !seen.add(obj)) continue;
+
+            Iterable<?> elements = null;
+            if (obj instanceof Multimap<?, ?> multimap) elements = multimap.values();
+            else if (obj instanceof Map<?, ?> map) elements = map.values();
+            else if (obj instanceof Iterable<?> iterable) elements = iterable;
+            else if (obj instanceof Object[] array) elements = Arrays.asList(array);
+            if (elements != null) {
+                if (depth < maxDepth) {
+                    for (Object o : elements) {
+                        if (o != null) queue.add(new Object[]{o, depth + 1});
+                    }
+                }
+                continue;
+            }
+
+            if (!obj.getClass().getName().startsWith("com.cobblemon")) continue;
+            result.add(obj);
+            if (depth >= maxDepth) continue;
+            for (Class<?> k = obj.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+                if (k.getName().startsWith("net.minecraft")) break;
+                for (Field f : k.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) continue;
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(obj);
+                        if (v != null) queue.add(new Object[]{v, depth + 1});
+                    } catch (Throwable ignored) {
+                        // skip
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /** All the text-like values on an option (names, ids, enum names), lowercased, to tell which one is "shoulder". */
+    private static String optionLabel(Object option) {
+        StringBuilder sb = new StringBuilder();
+        for (Class<?> k = option.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(option);
+                    if (v instanceof Text text) sb.append(text.getString()).append(' ');
+                    else if (v instanceof String || v instanceof Identifier || v instanceof Enum<?>) sb.append(v).append(' ');
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        sb.append(option.getClass().getSimpleName());
+        return sb.toString().toLowerCase(Locale.ROOT);
+    }
+
+    /** Runs the option's click action: a Runnable or a Kotlin lambda stored on it (fields named press/click/action first). */
+    private boolean invokeOptionAction(Object option) {
+        List<Object> actions = new ArrayList<>();
+        for (Class<?> k = option.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(option);
+                    if (v == null) continue;
+                    String n = f.getName().toLowerCase(Locale.ROOT);
+                    boolean named = n.contains("press") || n.contains("click") || n.contains("action")
+                        || n.contains("callback") || n.contains("handler");
+                    if (named) actions.add(0, v); else actions.add(v);
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        for (Object action : actions) {
+            try {
+                if (action instanceof Runnable runnable) {
+                    runnable.run();
+                    return true;
+                }
+                java.lang.reflect.Method invoke = action.getClass().getMethod("invoke");
+                invoke.setAccessible(true);
+                invoke.invoke(action);
+                return true;
+            } catch (NoSuchMethodException ignored) {
+                // not a function: try the next one
+            } catch (Throwable t) {
+                autoLog("HOOPA wheel action failed: " + t);
+            }
+        }
+        return false;
+    }
+
     private void stopHoopa(MinecraftClient client, String message) {
         task = Task.IDLE;
         hEntity = null;
+        releaseKeys(client);
         if (sneakHeld) {
             client.options.sneakKey.setPressed(false);
             sneakHeld = false;
+        }
+        if (hPrevSlot >= 0 && client.player != null) {
+            client.player.getInventory().selectedSlot = hPrevSlot;
+            hPrevSlot = -1;
         }
         autoLog("HOOPA stop: " + message);
         say(client, message);

@@ -32,6 +32,7 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.ArmorItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.ClientConnection;
 import net.minecraft.network.packet.CustomPayload;
@@ -174,6 +175,9 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final int PLAN_MAX_NODES = 15000;
     /** Minimum gap between route plans (ticks). */
     private static final int REPLAN_COOLDOWN_TICKS = 5;
+    /** Alphas (and anything that has hit you) are avoided: routes cost extra within this many blocks of them. */
+    private static final double AVOID_RADIUS = 7.0;
+    private static final double AVOID_COST = 10.0;
 
     // --- Wormhole run ---
     /** Key pressed after the first teleport to send out a Pokémon (Cobblemon's default is R). */
@@ -215,7 +219,9 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Send the home command ("home us") again after everything has been dropped. */
     private static final boolean RETURN_HOME_AFTER_CLEAN = true;
     /** Ticks between each drop (20 = 1 second). */
-    private static final int DROP_DELAY_TICKS = 4;
+    private static final int DROP_DELAY_TICKS = 10;
+    /** After the last drop, wait this long (ticks) before going home, so the hoppers can take everything in. */
+    private static final int DEPOSIT_WAIT_TICKS = 20 * 8;
     /** Don't start another clean-up for this long (ms) after one. */
     private static final long CLEAN_COOLDOWN_MS = 120000;
 
@@ -368,7 +374,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private final Set<Long> blockedNodes = new HashSet<>();
 
     // ---- inventory clean-up ----
-    private enum CStage { SEND_DEPOSIT, WAIT_ARRIVE, DROPPING }
+    private enum CStage { SEND_DEPOSIT, WAIT_ARRIVE, DROPPING, WAITING }
     private record DropAction(int slot, boolean wholeStack, String itemId, String name) {}
     private boolean autoCleanEnabled = false;
     private CStage cStage = CStage.SEND_DEPOSIT;
@@ -404,6 +410,17 @@ public class RadiantAlertClient implements ClientModInitializer {
     private long lastEndBattleAt = 0;
     private int deathTicks = 0, respawnTicks = 0;
     private Vec3d routeStart = Vec3d.ZERO;
+
+    // ---- avoiding Alphas, recovering from a bad route, server clean-ups ----
+    private enum RetryKind { NONE, CATCH, WORMHOLE }
+    private RetryKind retryKind = RetryKind.NONE;
+    private PokemonEntity retryEntity = null;
+    private boolean retryRadiant = false;
+    private Vec3d retryPos = Vec3d.ZERO;
+    private long retryAt = 0, retryDeadline = 0, wormholeDetectedAt = 0;
+    private int retryAttempts = 0;
+    private long clearBlockUntil = 0;
+    private final Map<UUID, Long> aggressors = new HashMap<>();
 
     // ---- action log ----
     private int autoLogLines = 0;
@@ -655,7 +672,10 @@ public class RadiantAlertClient implements ClientModInitializer {
                 if (alerted.add(e.getUuid())) {
                     announce(client, e, radiant, shiny, watched);
                     if ((radiant || shiny) && canStartTask()) {
-                        if (autoCatchEnabled) startCatch(client, e, radiant);
+                        if (autoCatchEnabled && System.currentTimeMillis() >= clearBlockUntil) {
+                            retryAttempts = 0;
+                            startCatch(client, e, radiant);
+                        }
                     }
                 }
             }
@@ -691,6 +711,68 @@ public class RadiantAlertClient implements ClientModInitializer {
             case HOOPA -> hoopaTick(client, player);
             default -> { }
         }
+    }
+
+    /**
+     * The route has gone badly wrong (fell, got far off course, stuck, no route): stop, go to /home us, and - if the
+     * Pokémon / wormhole is still there afterwards - try again (at most twice).
+     */
+    private void recoverAndRetry(MinecraftClient client, String reason) {
+        long now = System.currentTimeMillis();
+        autoLog("RECOVER (" + reason + ") task=" + task + " attempts=" + retryAttempts);
+        retryKind = RetryKind.NONE;
+        if (retryAttempts < 2) {
+            if (task == Task.CATCH && !ubCatch && target != null) {
+                retryKind = RetryKind.CATCH;
+                retryEntity = target;
+                retryRadiant = allowPremiumBalls;
+                retryAt = now + 12000;
+                retryDeadline = now + 90000;
+            } else if (task == Task.WORMHOLE && (wStage == WStage.WALK || wStage == WStage.PUSH)) {
+                retryKind = RetryKind.WORMHOLE;
+                retryPos = wormholePos;
+                retryAt = now + 12000;
+                retryDeadline = wormholeDetectedAt + 90000;
+            }
+            if (retryKind != RetryKind.NONE) retryAttempts++;
+        }
+        ubCatch = false; // we send the home command ourselves
+        abortCurrent(client, "Off course (" + reason + ") - going to /" + HOME_COMMAND
+            + (retryKind != RetryKind.NONE ? " and trying again." : "."));
+        sendHome(client);
+    }
+
+    /** You were just hit: remember the nearest wild Pokémon (other than the one we're after) as someone to keep away from. */
+    private void markAggressor(MinecraftClient client, ClientPlayerEntity player) {
+        PokemonEntity nearest = null;
+        double best = 8.0 * 8.0;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, player.getBoundingBox().expand(8),
+                x -> x.getOwnerUuid() == null && !x.isRemoved() && x != target)) {
+            double d = pe.squaredDistanceTo(player);
+            if (d < best) { best = d; nearest = pe; }
+        }
+        if (nearest != null) {
+            aggressors.put(nearest.getUuid(), System.currentTimeMillis());
+            autoLog("HIT by " + nearest.getPokemon().getSpecies().getName() + " - keeping away from it");
+        }
+    }
+
+    /** Places to route around: Alphas, and anything that has hit you in the last minute. */
+    private List<double[]> dangerZones(MinecraftClient client) {
+        List<double[]> zones = new ArrayList<>();
+        if (client.world == null || client.player == null) return zones;
+        long now = System.currentTimeMillis();
+        aggressors.values().removeIf(t -> now - t > 60000);
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                client.player.getBoundingBox().expand(60),
+                x -> x.getOwnerUuid() == null && !x.isRemoved() && x != target)) {
+            boolean alpha = false;
+            for (String aspect : pe.getPokemon().getAspects()) {
+                if (aspect.toLowerCase(Locale.ROOT).contains("alpha")) { alpha = true; break; }
+            }
+            if (alpha || aggressors.containsKey(pe.getUuid())) zones.add(new double[]{pe.getX(), pe.getZ(), AVOID_RADIUS});
+        }
+        return zones;
     }
 
     private void abortCurrent(MinecraftClient client, String message) {
@@ -809,7 +891,11 @@ public class RadiantAlertClient implements ClientModInitializer {
         wormholesSeen.add(new Seen(p[0], p[1], p[2], now));
         announceWormhole(client, p[0], p[1], p[2], describe(info));
 
-        if (autoWormholeEnabled && canStartTask()) startWormhole(client, new Vec3d(p[0], p[1], p[2]));
+        if (autoWormholeEnabled && canStartTask()) {
+            retryAttempts = 0;
+            wormholeDetectedAt = now;
+            startWormhole(client, new Vec3d(p[0], p[1], p[2]));
+        }
     }
 
     /** Short label for the alert: the matching effect name, e.g. "us_portal_rift_red". */
@@ -830,6 +916,18 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void onChatMessage(String text) {
         if (!text.startsWith("[RadiantAlert]") && !text.startsWith("[rec]")) listenLog("CHAT " + text);
         String lower = text.toLowerCase(Locale.ROOT);
+
+        // "Ground items and wild Pokemon will be cleared in 20 seconds!" / "...have been cleared!":
+        // don't chase Pokémon around a clean-up (wormholes are unaffected)
+        if (lower.contains("ground items") && lower.contains("cleared")) {
+            boolean warning = lower.contains("will be cleared");
+            clearBlockUntil = System.currentTimeMillis() + (warning ? 25000 : 8000);
+            autoLog("CLEAR message (" + (warning ? "warning" : "done") + "): no Pokémon chases for a while");
+            if (task == Task.CATCH && !ubCatch) {
+                stopAuto(MinecraftClient.getInstance(), "Wild Pokémon are being cleared - stopping the catch.");
+            }
+        }
+
         if (task == Task.CATCH && lower.contains("cannot be captured")) {
             MinecraftClient client = MinecraftClient.getInstance();
             autoLog("CHAT uncapturable: " + text);
@@ -1277,55 +1375,75 @@ public class RadiantAlertClient implements ClientModInitializer {
         return best;
     }
 
+    /** Inventory index (0-35) of a chestplate, or -1: things called "chestplate" first, then any chest armour that isn't an elytra. */
+    private int findChestplateSlot(ClientPlayerEntity player) {
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) return i;
+        }
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            if (s.getItem() instanceof ArmorItem armor && armor.getType() == ArmorItem.Type.CHESTPLATE) return i;
+        }
+        return -1;
+    }
+
     /**
-     * Makes sure a chestplate is worn. Each call tries one thing and it is called again every second during a
-     * wormhole run until the chestplate is on: (1) shift-click it into the armour slot, (2) bring it to the
-     * hotbar, (3) right-click it from the hotbar (which equips it).
+     * Makes sure a chestplate is worn. Each call tries one thing, and it is called again every second during a
+     * wormhole run until the chestplate is on: (1) shift-click it, (2) pick it up and drop it into the armour
+     * slot, (3) bring it to the hotbar, (4) right-click it from the hotbar.
      */
     private void ensureChestplate(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null) return;
         if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) { chestAttempts = 0; return; }
 
-        int found = -1;
-        for (int i = 0; i < 36; i++) {
-            ItemStack s = player.getInventory().getStack(i);
-            if (s.isEmpty()) continue;
-            if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) {
-                found = i;
-                break;
-            }
-        }
+        int found = findChestplateSlot(player);
         if (found < 0) {
             if (chestAttempts++ % 10 == 0) {
                 autoLog("CHEST no chestplate found in the inventory");
-                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
+                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory! (Run /radiantalert items to see what you carry.)");
             }
             return;
         }
 
-        int step = chestAttempts++ % 3;
+        int step = chestAttempts++ % 4;
         ItemStack stack = player.getInventory().getStack(found);
         int screenSlot = found < 9 ? 36 + found : found;
-        autoLog("CHEST step " + (step + 1) + ": " + itemIdOf(stack) + " from inventory slot " + found);
-        if (step == 0) {
-            say(client, "Putting on your chestplate (" + itemNameOf(stack) + ").");
-            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
-                SlotActionType.QUICK_MOVE, player);
-        } else if (step == 1) {
-            if (found >= 9) {
-                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot,
-                    player.getInventory().selectedSlot, SlotActionType.SWAP, player);
-            } else {
-                player.getInventory().selectedSlot = found;
+        int sync = player.playerScreenHandler.syncId;
+        String[] labels = {"shift-click", "pick up and place", "move to hotbar", "right-click"};
+        autoLog("CHEST step " + (step + 1) + "/4 (" + labels[step] + "): " + itemIdOf(stack) + " \"" + itemNameOf(stack)
+            + "\" in inventory slot " + found);
+        say(client, "Chestplate: " + labels[step] + " (" + itemNameOf(stack) + ").");
+
+        switch (step) {
+            case 0 -> client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.QUICK_MOVE, player);
+            case 1 -> {
+                client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player); // pick it up
+                client.interactionManager.clickSlot(sync, 6, 0, SlotActionType.PICKUP, player);          // put it in the chest slot
+                if (!player.currentScreenHandler.getCursorStack().isEmpty()) {                         // didn't go in: put it back
+                    client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player);
+                }
             }
-        } else {
-            ItemStack held = player.getMainHandStack();
-            if (!held.isEmpty() && (itemIdOf(held).endsWith("_chestplate")
-                    || itemNameOf(held).toLowerCase(Locale.ROOT).contains("chestplate"))) {
-                client.interactionManager.interactItem(player, Hand.MAIN_HAND); // right-click to wear it
-            } else if (found < 9) {
-                player.getInventory().selectedSlot = found;
+            case 2 -> {
+                if (found >= 9) {
+                    client.interactionManager.clickSlot(sync, screenSlot, player.getInventory().selectedSlot,
+                        SlotActionType.SWAP, player);
+                } else {
+                    player.getInventory().selectedSlot = found;
+                }
+            }
+            default -> {
+                ItemStack held = player.getMainHandStack();
+                if (!held.isEmpty() && (itemIdOf(held).endsWith("_chestplate")
+                        || itemNameOf(held).toLowerCase(Locale.ROOT).contains("chestplate")
+                        || (held.getItem() instanceof ArmorItem armor && armor.getType() == ArmorItem.Type.CHESTPLATE))) {
+                    client.interactionManager.interactItem(player, Hand.MAIN_HAND); // right-click to wear it
+                } else if (found < 9) {
+                    player.getInventory().selectedSlot = found;
+                }
             }
         }
     }
@@ -1384,6 +1502,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                 autoLog("CHEST test failed");
                 chestTestStage = 0;
                 return;
+            }
+            if (chestTestCalls > 0) {
+                say(client, "  chest slot now: empty (that step didn't work)");
             }
             chestTestCalls++;
             ensureChestplate(client);
@@ -1446,16 +1567,27 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         // just got hit (knockback): the old route is no good, plan a new one straight away
         if (player.hurtTime >= 8) {
+            markAggressor(client, player);
             path = List.of();
             replanCooldown = 0;
             stuckTicks = 0;
             stuckStrikes = 0;
         }
 
+        // falling a long way: give up on this route
+        if (player.fallDistance > 5.0f && !player.isTouchingWater()) {
+            recoverAndRetry(client, "falling");
+            return;
+        }
+
         boolean noPath = path.isEmpty() || pathIndex >= path.size();
         boolean goalMoved = planTargetPos == null || goal.squaredDistanceTo(planTargetPos) > 6.25;
-        boolean offPath = !noPath && isOffPath(player,
-            pathIndex == 0 ? routeStart : Vec3d.ofBottomCenter(path.get(pathIndex - 1)), path.get(pathIndex));
+        Vec3d segFrom = pathIndex == 0 ? routeStart : Vec3d.ofBottomCenter(path.get(Math.max(0, pathIndex - 1)));
+        if (!noPath && offPathDistance(player, segFrom, path.get(pathIndex)) > 12.0) {
+            recoverAndRetry(client, "far off course");
+            return;
+        }
+        boolean offPath = !noPath && isOffPath(player, segFrom, path.get(pathIndex));
 
         if (noPath || goalMoved || offPath) {
             if (replanCooldown > 0) { releaseKeys(client); return; }
@@ -1493,7 +1625,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             stuckZ = player.getZ();
             if (moved < 0.25) {
                 stuckStrikes++;
-                if (stuckStrikes >= 8) { abortCurrent(client, "Got stuck and couldn't find a way out - stopping."); return; }
+                if (stuckStrikes >= 8) { recoverAndRetry(client, "stuck"); return; }
                 if (stuckStrikes >= 2) {
                     double sx = wp.getX() + 0.5 - player.getX();
                     double sz = wp.getZ() + 0.5 - player.getZ();
@@ -1544,20 +1676,23 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     /** Off the route = far from the straight line between the previous waypoint and the current one. */
-    private static boolean isOffPath(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
+    private static double offPathDistance(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
         double ax = from.x, az = from.z, bx = wp.getX() + 0.5, bz = wp.getZ() + 0.5;
         double abx = bx - ax, abz = bz - az;
         double len2 = abx * abx + abz * abz;
         double t = len2 < 1e-6 ? 0 : Math.max(0, Math.min(1, ((player.getX() - ax) * abx + (player.getZ() - az) * abz) / len2));
-        double off = Math.hypot(player.getX() - (ax + abx * t), player.getZ() - (az + abz * t));
-        return off > 2.5 || Math.abs(wp.getY() - player.getY()) > 3.5;
+        return Math.hypot(player.getX() - (ax + abx * t), player.getZ() - (az + abz * t));
+    }
+
+    private static boolean isOffPath(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
+        return offPathDistance(player, from, wp) > 2.5 || Math.abs(wp.getY() - player.getY()) > 3.5;
     }
 
     /** Plans a new route. Returns false if the current task was given up. */
     private boolean replan(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring) {
         planTargetPos = goal;
         routeStart = player.getPos();
-        Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes).search();
+        Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes, dangerZones(client)).search();
         autoLog("PLAN " + plan.status() + " steps=" + plan.nodes().size());
 
         switch (plan.status()) {
@@ -1577,7 +1712,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 path = List.of();
                 pathIndex = 0;
                 if (++failedPlans >= 3) {
-                    abortCurrent(client, "Couldn't find a way there - stopping.");
+                    recoverAndRetry(client, "no route");
                     return false;
                 }
             }
@@ -1622,10 +1757,13 @@ public class RadiantAlertClient implements ClientModInitializer {
         private final double tx, ty, tz, goalEyeY;
         private final boolean ring;
         private final Set<Long> blocked;
+        private final List<double[]> avoid;
         private final Map<Long, Boolean> standCache = new HashMap<>();
         private final Map<Long, Boolean> goalCache = new HashMap<>();
 
-        Pathfinder(ClientWorld world, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring, Set<Long> blocked) {
+        Pathfinder(ClientWorld world, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring, Set<Long> blocked,
+                   List<double[]> avoid) {
+            this.avoid = avoid;
             this.world = world;
             this.player = player;
             this.tx = goal.x;
@@ -1670,7 +1808,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 for (Move m : moves) {
                     BlockPos np = new BlockPos(m.x(), m.y(), m.z());
                     long key = np.asLong();
-                    double ng = cur.g + m.cost();
+                    double ng = cur.g + m.cost() + dangerCost(m.x(), m.z());
                     Node nb = nodes.get(key);
                     if (nb == null) {
                         nb = new Node(np, cur, ng);
@@ -1721,6 +1859,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             for (int k = 1; k < steps; k++) {
                 double t = (double) k / steps;
                 double x = ax + (bx - ax) * t, z = az + (bz - az) * t;
+                if (dangerCost(MathHelper.floor(x), MathHelper.floor(z)) > 0) return false; // never cut through a danger zone
                 for (int sx = -1; sx <= 1; sx += 2) {
                     for (int sz = -1; sz <= 1; sz += 2) {
                         if (!standable(MathHelper.floor(x + sx * 0.3), y, MathHelper.floor(z + sz * 0.3))) return false;
@@ -1728,6 +1867,15 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
             }
             return true;
+        }
+
+        /** Extra cost for squares near an Alpha (or anything that has hit us), so routes go around them when they can. */
+        private double dangerCost(int x, int z) {
+            double cost = 0;
+            for (double[] zone : avoid) {
+                if (Math.hypot(x + 0.5 - zone[0], z + 0.5 - zone[1]) < zone[2]) cost += AVOID_COST;
+            }
+            return cost;
         }
 
         private static List<BlockPos> build(Node end) {
@@ -2096,6 +2244,23 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void idleChecks(MinecraftClient client) {
         if (!canStartTask() || client.currentScreen != null || client.player == null) return;
         long now = System.currentTimeMillis();
+        if (retryKind != RetryKind.NONE && now >= retryAt) {
+            RetryKind kind = retryKind;
+            retryKind = RetryKind.NONE;
+            if (now <= retryDeadline) {
+                if (kind == RetryKind.CATCH && autoCatchEnabled && retryEntity != null && !retryEntity.isRemoved()
+                        && client.player.distanceTo(retryEntity) <= MAX_APPROACH_DISTANCE && now >= clearBlockUntil) {
+                    say(client, "Trying again: heading back to " + retryEntity.getPokemon().getSpecies().getName() + ".");
+                    startCatch(client, retryEntity, retryRadiant);
+                    return;
+                }
+                if (kind == RetryKind.WORMHOLE && autoWormholeEnabled) {
+                    say(client, "Trying the wormhole again.");
+                    startWormhole(client, retryPos);
+                    return;
+                }
+            }
+        }
         if (autoCleanEnabled && now >= cleanCooldownUntil && freeSlots(client.player) <= INVENTORY_FREE_THRESHOLD) {
             startClean(client, true);
             return;
@@ -2558,7 +2723,12 @@ public class RadiantAlertClient implements ClientModInitializer {
             case DROPPING -> {
                 if (dropDelay > 0) { dropDelay--; return; }
                 DropAction a = dropQueue.poll();
-                if (a == null) { finishClean(client); return; }
+                if (a == null) {
+                    cStage = CStage.WAITING;
+                    cTicks = 0;
+                    say(client, "Dropped everything - waiting " + (DEPOSIT_WAIT_TICKS / 20) + " seconds for the hoppers to catch up.");
+                    return;
+                }
                 if (client.interactionManager == null) return;
                 ItemStack s = player.getInventory().getStack(a.slot());
                 // skip anything that changed since it was planned
@@ -2568,6 +2738,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     a.wholeStack() ? 1 : 0, SlotActionType.THROW, player);
                 dropsDone++;
                 dropDelay = DROP_DELAY_TICKS;
+            }
+            case WAITING -> {
+                if (cTicks >= DEPOSIT_WAIT_TICKS) finishClean(client);
             }
         }
     }

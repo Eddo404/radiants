@@ -413,6 +413,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean respawnContinuesRun = false;
     private long lastRespawnAt = 0;
     private int chestAttempts = 0;
+    private final List<int[]> ballSwaps = new ArrayList<>();   // {inventory slot, hotbar slot} of every ball we swapped into the hotbar
+    private int chestSwapSlot = -1;                          // where the elytra was put when a chestplate went on
+    private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
+    private int noPokemonTicks = 0;
     private Screen lastUnblockScreen = null;
     private int screenOpenTicks = 0;
     private long lastEndBattleAt = 0;
@@ -574,6 +578,14 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** End of every tick: server-hop check, Pokémon detection. */
     private void tick(MinecraftClient client) {
+        try {
+            tickInner(client);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "tick", t);
+        }
+    }
+
+    private void tickInner(MinecraftClient client) {
         // a new world object means we were moved to another server/dimension
         if (client.world != null && client.world != lastWorld) {
             lastWorld = client.world;
@@ -632,8 +644,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                 lastRespawnAt = System.currentTimeMillis();
                 ensureChestplate(client);
                 if (respawnContinuesRun && task == Task.WORMHOLE) {
-                    trySelectPartySlot(0);        // the first Pokémon
-                    pressSendOutKey();            // R
+                    trySelectPartySlot(firstHealthyPartySlot()); // the first Pokémon that hasn't fainted
+                    pressSendOutKey();                           // R
                     wStage = WStage.ENCOUNTER;    // keep waiting for the battle to finish
                     wTicks = 0;
                     autoLog("DEATH recovered: sent out the first Pokémon again");
@@ -642,6 +654,12 @@ public class RadiantAlertClient implements ClientModInitializer {
                     sendHome(client);
                 }
             }
+        }
+
+        // inside a wormhole nothing else is hunted: no shinies, radiants or alerts for them
+        if (inWormholeEncounter()) {
+            pending.clear();
+            return;
         }
 
         Iterator<Pending> it = pending.iterator();
@@ -692,12 +710,25 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    /** After the first teleport of a wormhole run (the encounter itself) - including the Terapagos shoulder step. */
+    private boolean inWormholeEncounter() {
+        return (task == Task.WORMHOLE && wStage != WStage.WALK && wStage != WStage.PUSH) || (task == Task.HOOPA && hoopaReturn);
+    }
+
     private boolean canStartTask() {
         return task == Task.IDLE && System.currentTimeMillis() >= homeCooldownUntil;
     }
 
     /** Start of every tick: drives whatever the bot is currently doing. */
     private void autoTick(MinecraftClient client) {
+        try {
+            autoTickInner(client);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "autoTick", t);
+        }
+    }
+
+    private void autoTickInner(MinecraftClient client) {
         if (task == Task.IDLE) { releaseKeys(client); return; }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); return; }
@@ -712,6 +743,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
         lastUnblockScreen = null;
+        lastUnblockClass = "";
         screenOpenTicks = 0;
 
         // standing still while the chestplate goes on (inventory clicks while moving can be rejected by the server)
@@ -740,6 +772,10 @@ public class RadiantAlertClient implements ClientModInitializer {
      * Pokémon / wormhole is still there afterwards - try again (at most twice).
      */
     private void recoverAndRetry(MinecraftClient client, String reason) {
+        if (task == Task.HOOPA) {                 // no need to go home just because we can't get to a Pokémon on the shoulder
+            stopHoopa(client, "Couldn't get to " + shoulderLabel + " (" + reason + ").");
+            return;
+        }
         long now = System.currentTimeMillis();
         autoLog("RECOVER (" + reason + ") task=" + task + " attempts=" + retryAttempts);
         retryKind = RetryKind.NONE;
@@ -797,6 +833,34 @@ public class RadiantAlertClient implements ClientModInitializer {
         return zones;
     }
 
+    private long lastErrorShownAt = 0;
+
+    /** A bug in this mod must never crash the game: log it, stop whatever was running, and tell the player (at most every 10 s). */
+    private void onTickError(MinecraftClient client, String where, Throwable t) {
+        LOG.error("RadiantAlert: error in " + where, t);
+        try {
+            StackTraceElement[] trace = t.getStackTrace();
+            autoLog("ERROR in " + where + ": " + t + (trace.length > 0 ? " at " + trace[0] : ""));
+            task = Task.IDLE;
+            ubCatch = false;
+            hoopaReturn = false;
+            path = List.of();
+            pathIndex = 0;
+            phase = Phase.READY;
+            target = null;
+            hEntity = null;
+            releaseKeys(client);
+            long now = System.currentTimeMillis();
+            if (now - lastErrorShownAt > 10000) {
+                lastErrorShownAt = now;
+                say(client, "Something went wrong (" + t.getClass().getSimpleName() + " in " + where
+                    + ") - I stopped what I was doing. Details are in radiantalert-auto.txt.");
+            }
+        } catch (Throwable ignored) {
+            // nothing more we can do
+        }
+    }
+
     private void abortCurrent(MinecraftClient client, String message) {
         switch (task) {
             case CATCH -> stopAuto(client, message);
@@ -850,9 +914,17 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void onEntityLoad(Entity entity) {
+        try {
+            onEntityLoadInner(entity);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "entity load", t);
+        }
+    }
+
+    private void onEntityLoadInner(Entity entity) {
         if (listening) logEntityLoad(entity);
         if (entity instanceof PokemonEntity pe) {
-            if (!alerted.contains(pe.getUuid())) pending.add(new Pending(pe, new int[]{0}));
+            if (!alerted.contains(pe.getUuid()) && !inWormholeEncounter()) pending.add(new Pending(pe, new int[]{0}));
             return;
         }
         MinecraftClient client = MinecraftClient.getInstance();
@@ -936,6 +1008,14 @@ public class RadiantAlertClient implements ClientModInitializer {
     // ============================== Chat and server hops ==============================
 
     private void onChatMessage(String text) {
+        try {
+            onChatMessageInner(text);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "chat", t);
+        }
+    }
+
+    private void onChatMessageInner(String text) {
         if (!text.startsWith("[RadiantAlert]") && !text.startsWith("[rec]")) listenLog("CHAT " + text);
         String lower = text.toLowerCase(Locale.ROOT);
 
@@ -960,6 +1040,14 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** We were moved to a different server or dimension. */
     private void onServerHop(String reason) {
+        try {
+            onServerHopInner(reason);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "server hop", t);
+        }
+    }
+
+    private void onServerHopInner(String reason) {
         listenLog("SIGNAL " + reason + " | " + contextString(MinecraftClient.getInstance()));
         long now = System.currentTimeMillis();
         if (now - lastHopTime < 3000) return; // several signals fire for one hop
@@ -1019,6 +1107,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void sendHome(MinecraftClient client) {
         if (client.player == null) return;
+        restoreSwaps(client);
         long now = System.currentTimeMillis();
         if (now - lastHomeSentAt < 5000) return; // already sent a moment ago
         lastHomeSentAt = now;
@@ -1139,8 +1228,10 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
         if (client.interactionManager == null) return;
+        if (catchPrevSlot < 0) catchPrevSlot = player.getInventory().selectedSlot;
         if (slot >= 9) {
-            // the ball is in the main inventory: swap it into the selected hotbar slot
+            // the ball is in the main inventory: swap it into the selected hotbar slot (and remember, to put it back later)
+            ballSwaps.add(new int[]{slot, player.getInventory().selectedSlot});
             client.interactionManager.clickSlot(player.playerScreenHandler.syncId, slot,
                 player.getInventory().selectedSlot, SlotActionType.SWAP, player);
             autoLog("Moved a ball from inventory slot " + slot + " to the hotbar");
@@ -1284,6 +1375,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         path = List.of();
         zoneActive = false;
         releaseKeys(client);
+        restoreSwaps(client);
         autoLog("CATCH stop: " + message);
         say(client, message);
         if (goHome) sendHome(client);
@@ -1347,7 +1439,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             case ARRIVED -> {
                 releaseKeys(client);
                 // 1) chestplate: keep trying (twice a second) until it is on
-                boolean needChest = player.getEquippedStack(EquipmentSlot.CHEST).isEmpty() && findChestplateSlot(player) >= 0;
+                boolean needChest = !chestplateWorn(player) && findChestplateSlot(player) >= 0;
                 if (needChest && wTicks >= 5 && wTicks < 100 && wTicks % 10 == 5) ensureChestplate(client);
                 // 2) Terapagos onto the shoulder (once), if there is one in the party
                 if (TERAPAGOS_IN_WORMHOLES && !terapagosTried && wTicks >= 20) {
@@ -1356,7 +1448,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
                 // 3) send out the first Pokémon (R) once the chestplate is on
                 if (wTicks >= AFTER_TELEPORT_WAIT_TICKS && (!needChest || wTicks >= 100)) {
-                    trySelectPartySlot(0);
+                    trySelectPartySlot(firstHealthyPartySlot());
                     pressSendOutKey();
                     wStage = WStage.ENCOUNTER;
                     wTicks = 0;
@@ -1366,7 +1458,20 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case ENCOUNTER -> {
                 releaseKeys(client);
-                if (wTicks > ENCOUNTER_TIMEOUT_TICKS) stopWormhole(client, "Timed out waiting for the encounter to finish.");
+                if (wTicks > ENCOUNTER_TIMEOUT_TICKS) { stopWormhole(client, "Timed out waiting for the encounter to finish."); return; }
+                // keep a Pokémon out: if none of yours has been out for 5 seconds (you died, it fainted, or it was
+                // recalled), send the first one that hasn't fainted out again
+                if (wTicks % 20 == 0) {
+                    if (ownPokemonOut(client)) noPokemonTicks = 0; else noPokemonTicks += 20;
+                    if (noPokemonTicks >= 100) {
+                        noPokemonTicks = 0;
+                        int slot = firstHealthyPartySlot();
+                        autoLog("ENCOUNTER no Pokémon out: sending out party slot " + (slot + 1));
+                        say(client, "No Pokémon out - sending out party slot " + (slot + 1) + ".");
+                        trySelectPartySlot(slot);
+                        pressSendOutKey();
+                    }
+                }
             }
             case FINISHED -> {
                 releaseKeys(client);
@@ -1422,15 +1527,22 @@ public class RadiantAlertClient implements ClientModInitializer {
         return -1;
     }
 
+    /** A chestplate (or other chest armour that isn't an elytra) is on. An elytra counts as "not worn": it gets swapped out. */
+    private static boolean chestplateWorn(ClientPlayerEntity player) {
+        ItemStack chest = player.getEquippedStack(EquipmentSlot.CHEST);
+        return !chest.isEmpty() && !itemIdOf(chest).equals("minecraft:elytra");
+    }
+
     /**
-     * Makes sure a chestplate is worn. Each call tries one thing, and it is called again every second during a
-     * wormhole run until the chestplate is on: (1) shift-click it, (2) pick it up and drop it into the armour
-     * slot, (3) bring it to the hotbar, (4) right-click it from the hotbar.
+     * Makes sure a chestplate is worn. With an elytra on, the chestplate is swapped for it (the elytra goes where the
+     * chestplate was, and is put back on later). Otherwise each call tries one thing and it is called again every
+     * second during a wormhole run: (1) shift-click, (2) pick it up and drop it into the armour slot, (3) bring it
+     * to the hotbar, (4) right-click it from the hotbar.
      */
     private void ensureChestplate(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null) return;
-        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) { chestAttempts = 0; return; }
+        if (chestplateWorn(player)) { chestAttempts = 0; return; }
 
         int found = findChestplateSlot(player);
         if (found < 0) {
@@ -1441,10 +1553,23 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
 
-        int step = chestAttempts++ % 4;
         ItemStack stack = player.getInventory().getStack(found);
         int screenSlot = found < 9 ? 36 + found : found;
         int sync = player.playerScreenHandler.syncId;
+
+        // an elytra is on: swap it with the chestplate (pick up the chestplate, click the chest slot, put the elytra down)
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
+            say(client, "Swapping your elytra for the chestplate (" + itemNameOf(stack) + ").");
+            autoLog("CHEST swapping the elytra for " + itemIdOf(stack) + " from inventory slot " + found);
+            client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player);
+            client.interactionManager.clickSlot(sync, 6, 0, SlotActionType.PICKUP, player);
+            client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player);
+            chestSwapSlot = found;
+            chestAttempts++;
+            return;
+        }
+
+        int step = chestAttempts++ % 4;
         String[] labels = {"shift-click", "pick up and place", "move to hotbar", "right-click"};
         autoLog("CHEST step " + (step + 1) + "/4 (" + labels[step] + "): " + itemIdOf(stack) + " \"" + itemNameOf(stack)
             + "\" in inventory slot " + found);
@@ -1480,6 +1605,43 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    /** Puts things back the way they were: swapped balls to their inventory slots, the elytra back on, the hotbar selection. */
+    private void restoreSwaps(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.interactionManager == null) {
+            ballSwaps.clear();
+            chestSwapSlot = -1;
+            catchPrevSlot = -1;
+            return;
+        }
+        int sync = player.playerScreenHandler.syncId;
+        for (int i = ballSwaps.size() - 1; i >= 0; i--) {
+            int[] swap = ballSwaps.get(i);
+            int screenSlot = swap[0] < 9 ? 36 + swap[0] : swap[0];
+            client.interactionManager.clickSlot(sync, screenSlot, swap[1], SlotActionType.SWAP, player);
+        }
+        if (!ballSwaps.isEmpty()) autoLog("RESTORE put " + ballSwaps.size() + " swapped item(s) back");
+        ballSwaps.clear();
+
+        if (chestSwapSlot >= 0) {
+            ItemStack inSlot = player.getInventory().getStack(chestSwapSlot);
+            if (itemIdOf(inSlot).equals("minecraft:elytra") && !player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
+                int screenSlot = chestSwapSlot < 9 ? 36 + chestSwapSlot : chestSwapSlot;
+                client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player); // pick up the elytra
+                client.interactionManager.clickSlot(sync, 6, 0, SlotActionType.PICKUP, player);          // swap it with the chestplate
+                client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player); // put the chestplate down
+                autoLog("RESTORE elytra back on");
+                say(client, "Put your elytra back on.");
+            }
+            chestSwapSlot = -1;
+        }
+
+        if (catchPrevSlot >= 0) {
+            player.getInventory().selectedSlot = catchPrevSlot;
+            catchPrevSlot = -1;
+        }
+    }
+
     /**
      * /radiantalert chestplate: tests the equipping. If you are wearing a chestplate it is taken off first,
      * then the same routine the wormhole run uses puts it back on, and the result is reported.
@@ -1506,7 +1668,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
 
-        boolean worn = !player.getEquippedStack(EquipmentSlot.CHEST).isEmpty();
+        boolean worn = chestplateWorn(player);
 
         if (chestTestStage == 3) {                       // begin
             chestTestTicks = 0;
@@ -1540,6 +1702,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             say(client, "Chestplate test PASSED: the chestplate is on (after " + chestTestCalls + " step(s)).");
             autoLog("CHEST test passed after " + chestTestCalls + " step(s)");
             chestTestStage = 0;
+            restoreSwaps(client); // an elytra that was swapped out goes back on
             return;
         }
         if (chestTestTicks % 10 == 1) {
@@ -1561,7 +1724,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void chestCheck(MinecraftClient client) {
         // works with a battle screen open too (the clicks are just messages to the server); not while a real inventory is open
         if (task != Task.WORMHOLE || client.player == null || client.currentScreen instanceof HandledScreen<?>) return;
-        if (!client.player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) { chestAttempts = 0; return; }
+        if (chestplateWorn(client.player)) { chestAttempts = 0; return; }
         if (wStage == WStage.WALK || wStage == WStage.PUSH) {
             chestPauseTicks = 14;          // stand still first: the equip happens in the middle of the pause (see autoTick)
         } else {
@@ -1573,6 +1736,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         task = Task.IDLE;
         path = List.of();
         releaseKeys(client);
+        restoreSwaps(client);
         autoLog("WORMHOLE stop: " + message);
         say(client, message);
     }
@@ -1631,9 +1795,11 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
 
+        if (path.isEmpty()) pathIndex = 0;
         boolean noPath = path.isEmpty() || pathIndex >= path.size();
         boolean goalMoved = planTargetPos == null || goal.squaredDistanceTo(planTargetPos) > 6.25;
-        Vec3d segFrom = pathIndex == 0 ? routeStart : Vec3d.ofBottomCenter(path.get(Math.max(0, pathIndex - 1)));
+        Vec3d segFrom = routeStart;
+        if (!noPath && pathIndex > 0) segFrom = Vec3d.ofBottomCenter(path.get(pathIndex - 1));
         if (!noPath && offPathDistance(player, segFrom, path.get(pathIndex)) > 12.0) {
             recoverAndRetry(client, "far off course");
             return;
@@ -2149,6 +2315,14 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void handleInfo(Info info, boolean wormhole, boolean identity) {
+        try {
+            handleInfoInner(info, wormhole, identity);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "packet", t);
+        }
+    }
+
+    private void handleInfoInner(Info info, boolean wormhole, boolean identity) {
         if (identity) onIdentityInfo(info);
         if (listening && !info.id().startsWith("particle:") && !isListenNoise(info.id())) {
             listenLog("PACKET " + info.id() + " " + info.strings()
@@ -2240,37 +2414,34 @@ public class RadiantAlertClient implements ClientModInitializer {
      * the inventory or Cobblemon's screens, as if pressing Esc; for a Cobblemon battle screen send /endbattle.
      * Loading screens and the like are left alone. While waiting for the automatic wormhole battle, nothing is touched.
      */
+    private String lastUnblockClass = "";
+
     private void unblockScreen(MinecraftClient client) {
         Screen screen = client.currentScreen;
         if (screen == null) {
-            lastUnblockScreen = null;
+            lastUnblockClass = "";
             screenOpenTicks = 0;
             return;
         }
-        if (screen != lastUnblockScreen) {
-            lastUnblockScreen = screen;
+        String cls = screen.getClass().getName();
+        if (!cls.equals(lastUnblockClass)) {   // a different kind of screen (some, like the battle one, are re-created all the time)
+            lastUnblockClass = cls;
             screenOpenTicks = 0;
         }
         screenOpenTicks++;
 
         if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) return; // the battle is supposed to be running
 
-        String cls = screen.getClass().getName();
+        boolean vanilla = cls.startsWith("net.minecraft.");
         boolean cobblemon = cls.startsWith("com.cobblemon");
         boolean battle = cobblemon && cls.toLowerCase(Locale.ROOT).contains("battle");
 
         if (battle) {
             // Ultra Beast (catching it, or looking for it at the end of a wormhole): only back out of the battle
-            // screen with Esc - then you can walk around and throw the ball
+            // screen - then you can walk around and throw the ball
             boolean escOnly = ubCatch || (task == Task.WORMHOLE && wStage == WStage.FINISHED);
             if (escOnly) {
-                if (screenOpenTicks == 10) {
-                    autoLog("MENU pressing Esc on the battle screen (" + cls + ")");
-                    screen.keyPressed(256, 1, 0); // 256 = the Esc key
-                } else if (screenOpenTicks >= 40 && screenOpenTicks % 20 == 0) {
-                    autoLog("MENU closing the battle screen (" + cls + ")");
-                    screen.close();
-                }
+                dismiss(client, screen, 5);
                 return;
             }
             boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH;
@@ -2281,26 +2452,38 @@ public class RadiantAlertClient implements ClientModInitializer {
                 autoLog("MENU battle screen in the way: sent /endbattle (" + cls + ")");
                 say(client, "In a battle - sending /endbattle so I can carry on.");
             }
+            if (mayEnd) dismiss(client, screen, 40);
             return;
         }
 
         if (screen instanceof ChatScreen chat) {
             String typed = chatScreenText(chat);
-            boolean ready = typed == null ? screenOpenTicks >= 60 : typed.isEmpty() && screenOpenTicks >= 40;
-            if (ready) {
-                autoLog("MENU closing the chat screen");
-                screen.close();
-            }
+            if (typed == null || typed.isEmpty()) dismiss(client, screen, typed == null ? 60 : 40);
             return;
         }
 
-        if (screen instanceof HandledScreen<?> || screen instanceof GameMenuScreen || cobblemon) {
-            if (screenOpenTicks >= 10) {
-                autoLog("MENU closing " + cls);
-                screen.close();
-            }
+        // everything else that isn't a loading / connecting screen: inventories, the pause menu, and any screen from a mod
+        if (screen instanceof HandledScreen<?> || screen instanceof GameMenuScreen || !vanilla) {
+            dismiss(client, screen, 10);
         }
-        // anything else (loading screens, the death screen, ...) is left alone
+    }
+
+    /** Gets rid of a screen the way a player would: press Esc, then close it, then force it shut (repeating every 1.5 s). */
+    private void dismiss(MinecraftClient client, Screen screen, int startTick) {
+        if (screenOpenTicks < startTick) return;
+        int step = (screenOpenTicks - startTick) % 30;
+        String cls = screen.getClass().getName();
+        if (step == 0) {
+            autoLog("MENU Esc on " + cls);
+            screen.keyPressed(256, 1, 0);   // 256 = the Esc key
+            screen.keyReleased(256, 1, 0);
+        } else if (step == 12) {
+            autoLog("MENU close() on " + cls);
+            screen.close();
+        } else if (step == 24) {
+            autoLog("MENU forcing " + cls + " shut");
+            client.setScreen(null);
+        }
     }
 
     /** What is typed in the chat box right now (null if it can't be read). */
@@ -2459,6 +2642,32 @@ public class RadiantAlertClient implements ClientModInitializer {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** The first party Pokémon that hasn't fainted (the shoulder ones don't count); slot 0 if that can't be worked out. */
+    private int firstHealthyPartySlot() {
+        try {
+            List<Pokemon> party = readParty();
+            for (int i = 0; i < party.size(); i++) {
+                Pokemon p = party.get(i);
+                if (p == null) continue;
+                String name = p.getSpecies().getName();
+                if (name.equalsIgnoreCase(HOOPA_SPECIES) || name.equalsIgnoreCase(TERAPAGOS_SPECIES)) continue;
+                if (p.getCurrentHealth() > 0) return i;
+            }
+        } catch (Throwable ignored) {
+            // fall back to the first slot
+        }
+        return 0;
+    }
+
+    /** One of your own Pokémon (not a shoulder one) is out near you. */
+    private boolean ownPokemonOut(MinecraftClient client) {
+        if (client.player == null || client.world == null) return false;
+        return !client.world.getEntitiesByClass(PokemonEntity.class, client.player.getBoundingBox().expand(48),
+            x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved()
+                && !x.getPokemon().getSpecies().getName().equalsIgnoreCase(HOOPA_SPECIES)
+                && !x.getPokemon().getSpecies().getName().equalsIgnoreCase(TERAPAGOS_SPECIES)).isEmpty();
     }
 
     /** Ultra Beasts don't spawn naturally in Ultra Space (the dimension "ultraspace:ultraspace"). */
@@ -2868,7 +3077,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         PokemonEntity best = null;
         double bestDist = Double.MAX_VALUE;
         for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
-                client.player.getBoundingBox().expand(12),
+                client.player.getBoundingBox().expand(30),
                 x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved()
                     && x.getPokemon().getSpecies().getName().equalsIgnoreCase(shoulderSpecies))) {
             double d = pe.squaredDistanceTo(client.player);
@@ -2933,6 +3142,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         hGuiTicks = 0;
         hWheelClicked = false;
         hEntity = findOwnHoopa(client);
+        resetRoute(client);
         task = Task.HOOPA;
         hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
         autoLog("HOOPA start " + label + " slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null)
@@ -2984,12 +3194,10 @@ public class RadiantAlertClient implements ClientModInitializer {
                 // wait for the send-out animation, and get within reach (about 3 blocks) of it
                 if (hEntity == null || hEntity.isRemoved()) hEntity = findOwnHoopa(client);
                 if (hEntity == null) { stopHoopa(client, "Lost track of " + shoulderLabel + "."); return; }
-                boolean tooFar = player.distanceTo(hEntity) > 2.4f;
-                if (tooFar && hTicks < 100) {
-                    aimAt(player, hEntity);
-                    client.options.forwardKey.setPressed(true);
-                    client.options.sprintKey.setPressed(false);
-                    keysHeld = true;
+                boolean tooFar = Math.hypot(hEntity.getX() - player.getX(), hEntity.getZ() - player.getZ()) > 2.2;
+                if (tooFar && hTicks < 240) {
+                    // walk there with the route planner (around walls, up stairs, out of holes)
+                    followPath(client, player, hEntity.getPos(), hEntity.getEyeY(), false);
                 } else if (hTicks >= 20) {
                     releaseKeys(client);
                     // use an empty hand for the right-click if there is a free hotbar slot

@@ -264,7 +264,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         namePattern("sandwich"),
         namePattern("\\bfossils?\\b"),                          // fossils
         namePattern("charged apri"),                            // charged apri juice
-        namePattern("golden apple"));
+        namePattern("golden apple"),
+        namePattern("pottery (shard|sherd)s?"));                // pottery shards
 
     /** Dropped when the item's registry id matches one of these (fossils and the vanilla ores / minerals). */
     private static final List<Pattern> JUNK_ID_PATTERNS = List.of(
@@ -275,6 +276,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         Pattern.compile("^minecraft:(iron|gold|copper|netherite)_ingot$"),                                // ingots
         Pattern.compile("^minecraft:(iron|gold)_nugget$"),
         Pattern.compile("^minecraft:(coal|iron|gold|copper|diamond|emerald|lapis|redstone|netherite)_block$"), // mineral blocks
+        Pattern.compile("^minecraft:.*_pottery_(sherd|shard)$"),                                          // pottery shards
         Pattern.compile("^minecraft:(coal|diamond|emerald|lapis_lazuli|redstone|quartz|netherite_scrap)$"));  // gems and dusts
 
     /** Never dropped, even though they look like a pattern above. */
@@ -417,6 +419,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int chestSwapSlot = -1;                          // where the elytra was put when a chestplate went on
     private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
     private int noPokemonTicks = 0;
+    private int ownHitTicks = 0, strafeTicks = 0;
     private Screen lastUnblockScreen = null;
     private int screenOpenTicks = 0;
     private long lastEndBattleAt = 0;
@@ -610,6 +613,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             idleCheckTicks = 0;
             idleChecks(client);
             chestCheck(client);
+            reviveCheck(client);
         }
         if (chestTestStage != 0) chestTestTick(client);
 
@@ -644,7 +648,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                 lastRespawnAt = System.currentTimeMillis();
                 ensureChestplate(client);
                 if (respawnContinuesRun && task == Task.WORMHOLE) {
-                    trySelectPartySlot(firstHealthyPartySlot()); // the first Pokémon that hasn't fainted
+                    lastSentOutSlot = firstHealthyPartySlot();
+                    trySelectPartySlot(lastSentOutSlot); // the first Pokémon that hasn't fainted
                     pressSendOutKey();                           // R
                     wStage = WStage.ENCOUNTER;    // keep waiting for the battle to finish
                     wTicks = 0;
@@ -736,6 +741,12 @@ public class RadiantAlertClient implements ClientModInitializer {
             // crouch + right-click on your Pokémon opens Cobblemon's interaction wheel: handle it instead of freezing behind it
             if (task == Task.HOOPA && hStage == HStage.SHOULDER && hAttempts >= 2 && isCobblemonInteractScreen(client.currentScreen)) {
                 hoopaScreen(client);
+                return;
+            }
+            // the party menu Cobblemon opens when a revive is used: click the fainted Pokémon in it
+            if (reviveStage == 3 && client.currentScreen.getClass().getName().startsWith("com.cobblemon")
+                    && !client.currentScreen.getClass().getName().toLowerCase(Locale.ROOT).contains("battle")) {
+                reviveScreen(client);
                 return;
             }
             releaseKeys(client);
@@ -1023,11 +1034,22 @@ public class RadiantAlertClient implements ClientModInitializer {
         // don't chase Pokémon around a clean-up (wormholes are unaffected)
         if (lower.contains("ground items") && lower.contains("cleared")) {
             boolean warning = lower.contains("will be cleared");
-            clearBlockUntil = System.currentTimeMillis() + (warning ? 25000 : 8000);
-            autoLog("CLEAR message (" + (warning ? "warning" : "done") + "): no Pokémon chases for a while");
-            if (task == Task.CATCH && !ubCatch) {
-                stopAuto(MinecraftClient.getInstance(), "Wild Pokémon are being cleared - stopping the catch.");
+            autoLog("CLEAR message (" + (warning ? "warning - ignored" : "it happened") + ")");
+            if (!warning) {
+                // the clean-up has just happened: the Pokémon we were after are gone
+                clearBlockUntil = System.currentTimeMillis() + 8000;
+                if (task == Task.CATCH && !ubCatch) {
+                    MinecraftClient client = MinecraftClient.getInstance();
+                    stopAuto(client, "Wild Pokémon were just cleared - stopping the catch and going home.");
+                    sendHome(client);
+                }
             }
+        }
+
+        // our own ball hit one of our own Pokémon: make sure the next throw goes around it
+        if (task == Task.CATCH && lower.contains("not a wild pok")) {
+            ownHitTicks = 80;
+            autoLog("CHAT a ball hit one of our own Pokémon: " + text);
         }
 
         if (task == Task.CATCH && lower.contains("cannot be captured")) {
@@ -1218,6 +1240,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (switchWait > 0) { switchWait--; return; }
         if (angleError(player, current) > 4.0f) return; // wait until we're aimed at it
 
+        // never throw through one of our own Pokémon ("That Koraidon is not a wild Pokémon."): sidestep until the line is clear
+        PokemonEntity blocker = blockerOnLine(client, player, current);
+        if (blocker == null && ownHitTicks > 0) blocker = nearestOwnPokemon(client, player);
+        if (ownHitTicks > 0) ownHitTicks--;
+        if (blocker != null && strafeTicks < 120) {
+            strafeAround(client, player, current, blocker);
+            strafeTicks++;
+            return;
+        }
+        strafeTicks = 0;
+
         int slot = findBallIndex(player);
         if (slot < 0) {
             stopAuto(client, ubCatch
@@ -1257,6 +1290,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         goneTicks = 0;
         ball = null;
         captureStarted = false;
+        ownHitTicks = 0;
         autoLog("THROW #" + throwsDone);
         say(client, "Threw ball #" + throwsDone + " at " + targetName + ". Waiting for the result...");
     }
@@ -1448,7 +1482,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
                 // 3) send out the first Pokémon (R) once the chestplate is on
                 if (wTicks >= AFTER_TELEPORT_WAIT_TICKS && (!needChest || wTicks >= 100)) {
-                    trySelectPartySlot(firstHealthyPartySlot());
+                    lastSentOutSlot = firstHealthyPartySlot();
+                    trySelectPartySlot(lastSentOutSlot);
                     pressSendOutKey();
                     wStage = WStage.ENCOUNTER;
                     wTicks = 0;
@@ -1459,6 +1494,17 @@ public class RadiantAlertClient implements ClientModInitializer {
             case ENCOUNTER -> {
                 releaseKeys(client);
                 if (wTicks > ENCOUNTER_TIMEOUT_TICKS) { stopWormhole(client, "Timed out waiting for the encounter to finish."); return; }
+                // a revive is needed (the Pokémon that was sent out has fainted)
+                if (reviveWanted && reviveStage == 0) {
+                    reviveStage = 1;
+                    reviveTicks = 0;
+                    reviveRetries = 0;
+                    reviveGuiTicks = 0;
+                    autoLog("REVIVE starting for party slot " + (reviveSlot + 1));
+                    say(client, "Your Pokémon fainted - using a revive on it.");
+                }
+                if (reviveStage != 0) { reviveTick(client, player); return; }
+
                 // keep a Pokémon out: if none of yours has been out for 5 seconds (you died, it fainted, or it was
                 // recalled), send the first one that hasn't fainted out again
                 if (wTicks % 20 == 0) {
@@ -1468,6 +1514,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                         int slot = firstHealthyPartySlot();
                         autoLog("ENCOUNTER no Pokémon out: sending out party slot " + (slot + 1));
                         say(client, "No Pokémon out - sending out party slot " + (slot + 1) + ".");
+                        lastSentOutSlot = slot;
                         trySelectPartySlot(slot);
                         pressSendOutKey();
                     }
@@ -1767,6 +1814,8 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void releaseKeys(MinecraftClient client) {
         if (!keysHeld) return;
+        client.options.leftKey.setPressed(false);
+        client.options.rightKey.setPressed(false);
         client.options.forwardKey.setPressed(false);
         client.options.sprintKey.setPressed(false);
         client.options.jumpKey.setPressed(false);
@@ -2374,6 +2423,271 @@ public class RadiantAlertClient implements ClientModInitializer {
         appendToFile("radiantalert-record.txt", line);
     }
 
+    // ============================== Revives (inside a wormhole) ==============================
+
+    private int lastSentOutSlot = -1;
+    private boolean reviveWanted = false;
+    private int reviveStage = 0;      // 0 idle, 1 get it into the hand, 2 use it, 3 waiting for the party menu, 4 clicked: waiting to see it work
+    private int reviveTicks = 0, reviveSlot = -1, revivePrevSlot = -1, reviveRetries = 0, reviveGuiTicks = 0;
+    private long reviveCooldownUntil = 0;
+
+    private static boolean isShoulderSpecies(Pokemon p) {
+        String name = p.getSpecies().getName();
+        return name.equalsIgnoreCase(HOOPA_SPECIES) || name.equalsIgnoreCase(TERAPAGOS_SPECIES);
+    }
+
+    /** Inventory index of a Max Revive (preferred) or Revive, or -1. */
+    private int findReviveSlot(ClientPlayerEntity player) {
+        for (String wanted : List.of("cobblemon:max_revive", "cobblemon:revive")) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (s.isEmpty()) continue;
+                if (itemIdOf(s).equals(wanted)) return i;
+                String name = itemNameOf(s);
+                if (name.equalsIgnoreCase(wanted.endsWith("max_revive") ? "max revive" : "revive")) return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The party slot of the Pokémon that was sent out, if it has fainted; -1 otherwise. */
+    private int faintedSentOutSlot() {
+        try {
+            List<Pokemon> party = readParty();
+            int slot = lastSentOutSlot;
+            if (slot < 0) {                                  // unknown: the first Pokémon that isn't a shoulder one
+                for (int i = 0; i < party.size(); i++) {
+                    Pokemon p = party.get(i);
+                    if (p != null && !isShoulderSpecies(p)) { slot = i; break; }
+                }
+            }
+            if (slot < 0 || slot >= party.size() || party.get(slot) == null) return -1;
+            return party.get(slot).getCurrentHealth() <= 0 ? slot : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** Once a second: inside a wormhole, has the Pokémon we sent out fainted, and do we have a revive for it? */
+    private void reviveCheck(MinecraftClient client) {
+        reviveWanted = false;
+        if (task != Task.WORMHOLE || wStage != WStage.ENCOUNTER || reviveStage != 0 || client.player == null) return;
+        long now = System.currentTimeMillis();
+        if (now < reviveCooldownUntil) return;
+        int slot = faintedSentOutSlot();
+        if (slot < 0) return;
+        if (findReviveSlot(client.player) < 0) {
+            autoLog("REVIVE party slot " + (slot + 1) + " fainted but there is no revive in the inventory");
+            reviveCooldownUntil = now + 30000;
+            return;
+        }
+        reviveSlot = slot;
+        reviveWanted = true;
+    }
+
+    private void reviveTick(MinecraftClient client, ClientPlayerEntity player) {
+        reviveTicks++;
+        long now = System.currentTimeMillis();
+        switch (reviveStage) {
+            case 1 -> {                                       // get the revive into your hand
+                int item = findReviveSlot(player);
+                if (item < 0 || client.interactionManager == null) { endRevive(client, "No revive found."); return; }
+                if (revivePrevSlot < 0) revivePrevSlot = player.getInventory().selectedSlot;
+                if (item >= 9) {
+                    ballSwaps.add(new int[]{item, player.getInventory().selectedSlot}); // put back at the end of the run
+                    client.interactionManager.clickSlot(player.playerScreenHandler.syncId, item,
+                        player.getInventory().selectedSlot, SlotActionType.SWAP, player);
+                } else {
+                    player.getInventory().selectedSlot = item;
+                }
+                autoLog("REVIVE holding " + itemIdOf(player.getMainHandStack()));
+                reviveStage = 2;
+                reviveTicks = 0;
+            }
+            case 2 -> {                                       // right-click it: Cobblemon opens its party menu
+                if (reviveTicks >= 6 && client.interactionManager != null) {
+                    client.interactionManager.interactItem(player, Hand.MAIN_HAND);
+                    reviveStage = 3;
+                    reviveTicks = 0;
+                    reviveGuiTicks = 0;
+                }
+            }
+            case 3 -> {                                       // waiting for the party menu (reviveScreen() handles it)
+                if (reviveTicks % 10 == 0 && reviveHealed()) {
+                    endRevive(client, "Revived! Sending it out again.");
+                    noPokemonTicks = 100;
+                    reviveCooldownUntil = now + 5000;
+                } else if (reviveTicks > 60) {
+                    if (reviveRetries++ < 1) {
+                        reviveStage = 2;
+                        reviveTicks = 0;
+                    } else {
+                        reviveCooldownUntil = now + 30000;
+                        endRevive(client, "The party menu never opened for the revive - see radiantalert-auto.txt (REVIVE lines).");
+                    }
+                }
+            }
+            case 4 -> {                                       // clicked: wait to see it work
+                if (reviveHealed()) {
+                    endRevive(client, "Revived! Sending it out again.");
+                    noPokemonTicks = 100;
+                    reviveCooldownUntil = now + 5000;
+                } else if (reviveTicks > 80) {
+                    reviveCooldownUntil = now + 30000;
+                    endRevive(client, "The revive didn't seem to work - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+                }
+            }
+            default -> { }
+        }
+    }
+
+    private boolean reviveHealed() {
+        try {
+            List<Pokemon> party = readParty();
+            return reviveSlot >= 0 && reviveSlot < party.size() && party.get(reviveSlot) != null
+                && party.get(reviveSlot).getCurrentHealth() > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void endRevive(MinecraftClient client, String message) {
+        reviveStage = 0;
+        reviveWanted = false;
+        reviveGuiTicks = 0;
+        if (revivePrevSlot >= 0 && client.player != null) {
+            client.player.getInventory().selectedSlot = revivePrevSlot;
+        }
+        revivePrevSlot = -1;
+        autoLog("REVIVE end: " + message);
+        say(client, message);
+    }
+
+    /** The party menu Cobblemon opens when a revive is used: write down its structure, click the fainted Pokémon, give up after 2 s. */
+    private void reviveScreen(MinecraftClient client) {
+        reviveGuiTicks++;
+        Screen screen = client.currentScreen;
+        if (screen == null) { reviveGuiTicks = 0; return; }
+        if (reviveGuiTicks == 1) {
+            dumpObject("PARTYMENU", screen, 0, Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>()), new int[]{0});
+        }
+        if (reviveGuiTicks == 4 || reviveGuiTicks == 8 || reviveGuiTicks == 12 || reviveGuiTicks == 16) {
+            boolean clicked = tryClickPartySlot(screen, reviveSlot);
+            autoLog("REVIVE party menu: clicked slot " + (reviveSlot + 1) + " = " + clicked + " (tick " + reviveGuiTicks + ")");
+            if (clicked) {
+                reviveStage = 4;
+                reviveTicks = 0;
+                reviveGuiTicks = 0;
+                return;
+            }
+        }
+        if (reviveGuiTicks >= 40) {
+            reviveGuiTicks = 0;
+            client.setScreen(null);
+            reviveCooldownUntil = System.currentTimeMillis() + 30000;
+            endRevive(client, "Couldn't click the Pokémon in the party menu - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+        }
+    }
+
+    private boolean tryClickPartySlot(Screen screen, int slot) {
+        try {
+            List<Pokemon> party = readParty();
+            Pokemon wanted = slot >= 0 && slot < party.size() ? party.get(slot) : null;
+            if (wanted == null) return false;
+            for (Object o : reachableObjects(screen, 4)) {
+                if (o == screen || !holdsPokemon(o, wanted)) continue;
+                double[] c = centerOf(o);
+                if (c != null) {
+                    screen.mouseClicked(c[0], c[1], 0);
+                    screen.mouseReleased(c[0], c[1], 0);
+                    return true;
+                }
+                if (invokeOptionAction(o)) return true;
+            }
+        } catch (Throwable t) {
+            autoLog("REVIVE click failed: " + t);
+        }
+        return false;
+    }
+
+    /** Does this object hold that exact Pokémon in one of its fields (i.e. is it that Pokémon's slot in the menu)? */
+    private static boolean holdsPokemon(Object o, Pokemon wanted) {
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break;
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v == wanted) return true;
+                    if (v instanceof Pokemon p && p.getUuid().equals(wanted.getUuid())) return true;
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        return false;
+    }
+
+    /** The middle of a widget on screen (via its x / y / width / height getters), or null. */
+    private static double[] centerOf(Object widget) {
+        try {
+            double x = ((Number) invoke(widget, "getX")).doubleValue();
+            double y = ((Number) invoke(widget, "getY")).doubleValue();
+            double w = ((Number) invoke(widget, "getWidth")).doubleValue();
+            double h = ((Number) invoke(widget, "getHeight")).doubleValue();
+            return new double[]{x + w / 2.0, y + h / 2.0};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // ============================== A clear shot ==============================
+
+    /** One of our own Pokémon (not a shoulder one) that is in the way of a throw from you to the target, or null. */
+    private PokemonEntity blockerOnLine(MinecraftClient client, ClientPlayerEntity player, Entity target) {
+        Vec3d from = player.getEyePos();
+        Vec3d to = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
+        Vec3d seg = to.subtract(from);
+        double len2 = seg.lengthSquared();
+        if (len2 < 1e-6) return null;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, player.getBoundingBox().expand(12),
+                x -> player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved() && !isShoulderSpecies(x.getPokemon()))) {
+            Vec3d c = new Vec3d(pe.getX(), pe.getY() + pe.getHeight() * 0.5, pe.getZ());
+            double t = Math.max(0, Math.min(1, c.subtract(from).dotProduct(seg) / len2));
+            Vec3d closest = from.add(seg.multiply(t));
+            if (closest.distanceTo(c) < pe.getWidth() * 0.5 + 0.7) return pe;
+        }
+        return null;
+    }
+
+    private PokemonEntity nearestOwnPokemon(MinecraftClient client, ClientPlayerEntity player) {
+        PokemonEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, player.getBoundingBox().expand(12),
+                x -> player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved() && !isShoulderSpecies(x.getPokemon()))) {
+            double d = pe.squaredDistanceTo(player);
+            if (d < bestDist) { bestDist = d; best = pe; }
+        }
+        return best;
+    }
+
+    /** Steps sideways (away from the blocker's side) while staying aimed at the target. */
+    private void strafeAround(MinecraftClient client, ClientPlayerEntity player, Entity target, PokemonEntity blocker) {
+        double fx = target.getX() - player.getX();
+        double fz = target.getZ() - player.getZ();
+        double len = Math.max(0.001, Math.hypot(fx, fz));
+        fx /= len;
+        fz /= len;
+        double rx = -fz, rz = fx;                                                   // your right-hand side
+        double side = (blocker.getX() - player.getX()) * rx + (blocker.getZ() - player.getZ()) * rz; // > 0: blocker is on the right
+        boolean goRight = side <= 0;
+        client.options.rightKey.setPressed(goRight);
+        client.options.leftKey.setPressed(!goRight);
+        client.options.forwardKey.setPressed(false);
+        keysHeld = true;
+    }
+
     // ============================== Battles ==============================
 
     /** True if Cobblemon says you are in a battle right now (found by name; false if that can't be read). */
@@ -2430,7 +2744,14 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         screenOpenTicks++;
 
-        if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) return; // the battle is supposed to be running
+        // waiting for the hoppers after the item drop: leave every screen alone so you can use your inventory
+        if (task == Task.CLEAN && cStage == CStage.WAITING) return;
+
+        if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) {
+            // normally the battle screen is left alone; get it out of the way when a revive is needed, or a revive menu is stuck open
+            if ((reviveWanted && reviveStage == 0) || (reviveStage == 4 && screenOpenTicks > 30)) dismiss(client, screen, 5);
+            return;
+        }
 
         boolean vanilla = cls.startsWith("net.minecraft.");
         boolean cobblemon = cls.startsWith("com.cobblemon");
@@ -3449,6 +3770,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 continue;
             }
 
+            if (obj instanceof Pokemon) continue;
             if (!obj.getClass().getName().startsWith("com.cobblemon")) continue;
             result.add(obj);
             if (depth >= maxDepth) continue;

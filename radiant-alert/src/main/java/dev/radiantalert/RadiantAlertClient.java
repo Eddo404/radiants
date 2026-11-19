@@ -415,6 +415,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean respawnContinuesRun = false;
     private long lastRespawnAt = 0;
     private int chestAttempts = 0;
+    private boolean chestGiveUp = false;
+    private int hitGraceTicks = 0;
     private final List<int[]> ballSwaps = new ArrayList<>();   // {inventory slot, hotbar slot} of every ball we swapped into the hotbar
     private int chestSwapSlot = -1;                          // where the elytra was put when a chestplate went on
     private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
@@ -839,7 +841,12 @@ public class RadiantAlertClient implements ClientModInitializer {
             for (String aspect : pe.getPokemon().getAspects()) {
                 if (aspect.toLowerCase(Locale.ROOT).contains("alpha")) { alpha = true; break; }
             }
-            if (alpha || aggressors.containsKey(pe.getUuid())) zones.add(new double[]{pe.getX(), pe.getZ(), AVOID_RADIUS});
+            if (alpha || aggressors.containsKey(pe.getUuid())) {
+                zones.add(new double[]{pe.getX(), pe.getZ(), AVOID_RADIUS, AVOID_COST});   // keep well away
+            } else {
+                // any other wild Pokémon is something to walk around, not into (bumping into one makes you stall)
+                zones.add(new double[]{pe.getX(), pe.getZ(), Math.max(1.6, pe.getWidth() * 0.5 + 0.9), 3.0});
+            }
         }
         return zones;
     }
@@ -1427,6 +1434,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         wormholePos = pos;
         wTicks = 0;
         resetRoute(client);
+        chestGiveUp = false;
+        chestAttempts = 0;
         ensureChestplate(client);
         autoLog(String.format("WORMHOLE start at %.1f, %.1f, %.1f", pos.x, pos.y, pos.z));
         say(client, "Walking to the wormhole. Open chat and run /radiantalert stop to cancel.");
@@ -1473,7 +1482,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             case ARRIVED -> {
                 releaseKeys(client);
                 // 1) chestplate: keep trying (twice a second) until it is on
-                boolean needChest = !chestplateWorn(player) && findChestplateSlot(player) >= 0;
+                boolean needChest = !chestGiveUp && !chestplateWorn(player) && findChestplateSlot(player) >= 0;
                 if (needChest && wTicks >= 5 && wTicks < 100 && wTicks % 10 == 5) ensureChestplate(client);
                 // 2) Terapagos onto the shoulder (once), if there is one in the party
                 if (TERAPAGOS_IN_WORMHOLES && !terapagosTried && wTicks >= 20) {
@@ -1561,6 +1570,13 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** Inventory index (0-35) of a chestplate, or -1: things called "chestplate" first, then any chest armour that isn't an elytra. */
     private int findChestplateSlot(ClientPlayerEntity player) {
+        // the elytra-chestplate (e.g. "Aether Elytra Chestplate") first: it is both
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            String name = itemNameOf(s).toLowerCase(Locale.ROOT);
+            if (name.contains("chestplate") && (name.contains("elytra") || name.contains("aether"))) return i;
+        }
         for (int i = 0; i < 36; i++) {
             ItemStack s = player.getInventory().getStack(i);
             if (s.isEmpty()) continue;
@@ -1577,7 +1593,10 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** A chestplate (or other chest armour that isn't an elytra) is on. An elytra counts as "not worn": it gets swapped out. */
     private static boolean chestplateWorn(ClientPlayerEntity player) {
         ItemStack chest = player.getEquippedStack(EquipmentSlot.CHEST);
-        return !chest.isEmpty() && !itemIdOf(chest).equals("minecraft:elytra");
+        if (chest.isEmpty()) return false;
+        if (!itemIdOf(chest).equals("minecraft:elytra")) return true;
+        // an elytra that is also a chestplate (e.g. the "Aether Elytra Chestplate") counts as a chestplate
+        return itemNameOf(chest).toLowerCase(Locale.ROOT).contains("chestplate");
     }
 
     /**
@@ -1591,7 +1610,14 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (player == null || client.interactionManager == null) return;
         if (chestplateWorn(player)) { chestAttempts = 0; return; }
 
+        if (chestGiveUp) return;
         int found = findChestplateSlot(player);
+        if (found >= 0 && chestAttempts >= 12) {
+            chestGiveUp = true;
+            autoLog("CHEST giving up after " + chestAttempts + " attempts");
+            say(client, "I couldn't get the chestplate on after several tries - carrying on without it.");
+            return;
+        }
         if (found < 0) {
             if (chestAttempts++ % 10 == 0) {
                 autoLog("CHEST no chestplate found in the inventory");
@@ -1697,6 +1723,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (client.player == null || client.interactionManager == null) return;
         say(client, "Chestplate test starting (the chat window has to close first)...");
         chestAttempts = 0;
+        chestGiveUp = false;
         chestTestCalls = 0;
         chestTestTicks = 0;
         chestTestStage = 3; // waiting for the chat screen to close, then it begins
@@ -1770,8 +1797,9 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Once a second during a wormhole run: if the chest slot is empty, try to put a chestplate on. */
     private void chestCheck(MinecraftClient client) {
         // works with a battle screen open too (the clicks are just messages to the server); not while a real inventory is open
-        if (task != Task.WORMHOLE || client.player == null || client.currentScreen instanceof HandledScreen<?>) return;
+        if (task != Task.WORMHOLE || client.player == null || chestGiveUp || client.currentScreen instanceof HandledScreen<?>) return;
         if (chestplateWorn(client.player)) { chestAttempts = 0; return; }
+        if (findChestplateSlot(client.player) < 0) return; // nothing to put on: don't keep stopping
         if (wStage == WStage.WALK || wStage == WStage.PUSH) {
             chestPauseTicks = 14;          // stand still first: the equip happens in the middle of the pause (see autoTick)
         } else {
@@ -1816,6 +1844,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (!keysHeld) return;
         client.options.leftKey.setPressed(false);
         client.options.rightKey.setPressed(false);
+        client.options.backKey.setPressed(false);
         client.options.forwardKey.setPressed(false);
         client.options.sprintKey.setPressed(false);
         client.options.jumpKey.setPressed(false);
@@ -1832,6 +1861,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         // just got hit (knockback): the old route is no good, plan a new one straight away
         if (player.hurtTime >= 8) {
             markAggressor(client, player);
+            hitGraceTicks = 30;
             path = List.of();
             replanCooldown = 0;
             stuckTicks = 0;
@@ -1856,13 +1886,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         boolean offPath = !noPath && isOffPath(player, segFrom, path.get(pathIndex));
 
         if (noPath || goalMoved || offPath) {
-            if (replanCooldown > 0) { releaseKeys(client); return; }
-            replanCooldown = REPLAN_COOLDOWN_TICKS;
-            if (!replan(client, player, goal, goalEyeY, ring)) return; // gave up
-            stuckTicks = 0;
-            stuckX = player.getX();
-            stuckY = player.getY();
-            stuckZ = player.getZ();
+            if (replanCooldown > 0) {
+                // keep walking the old route until the next re-plan is allowed (stopping here made it move in short bursts)
+                if (noPath) { releaseKeys(client); return; }
+            } else {
+                replanCooldown = REPLAN_COOLDOWN_TICKS;
+                if (!replan(client, player, goal, goalEyeY, ring)) return; // gave up
+                stuckTicks = 0;
+                stuckX = player.getX();
+                stuckY = player.getY();
+                stuckZ = player.getZ();
+            }
         }
         if (path.isEmpty() || pathIndex >= path.size()) { releaseKeys(client); return; }
 
@@ -1883,7 +1917,14 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
 
         // barely moving for half a second: re-plan; if it keeps happening, avoid the square just ahead of us
-        if (++stuckTicks >= 10) {
+        if (hitGraceTicks > 0) {
+            // knocked about by something: not making progress is expected, don't count it as being stuck
+            hitGraceTicks--;
+            stuckTicks = 0;
+            stuckX = player.getX();
+            stuckY = player.getY();
+            stuckZ = player.getZ();
+        } else if (++stuckTicks >= 10) {
             double moved = Math.abs(player.getX() - stuckX) + Math.abs(player.getY() - stuckY) + Math.abs(player.getZ() - stuckZ);
             stuckTicks = 0;
             stuckX = player.getX();
@@ -1909,30 +1950,53 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
         }
 
-        // steer toward the waypoint
+        // The camera stays on the target (the Pokémon / the wormhole); we walk toward the waypoint with W/A/S/D
+        // relative to where the camera points.
         double dx = wp.getX() + 0.5 - player.getX();
         double dz = wp.getZ() + 0.5 - player.getZ();
         double hd = Math.sqrt(dx * dx + dz * dz);
         double dy = wp.getY() - player.getY();
 
-        float yaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0f;
-        player.setYaw(MathHelper.lerpAngleDegrees(0.5f, player.getYaw(), yaw));
-        player.setPitch(MathHelper.lerp(0.5f, player.getPitch(), 0.0f));
-        float yawError = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw()));
+        lookAtPoint(player, goal.x, goalEyeY, goal.z, 0.35f);
 
-        // keep walking through turns; only stop to turn on the spot when facing almost the wrong way
-        boolean forward = yawError < 100.0f;
+        double yawRad = Math.toRadians(player.getYaw());
+        double camFx = -Math.sin(yawRad), camFz = Math.cos(yawRad);   // where the camera points (x, z)
+        double camRx = -Math.cos(yawRad), camRz = -Math.sin(yawRad);  // the camera's right-hand side
+        double len = Math.max(0.001, hd);
+        double fwd = (dx * camFx + dz * camFz) / len;                 // 1 = waypoint straight ahead of the camera
+        double rgt = (dx * camRx + dz * camRz) / len;                 // 1 = waypoint to the right of the camera
+        boolean forward = fwd > 0.35;
+        boolean back = fwd < -0.35;
+        boolean right = rgt > 0.35;
+        boolean left = rgt < -0.35;
+        boolean moving = forward || back || right || left;
+
         Vec3d vel = player.getVelocity();
         boolean barelyMoving = vel.x * vel.x + vel.z * vel.z < 0.0025;
         // jump for planned one-block steps, in water, or when pushing against something without moving
         boolean jump = player.isTouchingWater()
-            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || (player.horizontalCollision && barelyMoving && forward)));
-        boolean sprint = forward && hd > 2.5 && dy < 0.3 && yawError < 15.0f;
+            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || (player.horizontalCollision && barelyMoving && moving)));
+        boolean sprint = forward && Math.abs(rgt) < 0.3 && hd > 2.5 && dy < 0.3;
 
         client.options.forwardKey.setPressed(forward);
+        client.options.backKey.setPressed(back);
+        client.options.rightKey.setPressed(right);
+        client.options.leftKey.setPressed(left);
         client.options.sprintKey.setPressed(sprint);
         client.options.jumpKey.setPressed(jump);
         keysHeld = true;
+    }
+
+    /** Turns the camera toward a point (smoothly): factor is how much of the remaining turn is done each tick. */
+    private static void lookAtPoint(ClientPlayerEntity player, double x, double y, double z, float factor) {
+        Vec3d eye = player.getEyePos();
+        double dx = x - eye.x, dy = y - eye.y, dz = z - eye.z;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal < 0.3) return;                       // right on top of it: keep the camera where it is
+        float yaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0f;
+        float pitch = (float) -Math.toDegrees(Math.atan2(dy, horizontal));
+        player.setYaw(MathHelper.lerpAngleDegrees(factor, player.getYaw(), yaw));
+        player.setPitch(MathHelper.lerp(factor, player.getPitch(), MathHelper.clamp(pitch, -60.0f, 60.0f)));
     }
 
     private static double horizontalDistance(ClientPlayerEntity player, BlockPos p) {
@@ -2139,7 +2203,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         private double dangerCost(int x, int z) {
             double cost = 0;
             for (double[] zone : avoid) {
-                if (Math.hypot(x + 0.5 - zone[0], z + 0.5 - zone[1]) < zone[2]) cost += AVOID_COST;
+                if (Math.hypot(x + 0.5 - zone[0], z + 0.5 - zone[1]) < zone[2]) cost += zone[3];
             }
             return cost;
         }

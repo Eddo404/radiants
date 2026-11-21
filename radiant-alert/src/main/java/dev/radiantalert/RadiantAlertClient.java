@@ -32,6 +32,7 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.ArmorItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.ClientConnection;
 import net.minecraft.network.packet.CustomPayload;
@@ -174,6 +175,9 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final int PLAN_MAX_NODES = 15000;
     /** Minimum gap between route plans (ticks). */
     private static final int REPLAN_COOLDOWN_TICKS = 5;
+    /** Alphas (and anything that has hit you) are avoided: routes cost extra within this many blocks of them. */
+    private static final double AVOID_RADIUS = 7.0;
+    private static final double AVOID_COST = 10.0;
 
     // --- Wormhole run ---
     /** Key pressed after the first teleport to send out a Pokémon (Cobblemon's default is R). */
@@ -215,7 +219,9 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Send the home command ("home us") again after everything has been dropped. */
     private static final boolean RETURN_HOME_AFTER_CLEAN = true;
     /** Ticks between each drop (20 = 1 second). */
-    private static final int DROP_DELAY_TICKS = 4;
+    private static final int DROP_DELAY_TICKS = 10;
+    /** After the last drop, wait this long (ticks) before going home, so the hoppers can take everything in. */
+    private static final int DEPOSIT_WAIT_TICKS = 20 * 8;
     /** Don't start another clean-up for this long (ms) after one. */
     private static final long CLEAN_COOLDOWN_MS = 120000;
 
@@ -258,7 +264,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         namePattern("sandwich"),
         namePattern("\\bfossils?\\b"),                          // fossils
         namePattern("charged apri"),                            // charged apri juice
-        namePattern("golden apple"));
+        namePattern("golden apple"),
+        namePattern("pottery (shard|sherd)s?"));                // pottery shards
 
     /** Dropped when the item's registry id matches one of these (fossils and the vanilla ores / minerals). */
     private static final List<Pattern> JUNK_ID_PATTERNS = List.of(
@@ -269,6 +276,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         Pattern.compile("^minecraft:(iron|gold|copper|netherite)_ingot$"),                                // ingots
         Pattern.compile("^minecraft:(iron|gold)_nugget$"),
         Pattern.compile("^minecraft:(coal|iron|gold|copper|diamond|emerald|lapis|redstone|netherite)_block$"), // mineral blocks
+        Pattern.compile("^minecraft:.*_pottery_(sherd|shard)$"),                                          // pottery shards
         Pattern.compile("^minecraft:(coal|diamond|emerald|lapis_lazuli|redstone|quartz|netherite_scrap)$"));  // gems and dusts
 
     /** Never dropped, even though they look like a pattern above. */
@@ -276,6 +284,9 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     // --- Hoopa on your shoulder (/radiantalert autohoopa) ---
     private static final String HOOPA_SPECIES = "hoopa";
+    /** Terapagos goes on the shoulder only while you are inside a wormhole (right after the first teleport). */
+    private static final String TERAPAGOS_SPECIES = "terapagos";
+    private static final boolean TERAPAGOS_IN_WORMHOLES = true;
     /** A "normal" Hoopa may only have these aspects; anything else (delta, omega, unbound, ...) is not normal. */
     private static final Set<String> NORMAL_HOOPA_ASPECTS = Set.of("confined", "shiny", "genderless", "male", "female");
     /** ...and its form name must be one of these (lowercase). */
@@ -368,7 +379,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private final Set<Long> blockedNodes = new HashSet<>();
 
     // ---- inventory clean-up ----
-    private enum CStage { SEND_DEPOSIT, WAIT_ARRIVE, DROPPING }
+    private enum CStage { SEND_DEPOSIT, WAIT_ARRIVE, DROPPING, WAITING }
     private record DropAction(int slot, boolean wholeStack, String itemId, String name) {}
     private boolean autoCleanEnabled = false;
     private CStage cStage = CStage.SEND_DEPOSIT;
@@ -387,6 +398,11 @@ public class RadiantAlertClient implements ClientModInitializer {
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
     private boolean sneakHeld = false;
     private boolean hWheelClicked = false;
+    private String shoulderSpecies = HOOPA_SPECIES;
+    private String shoulderLabel = "Hoopa";
+    private boolean hoopaReturn = false;       // the shoulder routine was started from inside a wormhole run
+    private boolean terapagosTried = false;
+    private int chestPauseTicks = 0;
 
     // ---- chestplate test (/radiantalert chestplate) ----
     private int chestTestStage = 0, chestTestTicks = 0, chestTestCalls = 0;
@@ -399,11 +415,29 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean respawnContinuesRun = false;
     private long lastRespawnAt = 0;
     private int chestAttempts = 0;
+    private boolean chestGiveUp = false;
+    private int hitGraceTicks = 0;
+    private final List<int[]> ballSwaps = new ArrayList<>();   // {inventory slot, hotbar slot} of every ball we swapped into the hotbar
+    private int chestSwapSlot = -1;                          // where the elytra was put when a chestplate went on
+    private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
+    private int noPokemonTicks = 0;
+    private int ownHitTicks = 0, strafeTicks = 0;
     private Screen lastUnblockScreen = null;
     private int screenOpenTicks = 0;
     private long lastEndBattleAt = 0;
     private int deathTicks = 0, respawnTicks = 0;
     private Vec3d routeStart = Vec3d.ZERO;
+
+    // ---- avoiding Alphas, recovering from a bad route, server clean-ups ----
+    private enum RetryKind { NONE, CATCH, WORMHOLE }
+    private RetryKind retryKind = RetryKind.NONE;
+    private PokemonEntity retryEntity = null;
+    private boolean retryRadiant = false;
+    private Vec3d retryPos = Vec3d.ZERO;
+    private long retryAt = 0, retryDeadline = 0, wormholeDetectedAt = 0;
+    private int retryAttempts = 0;
+    private long clearBlockUntil = 0;
+    private final Map<UUID, Long> aggressors = new HashMap<>();
 
     // ---- action log ----
     private int autoLogLines = 0;
@@ -486,6 +520,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoCleanEnabled = false;
                     autoHoopaEnabled = false;
                     ubCatch = false;
+                    hoopaReturn = false;
                     abortCurrent(c, "Stopped.");
                     say(c, "All automatic features are OFF.");
                     return 1;
@@ -529,7 +564,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoHoopaEnabled = !autoHoopaEnabled;
                     if (autoHoopaEnabled) hoopaDueAt = System.currentTimeMillis() + 2000;
                     say(c, autoHoopaEnabled
-                        ? "Auto-Hoopa ON: after you arrive somewhere I'll put a normal Hoopa from your party on your shoulder."
+                        ? "Auto-Hoopa ON: after you arrive on an Ultra Wild server (ultrawild1/2) I'll put a normal Hoopa from your party on your shoulder."
                         : "Auto-Hoopa OFF.");
                     return 1;
                 }))
@@ -548,6 +583,14 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** End of every tick: server-hop check, Pokémon detection. */
     private void tick(MinecraftClient client) {
+        try {
+            tickInner(client);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "tick", t);
+        }
+    }
+
+    private void tickInner(MinecraftClient client) {
         // a new world object means we were moved to another server/dimension
         if (client.world != null && client.world != lastWorld) {
             lastWorld = client.world;
@@ -572,6 +615,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             idleCheckTicks = 0;
             idleChecks(client);
             chestCheck(client);
+            reviveCheck(client);
         }
         if (chestTestStage != 0) chestTestTick(client);
 
@@ -581,6 +625,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (client.currentScreen instanceof DeathScreen && (task == Task.WORMHOLE || autoWormholeEnabled)) {
             if (++deathTicks >= 20) {
                 deathTicks = 0;
+                if (task == Task.HOOPA && hoopaReturn) stopHoopa(client, "You died - respawning."); // back to the wormhole run
                 boolean insideWormhole = task == Task.WORMHOLE && (wStage == WStage.ARRIVED || wStage == WStage.ENCOUNTER);
                 respawnContinuesRun = insideWormhole;
                 autoLog("DEATH detected - respawning (task=" + task + ", insideWormhole=" + insideWormhole + ")");
@@ -605,8 +650,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                 lastRespawnAt = System.currentTimeMillis();
                 ensureChestplate(client);
                 if (respawnContinuesRun && task == Task.WORMHOLE) {
-                    trySelectPartySlot(0);        // the first Pokémon
-                    pressSendOutKey();            // R
+                    lastSentOutSlot = firstHealthyPartySlot();
+                    trySelectPartySlot(lastSentOutSlot); // the first Pokémon that hasn't fainted
+                    pressSendOutKey();                           // R
                     wStage = WStage.ENCOUNTER;    // keep waiting for the battle to finish
                     wTicks = 0;
                     autoLog("DEATH recovered: sent out the first Pokémon again");
@@ -615,6 +661,12 @@ public class RadiantAlertClient implements ClientModInitializer {
                     sendHome(client);
                 }
             }
+        }
+
+        // inside a wormhole nothing else is hunted: no shinies, radiants or alerts for them
+        if (inWormholeEncounter()) {
+            pending.clear();
+            return;
         }
 
         Iterator<Pending> it = pending.iterator();
@@ -655,11 +707,19 @@ public class RadiantAlertClient implements ClientModInitializer {
                 if (alerted.add(e.getUuid())) {
                     announce(client, e, radiant, shiny, watched);
                     if ((radiant || shiny) && canStartTask()) {
-                        if (autoCatchEnabled) startCatch(client, e, radiant);
+                        if (autoCatchEnabled && System.currentTimeMillis() >= clearBlockUntil) {
+                            retryAttempts = 0;
+                            startCatch(client, e, radiant);
+                        }
                     }
                 }
             }
         }
+    }
+
+    /** After the first teleport of a wormhole run (the encounter itself) - including the Terapagos shoulder step. */
+    private boolean inWormholeEncounter() {
+        return (task == Task.WORMHOLE && wStage != WStage.WALK && wStage != WStage.PUSH) || (task == Task.HOOPA && hoopaReturn);
     }
 
     private boolean canStartTask() {
@@ -668,6 +728,14 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** Start of every tick: drives whatever the bot is currently doing. */
     private void autoTick(MinecraftClient client) {
+        try {
+            autoTickInner(client);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "autoTick", t);
+        }
+    }
+
+    private void autoTickInner(MinecraftClient client) {
         if (task == Task.IDLE) { releaseKeys(client); return; }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); return; }
@@ -677,12 +745,31 @@ public class RadiantAlertClient implements ClientModInitializer {
                 hoopaScreen(client);
                 return;
             }
+            // the party menu Cobblemon opens when a revive is used: click the fainted Pokémon in it
+            if (reviveStage == 3 && client.currentScreen.getClass().getName().startsWith("com.cobblemon")
+                    && !client.currentScreen.getClass().getName().toLowerCase(Locale.ROOT).contains("battle")) {
+                reviveScreen(client);
+                return;
+            }
             releaseKeys(client);
             unblockScreen(client); // close chat / menus, or end a battle, that would stop us from moving
             return;
         }
         lastUnblockScreen = null;
+        lastUnblockClass = "";
         screenOpenTicks = 0;
+
+        // standing still while the chestplate goes on (inventory clicks while moving can be rejected by the server)
+        if (chestPauseTicks > 0) {
+            chestPauseTicks--;
+            releaseKeys(client);
+            if (chestPauseTicks == 6) ensureChestplate(client);
+            return;
+        }
+
+        // already in a battle (e.g. an Alpha started one) and we need to walk: /endbattle
+        // (never for the Ultra Beast catch - there you just back out of the battle screen)
+        if (!ubCatch && wantsToMove()) endBattleIfNeeded(client);
 
         switch (task) {
             case CATCH -> catchTick(client, player);
@@ -690,6 +777,105 @@ public class RadiantAlertClient implements ClientModInitializer {
             case CLEAN -> cleanTick(client, player);
             case HOOPA -> hoopaTick(client, player);
             default -> { }
+        }
+    }
+
+    /**
+     * The route has gone badly wrong (fell, got far off course, stuck, no route): stop, go to /home us, and - if the
+     * Pokémon / wormhole is still there afterwards - try again (at most twice).
+     */
+    private void recoverAndRetry(MinecraftClient client, String reason) {
+        if (task == Task.HOOPA) {                 // no need to go home just because we can't get to a Pokémon on the shoulder
+            stopHoopa(client, "Couldn't get to " + shoulderLabel + " (" + reason + ").");
+            return;
+        }
+        long now = System.currentTimeMillis();
+        autoLog("RECOVER (" + reason + ") task=" + task + " attempts=" + retryAttempts);
+        retryKind = RetryKind.NONE;
+        if (retryAttempts < 2) {
+            if (task == Task.CATCH && !ubCatch && target != null) {
+                retryKind = RetryKind.CATCH;
+                retryEntity = target;
+                retryRadiant = allowPremiumBalls;
+                retryAt = now + 12000;
+                retryDeadline = now + 90000;
+            } else if (task == Task.WORMHOLE && (wStage == WStage.WALK || wStage == WStage.PUSH)) {
+                retryKind = RetryKind.WORMHOLE;
+                retryPos = wormholePos;
+                retryAt = now + 12000;
+                retryDeadline = wormholeDetectedAt + 90000;
+            }
+            if (retryKind != RetryKind.NONE) retryAttempts++;
+        }
+        ubCatch = false; // we send the home command ourselves
+        abortCurrent(client, "Off course (" + reason + ") - going to /" + HOME_COMMAND
+            + (retryKind != RetryKind.NONE ? " and trying again." : "."));
+        sendHome(client);
+    }
+
+    /** You were just hit: remember the nearest wild Pokémon (other than the one we're after) as someone to keep away from. */
+    private void markAggressor(MinecraftClient client, ClientPlayerEntity player) {
+        PokemonEntity nearest = null;
+        double best = 8.0 * 8.0;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, player.getBoundingBox().expand(8),
+                x -> x.getOwnerUuid() == null && !x.isRemoved() && x != target)) {
+            double d = pe.squaredDistanceTo(player);
+            if (d < best) { best = d; nearest = pe; }
+        }
+        if (nearest != null) {
+            aggressors.put(nearest.getUuid(), System.currentTimeMillis());
+            autoLog("HIT by " + nearest.getPokemon().getSpecies().getName() + " - keeping away from it");
+        }
+    }
+
+    /** Places to route around: Alphas, and anything that has hit you in the last minute. */
+    private List<double[]> dangerZones(MinecraftClient client) {
+        List<double[]> zones = new ArrayList<>();
+        if (client.world == null || client.player == null) return zones;
+        long now = System.currentTimeMillis();
+        aggressors.values().removeIf(t -> now - t > 60000);
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                client.player.getBoundingBox().expand(60),
+                x -> x.getOwnerUuid() == null && !x.isRemoved() && x != target)) {
+            boolean alpha = false;
+            for (String aspect : pe.getPokemon().getAspects()) {
+                if (aspect.toLowerCase(Locale.ROOT).contains("alpha")) { alpha = true; break; }
+            }
+            if (alpha || aggressors.containsKey(pe.getUuid())) {
+                zones.add(new double[]{pe.getX(), pe.getZ(), AVOID_RADIUS, AVOID_COST});   // keep well away
+            } else {
+                // any other wild Pokémon is something to walk around, not into (bumping into one makes you stall)
+                zones.add(new double[]{pe.getX(), pe.getZ(), Math.max(1.6, pe.getWidth() * 0.5 + 0.9), 3.0});
+            }
+        }
+        return zones;
+    }
+
+    private long lastErrorShownAt = 0;
+
+    /** A bug in this mod must never crash the game: log it, stop whatever was running, and tell the player (at most every 10 s). */
+    private void onTickError(MinecraftClient client, String where, Throwable t) {
+        LOG.error("RadiantAlert: error in " + where, t);
+        try {
+            StackTraceElement[] trace = t.getStackTrace();
+            autoLog("ERROR in " + where + ": " + t + (trace.length > 0 ? " at " + trace[0] : ""));
+            task = Task.IDLE;
+            ubCatch = false;
+            hoopaReturn = false;
+            path = List.of();
+            pathIndex = 0;
+            phase = Phase.READY;
+            target = null;
+            hEntity = null;
+            releaseKeys(client);
+            long now = System.currentTimeMillis();
+            if (now - lastErrorShownAt > 10000) {
+                lastErrorShownAt = now;
+                say(client, "Something went wrong (" + t.getClass().getSimpleName() + " in " + where
+                    + ") - I stopped what I was doing. Details are in radiantalert-auto.txt.");
+            }
+        } catch (Throwable ignored) {
+            // nothing more we can do
         }
     }
 
@@ -746,9 +932,17 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void onEntityLoad(Entity entity) {
+        try {
+            onEntityLoadInner(entity);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "entity load", t);
+        }
+    }
+
+    private void onEntityLoadInner(Entity entity) {
         if (listening) logEntityLoad(entity);
         if (entity instanceof PokemonEntity pe) {
-            if (!alerted.contains(pe.getUuid())) pending.add(new Pending(pe, new int[]{0}));
+            if (!alerted.contains(pe.getUuid()) && !inWormholeEncounter()) pending.add(new Pending(pe, new int[]{0}));
             return;
         }
         MinecraftClient client = MinecraftClient.getInstance();
@@ -809,7 +1003,11 @@ public class RadiantAlertClient implements ClientModInitializer {
         wormholesSeen.add(new Seen(p[0], p[1], p[2], now));
         announceWormhole(client, p[0], p[1], p[2], describe(info));
 
-        if (autoWormholeEnabled && canStartTask()) startWormhole(client, new Vec3d(p[0], p[1], p[2]));
+        if (autoWormholeEnabled && canStartTask()) {
+            retryAttempts = 0;
+            wormholeDetectedAt = now;
+            startWormhole(client, new Vec3d(p[0], p[1], p[2]));
+        }
     }
 
     /** Short label for the alert: the matching effect name, e.g. "us_portal_rift_red". */
@@ -828,8 +1026,39 @@ public class RadiantAlertClient implements ClientModInitializer {
     // ============================== Chat and server hops ==============================
 
     private void onChatMessage(String text) {
+        try {
+            onChatMessageInner(text);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "chat", t);
+        }
+    }
+
+    private void onChatMessageInner(String text) {
         if (!text.startsWith("[RadiantAlert]") && !text.startsWith("[rec]")) listenLog("CHAT " + text);
         String lower = text.toLowerCase(Locale.ROOT);
+
+        // "Ground items and wild Pokemon will be cleared in 20 seconds!" / "...have been cleared!":
+        // don't chase Pokémon around a clean-up (wormholes are unaffected)
+        if (lower.contains("ground items") && lower.contains("cleared")) {
+            boolean warning = lower.contains("will be cleared");
+            autoLog("CLEAR message (" + (warning ? "warning - ignored" : "it happened") + ")");
+            if (!warning) {
+                // the clean-up has just happened: the Pokémon we were after are gone
+                clearBlockUntil = System.currentTimeMillis() + 8000;
+                if (task == Task.CATCH && !ubCatch) {
+                    MinecraftClient client = MinecraftClient.getInstance();
+                    stopAuto(client, "Wild Pokémon were just cleared - stopping the catch and going home.");
+                    sendHome(client);
+                }
+            }
+        }
+
+        // our own ball hit one of our own Pokémon: make sure the next throw goes around it
+        if (task == Task.CATCH && lower.contains("not a wild pok")) {
+            ownHitTicks = 80;
+            autoLog("CHAT a ball hit one of our own Pokémon: " + text);
+        }
+
         if (task == Task.CATCH && lower.contains("cannot be captured")) {
             MinecraftClient client = MinecraftClient.getInstance();
             autoLog("CHAT uncapturable: " + text);
@@ -840,6 +1069,14 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** We were moved to a different server or dimension. */
     private void onServerHop(String reason) {
+        try {
+            onServerHopInner(reason);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "server hop", t);
+        }
+    }
+
+    private void onServerHopInner(String reason) {
         listenLog("SIGNAL " + reason + " | " + contextString(MinecraftClient.getInstance()));
         long now = System.currentTimeMillis();
         if (now - lastHopTime < 3000) return; // several signals fire for one hop
@@ -863,6 +1100,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             switch (wStage) {
                 case WALK, PUSH -> {
                     wStage = WStage.ARRIVED;
+                    terapagosTried = false;
                     wTicks = 0;
                     wArrivedAt = now;
                     releaseKeys(client);
@@ -898,6 +1136,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void sendHome(MinecraftClient client) {
         if (client.player == null) return;
+        restoreSwaps(client);
         long now = System.currentTimeMillis();
         if (now - lastHomeSentAt < 5000) return; // already sent a moment ago
         lastHomeSentAt = now;
@@ -1008,6 +1247,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (switchWait > 0) { switchWait--; return; }
         if (angleError(player, current) > 4.0f) return; // wait until we're aimed at it
 
+        // never throw through one of our own Pokémon ("That Koraidon is not a wild Pokémon."): sidestep until the line is clear
+        PokemonEntity blocker = blockerOnLine(client, player, current);
+        if (blocker == null && ownHitTicks > 0) blocker = nearestOwnPokemon(client, player);
+        if (ownHitTicks > 0) ownHitTicks--;
+        if (blocker != null && strafeTicks < 120) {
+            strafeAround(client, player, current, blocker);
+            strafeTicks++;
+            return;
+        }
+        strafeTicks = 0;
+
         int slot = findBallIndex(player);
         if (slot < 0) {
             stopAuto(client, ubCatch
@@ -1018,8 +1268,10 @@ public class RadiantAlertClient implements ClientModInitializer {
             return;
         }
         if (client.interactionManager == null) return;
+        if (catchPrevSlot < 0) catchPrevSlot = player.getInventory().selectedSlot;
         if (slot >= 9) {
-            // the ball is in the main inventory: swap it into the selected hotbar slot
+            // the ball is in the main inventory: swap it into the selected hotbar slot (and remember, to put it back later)
+            ballSwaps.add(new int[]{slot, player.getInventory().selectedSlot});
             client.interactionManager.clickSlot(player.playerScreenHandler.syncId, slot,
                 player.getInventory().selectedSlot, SlotActionType.SWAP, player);
             autoLog("Moved a ball from inventory slot " + slot + " to the hotbar");
@@ -1045,6 +1297,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         goneTicks = 0;
         ball = null;
         captureStarted = false;
+        ownHitTicks = 0;
         autoLog("THROW #" + throwsDone);
         say(client, "Threw ball #" + throwsDone + " at " + targetName + ". Waiting for the result...");
     }
@@ -1163,6 +1416,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         path = List.of();
         zoneActive = false;
         releaseKeys(client);
+        restoreSwaps(client);
         autoLog("CATCH stop: " + message);
         say(client, message);
         if (goHome) sendHome(client);
@@ -1180,6 +1434,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         wormholePos = pos;
         wTicks = 0;
         resetRoute(client);
+        chestGiveUp = false;
+        chestAttempts = 0;
         ensureChestplate(client);
         autoLog(String.format("WORMHOLE start at %.1f, %.1f, %.1f", pos.x, pos.y, pos.z));
         say(client, "Walking to the wormhole. Open chat and run /radiantalert stop to cancel.");
@@ -1225,8 +1481,18 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case ARRIVED -> {
                 releaseKeys(client);
-                if (wTicks == 10) ensureChestplate(client);
-                if (wTicks >= AFTER_TELEPORT_WAIT_TICKS) {
+                // 1) chestplate: keep trying (twice a second) until it is on
+                boolean needChest = !chestGiveUp && !chestplateWorn(player) && findChestplateSlot(player) >= 0;
+                if (needChest && wTicks >= 5 && wTicks < 100 && wTicks % 10 == 5) ensureChestplate(client);
+                // 2) Terapagos onto the shoulder (once), if there is one in the party
+                if (TERAPAGOS_IN_WORMHOLES && !terapagosTried && wTicks >= 20) {
+                    terapagosTried = true;
+                    if (startShoulder(client, false, TERAPAGOS_SPECIES, false, true)) return;
+                }
+                // 3) send out the first Pokémon (R) once the chestplate is on
+                if (wTicks >= AFTER_TELEPORT_WAIT_TICKS && (!needChest || wTicks >= 100)) {
+                    lastSentOutSlot = firstHealthyPartySlot();
+                    trySelectPartySlot(lastSentOutSlot);
                     pressSendOutKey();
                     wStage = WStage.ENCOUNTER;
                     wTicks = 0;
@@ -1236,7 +1502,32 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             case ENCOUNTER -> {
                 releaseKeys(client);
-                if (wTicks > ENCOUNTER_TIMEOUT_TICKS) stopWormhole(client, "Timed out waiting for the encounter to finish.");
+                if (wTicks > ENCOUNTER_TIMEOUT_TICKS) { stopWormhole(client, "Timed out waiting for the encounter to finish."); return; }
+                // a revive is needed (the Pokémon that was sent out has fainted)
+                if (reviveWanted && reviveStage == 0) {
+                    reviveStage = 1;
+                    reviveTicks = 0;
+                    reviveRetries = 0;
+                    reviveGuiTicks = 0;
+                    autoLog("REVIVE starting for party slot " + (reviveSlot + 1));
+                    say(client, "Your Pokémon fainted - using a revive on it.");
+                }
+                if (reviveStage != 0) { reviveTick(client, player); return; }
+
+                // keep a Pokémon out: if none of yours has been out for 5 seconds (you died, it fainted, or it was
+                // recalled), send the first one that hasn't fainted out again
+                if (wTicks % 20 == 0) {
+                    if (ownPokemonOut(client)) noPokemonTicks = 0; else noPokemonTicks += 20;
+                    if (noPokemonTicks >= 100) {
+                        noPokemonTicks = 0;
+                        int slot = firstHealthyPartySlot();
+                        autoLog("ENCOUNTER no Pokémon out: sending out party slot " + (slot + 1));
+                        say(client, "No Pokémon out - sending out party slot " + (slot + 1) + ".");
+                        lastSentOutSlot = slot;
+                        trySelectPartySlot(slot);
+                        pressSendOutKey();
+                    }
+                }
             }
             case FINISHED -> {
                 releaseKeys(client);
@@ -1277,56 +1568,150 @@ public class RadiantAlertClient implements ClientModInitializer {
         return best;
     }
 
+    /** Inventory index (0-35) of a chestplate, or -1: things called "chestplate" first, then any chest armour that isn't an elytra. */
+    private int findChestplateSlot(ClientPlayerEntity player) {
+        // the elytra-chestplate (e.g. "Aether Elytra Chestplate") first: it is both
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            String name = itemNameOf(s).toLowerCase(Locale.ROOT);
+            if (name.contains("chestplate") && (name.contains("elytra") || name.contains("aether"))) return i;
+        }
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) return i;
+        }
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getStack(i);
+            if (s.isEmpty()) continue;
+            if (s.getItem() instanceof ArmorItem armor && armor.getType() == ArmorItem.Type.CHESTPLATE) return i;
+        }
+        return -1;
+    }
+
+    /** A chestplate (or other chest armour that isn't an elytra) is on. An elytra counts as "not worn": it gets swapped out. */
+    private static boolean chestplateWorn(ClientPlayerEntity player) {
+        ItemStack chest = player.getEquippedStack(EquipmentSlot.CHEST);
+        if (chest.isEmpty()) return false;
+        if (!itemIdOf(chest).equals("minecraft:elytra")) return true;
+        // an elytra that is also a chestplate (e.g. the "Aether Elytra Chestplate") counts as a chestplate
+        return itemNameOf(chest).toLowerCase(Locale.ROOT).contains("chestplate");
+    }
+
     /**
-     * Makes sure a chestplate is worn. Each call tries one thing and it is called again every second during a
-     * wormhole run until the chestplate is on: (1) shift-click it into the armour slot, (2) bring it to the
-     * hotbar, (3) right-click it from the hotbar (which equips it).
+     * Makes sure a chestplate is worn. With an elytra on, the chestplate is swapped for it (the elytra goes where the
+     * chestplate was, and is put back on later). Otherwise each call tries one thing and it is called again every
+     * second during a wormhole run: (1) shift-click, (2) pick it up and drop it into the armour slot, (3) bring it
+     * to the hotbar, (4) right-click it from the hotbar.
      */
     private void ensureChestplate(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.interactionManager == null) return;
-        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) { chestAttempts = 0; return; }
+        if (chestplateWorn(player)) { chestAttempts = 0; return; }
 
-        int found = -1;
-        for (int i = 0; i < 36; i++) {
-            ItemStack s = player.getInventory().getStack(i);
-            if (s.isEmpty()) continue;
-            if (itemIdOf(s).endsWith("_chestplate") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("chestplate")) {
-                found = i;
-                break;
-            }
+        if (chestGiveUp) return;
+        int found = findChestplateSlot(player);
+        if (found >= 0 && chestAttempts >= 12) {
+            chestGiveUp = true;
+            autoLog("CHEST giving up after " + chestAttempts + " attempts");
+            say(client, "I couldn't get the chestplate on after several tries - carrying on without it.");
+            return;
         }
         if (found < 0) {
             if (chestAttempts++ % 10 == 0) {
                 autoLog("CHEST no chestplate found in the inventory");
-                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
+                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory! (Run /radiantalert items to see what you carry.)");
             }
             return;
         }
 
-        int step = chestAttempts++ % 3;
         ItemStack stack = player.getInventory().getStack(found);
         int screenSlot = found < 9 ? 36 + found : found;
-        autoLog("CHEST step " + (step + 1) + ": " + itemIdOf(stack) + " from inventory slot " + found);
-        if (step == 0) {
-            say(client, "Putting on your chestplate (" + itemNameOf(stack) + ").");
-            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot, 0,
-                SlotActionType.QUICK_MOVE, player);
-        } else if (step == 1) {
-            if (found >= 9) {
-                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, screenSlot,
-                    player.getInventory().selectedSlot, SlotActionType.SWAP, player);
-            } else {
-                player.getInventory().selectedSlot = found;
+        int sync = player.playerScreenHandler.syncId;
+
+        // an elytra is on: swap it with the chestplate (pick up the chestplate, click the chest slot, put the elytra down)
+        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
+            say(client, "Swapping your elytra for the chestplate (" + itemNameOf(stack) + ").");
+            autoLog("CHEST swapping the elytra for " + itemIdOf(stack) + " from inventory slot " + found);
+            client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player);
+            client.interactionManager.clickSlot(sync, 6, 0, SlotActionType.PICKUP, player);
+            client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player);
+            chestSwapSlot = found;
+            chestAttempts++;
+            return;
+        }
+
+        int step = chestAttempts++ % 4;
+        String[] labels = {"shift-click", "pick up and place", "move to hotbar", "right-click"};
+        autoLog("CHEST step " + (step + 1) + "/4 (" + labels[step] + "): " + itemIdOf(stack) + " \"" + itemNameOf(stack)
+            + "\" in inventory slot " + found);
+        say(client, "Chestplate: " + labels[step] + " (" + itemNameOf(stack) + ").");
+
+        switch (step) {
+            case 0 -> client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.QUICK_MOVE, player);
+            case 1 -> {
+                client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player); // pick it up
+                client.interactionManager.clickSlot(sync, 6, 0, SlotActionType.PICKUP, player);          // put it in the chest slot
+                if (!player.currentScreenHandler.getCursorStack().isEmpty()) {                         // didn't go in: put it back
+                    client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player);
+                }
             }
-        } else {
-            ItemStack held = player.getMainHandStack();
-            if (!held.isEmpty() && (itemIdOf(held).endsWith("_chestplate")
-                    || itemNameOf(held).toLowerCase(Locale.ROOT).contains("chestplate"))) {
-                client.interactionManager.interactItem(player, Hand.MAIN_HAND); // right-click to wear it
-            } else if (found < 9) {
-                player.getInventory().selectedSlot = found;
+            case 2 -> {
+                if (found >= 9) {
+                    client.interactionManager.clickSlot(sync, screenSlot, player.getInventory().selectedSlot,
+                        SlotActionType.SWAP, player);
+                } else {
+                    player.getInventory().selectedSlot = found;
+                }
             }
+            default -> {
+                ItemStack held = player.getMainHandStack();
+                if (!held.isEmpty() && (itemIdOf(held).endsWith("_chestplate")
+                        || itemNameOf(held).toLowerCase(Locale.ROOT).contains("chestplate")
+                        || (held.getItem() instanceof ArmorItem armor && armor.getType() == ArmorItem.Type.CHESTPLATE))) {
+                    client.interactionManager.interactItem(player, Hand.MAIN_HAND); // right-click to wear it
+                } else if (found < 9) {
+                    player.getInventory().selectedSlot = found;
+                }
+            }
+        }
+    }
+
+    /** Puts things back the way they were: swapped balls to their inventory slots, the elytra back on, the hotbar selection. */
+    private void restoreSwaps(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || client.interactionManager == null) {
+            ballSwaps.clear();
+            chestSwapSlot = -1;
+            catchPrevSlot = -1;
+            return;
+        }
+        int sync = player.playerScreenHandler.syncId;
+        for (int i = ballSwaps.size() - 1; i >= 0; i--) {
+            int[] swap = ballSwaps.get(i);
+            int screenSlot = swap[0] < 9 ? 36 + swap[0] : swap[0];
+            client.interactionManager.clickSlot(sync, screenSlot, swap[1], SlotActionType.SWAP, player);
+        }
+        if (!ballSwaps.isEmpty()) autoLog("RESTORE put " + ballSwaps.size() + " swapped item(s) back");
+        ballSwaps.clear();
+
+        if (chestSwapSlot >= 0) {
+            ItemStack inSlot = player.getInventory().getStack(chestSwapSlot);
+            if (itemIdOf(inSlot).equals("minecraft:elytra") && !player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
+                int screenSlot = chestSwapSlot < 9 ? 36 + chestSwapSlot : chestSwapSlot;
+                client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player); // pick up the elytra
+                client.interactionManager.clickSlot(sync, 6, 0, SlotActionType.PICKUP, player);          // swap it with the chestplate
+                client.interactionManager.clickSlot(sync, screenSlot, 0, SlotActionType.PICKUP, player); // put the chestplate down
+                autoLog("RESTORE elytra back on");
+                say(client, "Put your elytra back on.");
+            }
+            chestSwapSlot = -1;
+        }
+
+        if (catchPrevSlot >= 0) {
+            player.getInventory().selectedSlot = catchPrevSlot;
+            catchPrevSlot = -1;
         }
     }
 
@@ -1335,29 +1720,44 @@ public class RadiantAlertClient implements ClientModInitializer {
      * then the same routine the wormhole run uses puts it back on, and the result is reported.
      */
     private void startChestTest(MinecraftClient client) {
-        ClientPlayerEntity player = client.player;
-        if (player == null || client.interactionManager == null) return;
-        if (client.currentScreen != null) { say(client, "Close any open menu first."); return; }
-        if (task != Task.IDLE) { say(client, "Busy with something else right now."); return; }
+        if (client.player == null || client.interactionManager == null) return;
+        say(client, "Chestplate test starting (the chat window has to close first)...");
         chestAttempts = 0;
+        chestGiveUp = false;
         chestTestCalls = 0;
         chestTestTicks = 0;
-        if (!player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) {
-            say(client, "Chestplate test: taking your chestplate off first...");
-            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, 6, 0, SlotActionType.QUICK_MOVE, player);
-            chestTestStage = 1;
-        } else {
-            say(client, "Chestplate test: no chestplate is worn - putting one on.");
-            chestTestStage = 2;
-        }
+        chestTestStage = 3; // waiting for the chat screen to close, then it begins
     }
 
     private void chestTestTick(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
-        if (player == null || client.currentScreen != null) { chestTestStage = 0; return; }
-        chestTestTicks++;
-        boolean worn = !player.getEquippedStack(EquipmentSlot.CHEST).isEmpty();
+        if (player == null || client.interactionManager == null) { chestTestStage = 0; return; }
 
+        // the command is typed in chat, so the chat screen is still open for a moment: wait for it
+        if (client.currentScreen != null) {
+            if (++chestTestTicks > 200) {
+                say(client, "Chestplate test: a menu stayed open, giving up.");
+                chestTestStage = 0;
+            }
+            return;
+        }
+
+        boolean worn = chestplateWorn(player);
+
+        if (chestTestStage == 3) {                       // begin
+            chestTestTicks = 0;
+            if (worn) {
+                say(client, "Chestplate test: taking your chestplate off first...");
+                client.interactionManager.clickSlot(player.playerScreenHandler.syncId, 6, 0, SlotActionType.QUICK_MOVE, player);
+                chestTestStage = 1;
+            } else {
+                say(client, "Chestplate test: no chestplate is worn - putting one on.");
+                chestTestStage = 2;
+            }
+            return;
+        }
+
+        chestTestTicks++;
         if (chestTestStage == 1) {                       // waiting for it to come off
             if (!worn) {
                 say(client, "Chestplate test: it's off. Now putting it back on...");
@@ -1376,6 +1776,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             say(client, "Chestplate test PASSED: the chestplate is on (after " + chestTestCalls + " step(s)).");
             autoLog("CHEST test passed after " + chestTestCalls + " step(s)");
             chestTestStage = 0;
+            restoreSwaps(client); // an elytra that was swapped out goes back on
             return;
         }
         if (chestTestTicks % 10 == 1) {
@@ -1385,6 +1786,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                 chestTestStage = 0;
                 return;
             }
+            if (chestTestCalls > 0) {
+                say(client, "  chest slot now: empty (that step didn't work)");
+            }
             chestTestCalls++;
             ensureChestplate(client);
         }
@@ -1392,15 +1796,22 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** Once a second during a wormhole run: if the chest slot is empty, try to put a chestplate on. */
     private void chestCheck(MinecraftClient client) {
-        if (task != Task.WORMHOLE || client.currentScreen != null || client.player == null) return;
-        if (client.player.getEquippedStack(EquipmentSlot.CHEST).isEmpty()) ensureChestplate(client);
-        else chestAttempts = 0;
+        // works with a battle screen open too (the clicks are just messages to the server); not while a real inventory is open
+        if (task != Task.WORMHOLE || client.player == null || chestGiveUp || client.currentScreen instanceof HandledScreen<?>) return;
+        if (chestplateWorn(client.player)) { chestAttempts = 0; return; }
+        if (findChestplateSlot(client.player) < 0) return; // nothing to put on: don't keep stopping
+        if (wStage == WStage.WALK || wStage == WStage.PUSH) {
+            chestPauseTicks = 14;          // stand still first: the equip happens in the middle of the pause (see autoTick)
+        } else {
+            ensureChestplate(client);
+        }
     }
 
     private void stopWormhole(MinecraftClient client, String message) {
         task = Task.IDLE;
         path = List.of();
         releaseKeys(client);
+        restoreSwaps(client);
         autoLog("WORMHOLE stop: " + message);
         say(client, message);
     }
@@ -1431,6 +1842,9 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void releaseKeys(MinecraftClient client) {
         if (!keysHeld) return;
+        client.options.leftKey.setPressed(false);
+        client.options.rightKey.setPressed(false);
+        client.options.backKey.setPressed(false);
         client.options.forwardKey.setPressed(false);
         client.options.sprintKey.setPressed(false);
         client.options.jumpKey.setPressed(false);
@@ -1446,25 +1860,43 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         // just got hit (knockback): the old route is no good, plan a new one straight away
         if (player.hurtTime >= 8) {
+            markAggressor(client, player);
+            hitGraceTicks = 30;
             path = List.of();
             replanCooldown = 0;
             stuckTicks = 0;
             stuckStrikes = 0;
         }
 
+        // falling a long way: give up on this route
+        if (player.fallDistance > 5.0f && !player.isTouchingWater()) {
+            recoverAndRetry(client, "falling");
+            return;
+        }
+
+        if (path.isEmpty()) pathIndex = 0;
         boolean noPath = path.isEmpty() || pathIndex >= path.size();
         boolean goalMoved = planTargetPos == null || goal.squaredDistanceTo(planTargetPos) > 6.25;
-        boolean offPath = !noPath && isOffPath(player,
-            pathIndex == 0 ? routeStart : Vec3d.ofBottomCenter(path.get(pathIndex - 1)), path.get(pathIndex));
+        Vec3d segFrom = routeStart;
+        if (!noPath && pathIndex > 0) segFrom = Vec3d.ofBottomCenter(path.get(pathIndex - 1));
+        if (!noPath && offPathDistance(player, segFrom, path.get(pathIndex)) > 12.0) {
+            recoverAndRetry(client, "far off course");
+            return;
+        }
+        boolean offPath = !noPath && isOffPath(player, segFrom, path.get(pathIndex));
 
         if (noPath || goalMoved || offPath) {
-            if (replanCooldown > 0) { releaseKeys(client); return; }
-            replanCooldown = REPLAN_COOLDOWN_TICKS;
-            if (!replan(client, player, goal, goalEyeY, ring)) return; // gave up
-            stuckTicks = 0;
-            stuckX = player.getX();
-            stuckY = player.getY();
-            stuckZ = player.getZ();
+            if (replanCooldown > 0) {
+                // keep walking the old route until the next re-plan is allowed (stopping here made it move in short bursts)
+                if (noPath) { releaseKeys(client); return; }
+            } else {
+                replanCooldown = REPLAN_COOLDOWN_TICKS;
+                if (!replan(client, player, goal, goalEyeY, ring)) return; // gave up
+                stuckTicks = 0;
+                stuckX = player.getX();
+                stuckY = player.getY();
+                stuckZ = player.getZ();
+            }
         }
         if (path.isEmpty() || pathIndex >= path.size()) { releaseKeys(client); return; }
 
@@ -1485,7 +1917,14 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
 
         // barely moving for half a second: re-plan; if it keeps happening, avoid the square just ahead of us
-        if (++stuckTicks >= 10) {
+        if (hitGraceTicks > 0) {
+            // knocked about by something: not making progress is expected, don't count it as being stuck
+            hitGraceTicks--;
+            stuckTicks = 0;
+            stuckX = player.getX();
+            stuckY = player.getY();
+            stuckZ = player.getZ();
+        } else if (++stuckTicks >= 10) {
             double moved = Math.abs(player.getX() - stuckX) + Math.abs(player.getY() - stuckY) + Math.abs(player.getZ() - stuckZ);
             stuckTicks = 0;
             stuckX = player.getX();
@@ -1493,7 +1932,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             stuckZ = player.getZ();
             if (moved < 0.25) {
                 stuckStrikes++;
-                if (stuckStrikes >= 8) { abortCurrent(client, "Got stuck and couldn't find a way out - stopping."); return; }
+                if (stuckStrikes >= 8) { recoverAndRetry(client, "stuck"); return; }
                 if (stuckStrikes >= 2) {
                     double sx = wp.getX() + 0.5 - player.getX();
                     double sz = wp.getZ() + 0.5 - player.getZ();
@@ -1511,30 +1950,53 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
         }
 
-        // steer toward the waypoint
+        // The camera stays on the target (the Pokémon / the wormhole); we walk toward the waypoint with W/A/S/D
+        // relative to where the camera points.
         double dx = wp.getX() + 0.5 - player.getX();
         double dz = wp.getZ() + 0.5 - player.getZ();
         double hd = Math.sqrt(dx * dx + dz * dz);
         double dy = wp.getY() - player.getY();
 
-        float yaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0f;
-        player.setYaw(MathHelper.lerpAngleDegrees(0.5f, player.getYaw(), yaw));
-        player.setPitch(MathHelper.lerp(0.5f, player.getPitch(), 0.0f));
-        float yawError = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw()));
+        lookAtPoint(player, goal.x, goalEyeY, goal.z, 0.35f);
 
-        // keep walking through turns; only stop to turn on the spot when facing almost the wrong way
-        boolean forward = yawError < 100.0f;
+        double yawRad = Math.toRadians(player.getYaw());
+        double camFx = -Math.sin(yawRad), camFz = Math.cos(yawRad);   // where the camera points (x, z)
+        double camRx = -Math.cos(yawRad), camRz = -Math.sin(yawRad);  // the camera's right-hand side
+        double len = Math.max(0.001, hd);
+        double fwd = (dx * camFx + dz * camFz) / len;                 // 1 = waypoint straight ahead of the camera
+        double rgt = (dx * camRx + dz * camRz) / len;                 // 1 = waypoint to the right of the camera
+        boolean forward = fwd > 0.35;
+        boolean back = fwd < -0.35;
+        boolean right = rgt > 0.35;
+        boolean left = rgt < -0.35;
+        boolean moving = forward || back || right || left;
+
         Vec3d vel = player.getVelocity();
         boolean barelyMoving = vel.x * vel.x + vel.z * vel.z < 0.0025;
         // jump for planned one-block steps, in water, or when pushing against something without moving
         boolean jump = player.isTouchingWater()
-            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || (player.horizontalCollision && barelyMoving && forward)));
-        boolean sprint = forward && hd > 2.5 && dy < 0.3 && yawError < 15.0f;
+            || (player.isOnGround() && ((dy > 0.3 && hd < 1.6) || (player.horizontalCollision && barelyMoving && moving)));
+        boolean sprint = forward && Math.abs(rgt) < 0.3 && hd > 2.5 && dy < 0.3;
 
         client.options.forwardKey.setPressed(forward);
+        client.options.backKey.setPressed(back);
+        client.options.rightKey.setPressed(right);
+        client.options.leftKey.setPressed(left);
         client.options.sprintKey.setPressed(sprint);
         client.options.jumpKey.setPressed(jump);
         keysHeld = true;
+    }
+
+    /** Turns the camera toward a point (smoothly): factor is how much of the remaining turn is done each tick. */
+    private static void lookAtPoint(ClientPlayerEntity player, double x, double y, double z, float factor) {
+        Vec3d eye = player.getEyePos();
+        double dx = x - eye.x, dy = y - eye.y, dz = z - eye.z;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal < 0.3) return;                       // right on top of it: keep the camera where it is
+        float yaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0f;
+        float pitch = (float) -Math.toDegrees(Math.atan2(dy, horizontal));
+        player.setYaw(MathHelper.lerpAngleDegrees(factor, player.getYaw(), yaw));
+        player.setPitch(MathHelper.lerp(factor, player.getPitch(), MathHelper.clamp(pitch, -60.0f, 60.0f)));
     }
 
     private static double horizontalDistance(ClientPlayerEntity player, BlockPos p) {
@@ -1544,20 +2006,23 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     /** Off the route = far from the straight line between the previous waypoint and the current one. */
-    private static boolean isOffPath(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
+    private static double offPathDistance(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
         double ax = from.x, az = from.z, bx = wp.getX() + 0.5, bz = wp.getZ() + 0.5;
         double abx = bx - ax, abz = bz - az;
         double len2 = abx * abx + abz * abz;
         double t = len2 < 1e-6 ? 0 : Math.max(0, Math.min(1, ((player.getX() - ax) * abx + (player.getZ() - az) * abz) / len2));
-        double off = Math.hypot(player.getX() - (ax + abx * t), player.getZ() - (az + abz * t));
-        return off > 2.5 || Math.abs(wp.getY() - player.getY()) > 3.5;
+        return Math.hypot(player.getX() - (ax + abx * t), player.getZ() - (az + abz * t));
+    }
+
+    private static boolean isOffPath(ClientPlayerEntity player, Vec3d from, BlockPos wp) {
+        return offPathDistance(player, from, wp) > 2.5 || Math.abs(wp.getY() - player.getY()) > 3.5;
     }
 
     /** Plans a new route. Returns false if the current task was given up. */
     private boolean replan(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring) {
         planTargetPos = goal;
         routeStart = player.getPos();
-        Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes).search();
+        Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes, dangerZones(client)).search();
         autoLog("PLAN " + plan.status() + " steps=" + plan.nodes().size());
 
         switch (plan.status()) {
@@ -1577,7 +2042,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 path = List.of();
                 pathIndex = 0;
                 if (++failedPlans >= 3) {
-                    abortCurrent(client, "Couldn't find a way there - stopping.");
+                    recoverAndRetry(client, "no route");
                     return false;
                 }
             }
@@ -1622,10 +2087,13 @@ public class RadiantAlertClient implements ClientModInitializer {
         private final double tx, ty, tz, goalEyeY;
         private final boolean ring;
         private final Set<Long> blocked;
+        private final List<double[]> avoid;
         private final Map<Long, Boolean> standCache = new HashMap<>();
         private final Map<Long, Boolean> goalCache = new HashMap<>();
 
-        Pathfinder(ClientWorld world, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring, Set<Long> blocked) {
+        Pathfinder(ClientWorld world, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring, Set<Long> blocked,
+                   List<double[]> avoid) {
+            this.avoid = avoid;
             this.world = world;
             this.player = player;
             this.tx = goal.x;
@@ -1670,7 +2138,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 for (Move m : moves) {
                     BlockPos np = new BlockPos(m.x(), m.y(), m.z());
                     long key = np.asLong();
-                    double ng = cur.g + m.cost();
+                    double ng = cur.g + m.cost() + dangerCost(m.x(), m.z());
                     Node nb = nodes.get(key);
                     if (nb == null) {
                         nb = new Node(np, cur, ng);
@@ -1721,6 +2189,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             for (int k = 1; k < steps; k++) {
                 double t = (double) k / steps;
                 double x = ax + (bx - ax) * t, z = az + (bz - az) * t;
+                if (dangerCost(MathHelper.floor(x), MathHelper.floor(z)) > 0) return false; // never cut through a danger zone
                 for (int sx = -1; sx <= 1; sx += 2) {
                     for (int sz = -1; sz <= 1; sz += 2) {
                         if (!standable(MathHelper.floor(x + sx * 0.3), y, MathHelper.floor(z + sz * 0.3))) return false;
@@ -1728,6 +2197,15 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
             }
             return true;
+        }
+
+        /** Extra cost for squares near an Alpha (or anything that has hit us), so routes go around them when they can. */
+        private double dangerCost(int x, int z) {
+            double cost = 0;
+            for (double[] zone : avoid) {
+                if (Math.hypot(x + 0.5 - zone[0], z + 0.5 - zone[1]) < zone[2]) cost += zone[3];
+            }
+            return cost;
         }
 
         private static List<BlockPos> build(Node end) {
@@ -1950,6 +2428,14 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void handleInfo(Info info, boolean wormhole, boolean identity) {
+        try {
+            handleInfoInner(info, wormhole, identity);
+        } catch (Throwable t) {
+            onTickError(MinecraftClient.getInstance(), "packet", t);
+        }
+    }
+
+    private void handleInfoInner(Info info, boolean wormhole, boolean identity) {
         if (identity) onIdentityInfo(info);
         if (listening && !info.id().startsWith("particle:") && !isListenNoise(info.id())) {
             listenLog("PACKET " + info.id() + " " + info.strings()
@@ -2001,6 +2487,304 @@ public class RadiantAlertClient implements ClientModInitializer {
         appendToFile("radiantalert-record.txt", line);
     }
 
+    // ============================== Revives (inside a wormhole) ==============================
+
+    private int lastSentOutSlot = -1;
+    private boolean reviveWanted = false;
+    private int reviveStage = 0;      // 0 idle, 1 get it into the hand, 2 use it, 3 waiting for the party menu, 4 clicked: waiting to see it work
+    private int reviveTicks = 0, reviveSlot = -1, revivePrevSlot = -1, reviveRetries = 0, reviveGuiTicks = 0;
+    private long reviveCooldownUntil = 0;
+
+    private static boolean isShoulderSpecies(Pokemon p) {
+        String name = p.getSpecies().getName();
+        return name.equalsIgnoreCase(HOOPA_SPECIES) || name.equalsIgnoreCase(TERAPAGOS_SPECIES);
+    }
+
+    /** Inventory index of a Max Revive (preferred) or Revive, or -1. */
+    private int findReviveSlot(ClientPlayerEntity player) {
+        for (String wanted : List.of("cobblemon:max_revive", "cobblemon:revive")) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (s.isEmpty()) continue;
+                if (itemIdOf(s).equals(wanted)) return i;
+                String name = itemNameOf(s);
+                if (name.equalsIgnoreCase(wanted.endsWith("max_revive") ? "max revive" : "revive")) return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The party slot of the Pokémon that was sent out, if it has fainted; -1 otherwise. */
+    private int faintedSentOutSlot() {
+        try {
+            List<Pokemon> party = readParty();
+            int slot = lastSentOutSlot;
+            if (slot < 0) {                                  // unknown: the first Pokémon that isn't a shoulder one
+                for (int i = 0; i < party.size(); i++) {
+                    Pokemon p = party.get(i);
+                    if (p != null && !isShoulderSpecies(p)) { slot = i; break; }
+                }
+            }
+            if (slot < 0 || slot >= party.size() || party.get(slot) == null) return -1;
+            return party.get(slot).getCurrentHealth() <= 0 ? slot : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** Once a second: inside a wormhole, has the Pokémon we sent out fainted, and do we have a revive for it? */
+    private void reviveCheck(MinecraftClient client) {
+        reviveWanted = false;
+        if (task != Task.WORMHOLE || wStage != WStage.ENCOUNTER || reviveStage != 0 || client.player == null) return;
+        long now = System.currentTimeMillis();
+        if (now < reviveCooldownUntil) return;
+        int slot = faintedSentOutSlot();
+        if (slot < 0) return;
+        if (findReviveSlot(client.player) < 0) {
+            autoLog("REVIVE party slot " + (slot + 1) + " fainted but there is no revive in the inventory");
+            reviveCooldownUntil = now + 30000;
+            return;
+        }
+        reviveSlot = slot;
+        reviveWanted = true;
+    }
+
+    private void reviveTick(MinecraftClient client, ClientPlayerEntity player) {
+        reviveTicks++;
+        long now = System.currentTimeMillis();
+        switch (reviveStage) {
+            case 1 -> {                                       // get the revive into your hand
+                int item = findReviveSlot(player);
+                if (item < 0 || client.interactionManager == null) { endRevive(client, "No revive found."); return; }
+                if (revivePrevSlot < 0) revivePrevSlot = player.getInventory().selectedSlot;
+                if (item >= 9) {
+                    ballSwaps.add(new int[]{item, player.getInventory().selectedSlot}); // put back at the end of the run
+                    client.interactionManager.clickSlot(player.playerScreenHandler.syncId, item,
+                        player.getInventory().selectedSlot, SlotActionType.SWAP, player);
+                } else {
+                    player.getInventory().selectedSlot = item;
+                }
+                autoLog("REVIVE holding " + itemIdOf(player.getMainHandStack()));
+                reviveStage = 2;
+                reviveTicks = 0;
+            }
+            case 2 -> {                                       // right-click it: Cobblemon opens its party menu
+                if (reviveTicks >= 6 && client.interactionManager != null) {
+                    client.interactionManager.interactItem(player, Hand.MAIN_HAND);
+                    reviveStage = 3;
+                    reviveTicks = 0;
+                    reviveGuiTicks = 0;
+                }
+            }
+            case 3 -> {                                       // waiting for the party menu (reviveScreen() handles it)
+                if (reviveTicks % 10 == 0 && reviveHealed()) {
+                    endRevive(client, "Revived! Sending it out again.");
+                    noPokemonTicks = 100;
+                    reviveCooldownUntil = now + 5000;
+                } else if (reviveTicks > 60) {
+                    if (reviveRetries++ < 1) {
+                        reviveStage = 2;
+                        reviveTicks = 0;
+                    } else {
+                        reviveCooldownUntil = now + 30000;
+                        endRevive(client, "The party menu never opened for the revive - see radiantalert-auto.txt (REVIVE lines).");
+                    }
+                }
+            }
+            case 4 -> {                                       // clicked: wait to see it work
+                if (reviveHealed()) {
+                    endRevive(client, "Revived! Sending it out again.");
+                    noPokemonTicks = 100;
+                    reviveCooldownUntil = now + 5000;
+                } else if (reviveTicks > 80) {
+                    reviveCooldownUntil = now + 30000;
+                    endRevive(client, "The revive didn't seem to work - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+                }
+            }
+            default -> { }
+        }
+    }
+
+    private boolean reviveHealed() {
+        try {
+            List<Pokemon> party = readParty();
+            return reviveSlot >= 0 && reviveSlot < party.size() && party.get(reviveSlot) != null
+                && party.get(reviveSlot).getCurrentHealth() > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void endRevive(MinecraftClient client, String message) {
+        reviveStage = 0;
+        reviveWanted = false;
+        reviveGuiTicks = 0;
+        if (revivePrevSlot >= 0 && client.player != null) {
+            client.player.getInventory().selectedSlot = revivePrevSlot;
+        }
+        revivePrevSlot = -1;
+        autoLog("REVIVE end: " + message);
+        say(client, message);
+    }
+
+    /** The party menu Cobblemon opens when a revive is used: write down its structure, click the fainted Pokémon, give up after 2 s. */
+    private void reviveScreen(MinecraftClient client) {
+        reviveGuiTicks++;
+        Screen screen = client.currentScreen;
+        if (screen == null) { reviveGuiTicks = 0; return; }
+        if (reviveGuiTicks == 1) {
+            dumpObject("PARTYMENU", screen, 0, Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>()), new int[]{0});
+        }
+        if (reviveGuiTicks == 4 || reviveGuiTicks == 8 || reviveGuiTicks == 12 || reviveGuiTicks == 16) {
+            boolean clicked = tryClickPartySlot(screen, reviveSlot);
+            autoLog("REVIVE party menu: clicked slot " + (reviveSlot + 1) + " = " + clicked + " (tick " + reviveGuiTicks + ")");
+            if (clicked) {
+                reviveStage = 4;
+                reviveTicks = 0;
+                reviveGuiTicks = 0;
+                return;
+            }
+        }
+        if (reviveGuiTicks >= 40) {
+            reviveGuiTicks = 0;
+            client.setScreen(null);
+            reviveCooldownUntil = System.currentTimeMillis() + 30000;
+            endRevive(client, "Couldn't click the Pokémon in the party menu - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+        }
+    }
+
+    private boolean tryClickPartySlot(Screen screen, int slot) {
+        try {
+            List<Pokemon> party = readParty();
+            Pokemon wanted = slot >= 0 && slot < party.size() ? party.get(slot) : null;
+            if (wanted == null) return false;
+            for (Object o : reachableObjects(screen, 4)) {
+                if (o == screen || !holdsPokemon(o, wanted)) continue;
+                double[] c = centerOf(o);
+                if (c != null) {
+                    screen.mouseClicked(c[0], c[1], 0);
+                    screen.mouseReleased(c[0], c[1], 0);
+                    return true;
+                }
+                if (invokeOptionAction(o)) return true;
+            }
+        } catch (Throwable t) {
+            autoLog("REVIVE click failed: " + t);
+        }
+        return false;
+    }
+
+    /** Does this object hold that exact Pokémon in one of its fields (i.e. is it that Pokémon's slot in the menu)? */
+    private static boolean holdsPokemon(Object o, Pokemon wanted) {
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break;
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v == wanted) return true;
+                    if (v instanceof Pokemon p && p.getUuid().equals(wanted.getUuid())) return true;
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        return false;
+    }
+
+    /** The middle of a widget on screen (via its x / y / width / height getters), or null. */
+    private static double[] centerOf(Object widget) {
+        try {
+            double x = ((Number) invoke(widget, "getX")).doubleValue();
+            double y = ((Number) invoke(widget, "getY")).doubleValue();
+            double w = ((Number) invoke(widget, "getWidth")).doubleValue();
+            double h = ((Number) invoke(widget, "getHeight")).doubleValue();
+            return new double[]{x + w / 2.0, y + h / 2.0};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // ============================== A clear shot ==============================
+
+    /** One of our own Pokémon (not a shoulder one) that is in the way of a throw from you to the target, or null. */
+    private PokemonEntity blockerOnLine(MinecraftClient client, ClientPlayerEntity player, Entity target) {
+        Vec3d from = player.getEyePos();
+        Vec3d to = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
+        Vec3d seg = to.subtract(from);
+        double len2 = seg.lengthSquared();
+        if (len2 < 1e-6) return null;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, player.getBoundingBox().expand(12),
+                x -> player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved() && !isShoulderSpecies(x.getPokemon()))) {
+            Vec3d c = new Vec3d(pe.getX(), pe.getY() + pe.getHeight() * 0.5, pe.getZ());
+            double t = Math.max(0, Math.min(1, c.subtract(from).dotProduct(seg) / len2));
+            Vec3d closest = from.add(seg.multiply(t));
+            if (closest.distanceTo(c) < pe.getWidth() * 0.5 + 0.7) return pe;
+        }
+        return null;
+    }
+
+    private PokemonEntity nearestOwnPokemon(MinecraftClient client, ClientPlayerEntity player) {
+        PokemonEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class, player.getBoundingBox().expand(12),
+                x -> player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved() && !isShoulderSpecies(x.getPokemon()))) {
+            double d = pe.squaredDistanceTo(player);
+            if (d < bestDist) { bestDist = d; best = pe; }
+        }
+        return best;
+    }
+
+    /** Steps sideways (away from the blocker's side) while staying aimed at the target. */
+    private void strafeAround(MinecraftClient client, ClientPlayerEntity player, Entity target, PokemonEntity blocker) {
+        double fx = target.getX() - player.getX();
+        double fz = target.getZ() - player.getZ();
+        double len = Math.max(0.001, Math.hypot(fx, fz));
+        fx /= len;
+        fz /= len;
+        double rx = -fz, rz = fx;                                                   // your right-hand side
+        double side = (blocker.getX() - player.getX()) * rx + (blocker.getZ() - player.getZ()) * rz; // > 0: blocker is on the right
+        boolean goRight = side <= 0;
+        client.options.rightKey.setPressed(goRight);
+        client.options.leftKey.setPressed(!goRight);
+        client.options.forwardKey.setPressed(false);
+        keysHeld = true;
+    }
+
+    // ============================== Battles ==============================
+
+    /** True if Cobblemon says you are in a battle right now (found by name; false if that can't be read). */
+    private static boolean battleActive() {
+        try {
+            Class<?> c = Class.forName("com.cobblemon.mod.common.client.CobblemonClient");
+            return invoke(c.getField("INSTANCE").get(null), "getBattle") != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** True while the current task needs you to be able to walk or act. */
+    private boolean wantsToMove() {
+        return (task == Task.CATCH && phase == Phase.READY)
+            || (task == Task.WORMHOLE && (wStage == WStage.WALK || wStage == WStage.PUSH))
+            || task == Task.HOOPA;
+    }
+
+    private long lastBattleCheck = 0;
+
+    /** Already in a battle when we need to walk somewhere: end it with /endbattle (at most once every 4 seconds). */
+    private void endBattleIfNeeded(MinecraftClient client) {
+        long now = System.currentTimeMillis();
+        if (now - lastBattleCheck < 500 || client.player == null) return;
+        lastBattleCheck = now;
+        if (now - lastEndBattleAt < 4000 || !battleActive()) return;
+        lastEndBattleAt = now;
+        client.player.networkHandler.sendChatCommand("endbattle");
+        autoLog("BATTLE already in a battle while walking: sent /endbattle (task=" + task + ")");
+        say(client, "You're in a battle - sending /endbattle so I can walk.");
+    }
+
     // ============================== Menus in the way ==============================
 
     /**
@@ -2008,27 +2792,44 @@ public class RadiantAlertClient implements ClientModInitializer {
      * the inventory or Cobblemon's screens, as if pressing Esc; for a Cobblemon battle screen send /endbattle.
      * Loading screens and the like are left alone. While waiting for the automatic wormhole battle, nothing is touched.
      */
+    private String lastUnblockClass = "";
+
     private void unblockScreen(MinecraftClient client) {
         Screen screen = client.currentScreen;
         if (screen == null) {
-            lastUnblockScreen = null;
+            lastUnblockClass = "";
             screenOpenTicks = 0;
             return;
         }
-        if (screen != lastUnblockScreen) {
-            lastUnblockScreen = screen;
+        String cls = screen.getClass().getName();
+        if (!cls.equals(lastUnblockClass)) {   // a different kind of screen (some, like the battle one, are re-created all the time)
+            lastUnblockClass = cls;
             screenOpenTicks = 0;
         }
         screenOpenTicks++;
 
-        if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) return; // the battle is supposed to be running
+        // waiting for the hoppers after the item drop: leave every screen alone so you can use your inventory
+        if (task == Task.CLEAN && cStage == CStage.WAITING) return;
 
-        String cls = screen.getClass().getName();
+        if (task == Task.WORMHOLE && wStage == WStage.ENCOUNTER) {
+            // normally the battle screen is left alone; get it out of the way when a revive is needed, or a revive menu is stuck open
+            if ((reviveWanted && reviveStage == 0) || (reviveStage == 4 && screenOpenTicks > 30)) dismiss(client, screen, 5);
+            return;
+        }
+
+        boolean vanilla = cls.startsWith("net.minecraft.");
         boolean cobblemon = cls.startsWith("com.cobblemon");
         boolean battle = cobblemon && cls.toLowerCase(Locale.ROOT).contains("battle");
 
         if (battle) {
-            boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH || wStage == WStage.FINISHED;
+            // Ultra Beast (catching it, or looking for it at the end of a wormhole): only back out of the battle
+            // screen - then you can walk around and throw the ball
+            boolean escOnly = ubCatch || (task == Task.WORMHOLE && wStage == WStage.FINISHED);
+            if (escOnly) {
+                dismiss(client, screen, 5);
+                return;
+            }
+            boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH;
             long now = System.currentTimeMillis();
             if (mayEnd && screenOpenTicks >= 20 && now - lastEndBattleAt > 4000 && client.player != null) {
                 lastEndBattleAt = now;
@@ -2036,26 +2837,38 @@ public class RadiantAlertClient implements ClientModInitializer {
                 autoLog("MENU battle screen in the way: sent /endbattle (" + cls + ")");
                 say(client, "In a battle - sending /endbattle so I can carry on.");
             }
+            if (mayEnd) dismiss(client, screen, 40);
             return;
         }
 
         if (screen instanceof ChatScreen chat) {
             String typed = chatScreenText(chat);
-            boolean ready = typed == null ? screenOpenTicks >= 60 : typed.isEmpty() && screenOpenTicks >= 40;
-            if (ready) {
-                autoLog("MENU closing the chat screen");
-                screen.close();
-            }
+            if (typed == null || typed.isEmpty()) dismiss(client, screen, typed == null ? 60 : 40);
             return;
         }
 
-        if (screen instanceof HandledScreen<?> || screen instanceof GameMenuScreen || cobblemon) {
-            if (screenOpenTicks >= 10) {
-                autoLog("MENU closing " + cls);
-                screen.close();
-            }
+        // everything else that isn't a loading / connecting screen: inventories, the pause menu, and any screen from a mod
+        if (screen instanceof HandledScreen<?> || screen instanceof GameMenuScreen || !vanilla) {
+            dismiss(client, screen, 10);
         }
-        // anything else (loading screens, the death screen, ...) is left alone
+    }
+
+    /** Gets rid of a screen the way a player would: press Esc, then close it, then force it shut (repeating every 1.5 s). */
+    private void dismiss(MinecraftClient client, Screen screen, int startTick) {
+        if (screenOpenTicks < startTick) return;
+        int step = (screenOpenTicks - startTick) % 30;
+        String cls = screen.getClass().getName();
+        if (step == 0) {
+            autoLog("MENU Esc on " + cls);
+            screen.keyPressed(256, 1, 0);   // 256 = the Esc key
+            screen.keyReleased(256, 1, 0);
+        } else if (step == 12) {
+            autoLog("MENU close() on " + cls);
+            screen.close();
+        } else if (step == 24) {
+            autoLog("MENU forcing " + cls + " shut");
+            client.setScreen(null);
+        }
     }
 
     /** What is typed in the chat box right now (null if it can't be read). */
@@ -2093,14 +2906,36 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     /** Once a second while idle: start a clean-up or the Hoopa routine if one is due. */
+    /** The Ultra Space area: the servers called ultrawild1 / ultrawild2. */
+    private boolean isUltraWildServer() {
+        return lastServerName != null && lastServerName.toLowerCase(Locale.ROOT).startsWith("ultrawild");
+    }
+
     private void idleChecks(MinecraftClient client) {
         if (!canStartTask() || client.currentScreen != null || client.player == null) return;
         long now = System.currentTimeMillis();
+        if (retryKind != RetryKind.NONE && now >= retryAt) {
+            RetryKind kind = retryKind;
+            retryKind = RetryKind.NONE;
+            if (now <= retryDeadline) {
+                if (kind == RetryKind.CATCH && autoCatchEnabled && retryEntity != null && !retryEntity.isRemoved()
+                        && client.player.distanceTo(retryEntity) <= MAX_APPROACH_DISTANCE && now >= clearBlockUntil) {
+                    say(client, "Trying again: heading back to " + retryEntity.getPokemon().getSpecies().getName() + ".");
+                    startCatch(client, retryEntity, retryRadiant);
+                    return;
+                }
+                if (kind == RetryKind.WORMHOLE && autoWormholeEnabled) {
+                    say(client, "Trying the wormhole again.");
+                    startWormhole(client, retryPos);
+                    return;
+                }
+            }
+        }
         if (autoCleanEnabled && now >= cleanCooldownUntil && freeSlots(client.player) <= INVENTORY_FREE_THRESHOLD) {
             startClean(client, true);
             return;
         }
-        if (autoHoopaEnabled && hoopaDueAt != 0 && now >= hoopaDueAt && now >= hoopaCooldownUntil
+        if (autoHoopaEnabled && isUltraWildServer() && hoopaDueAt != 0 && now >= hoopaDueAt && now >= hoopaCooldownUntil
                 && now - hoopaMountedAt > HOOPA_RECHECK_MS) {
             hoopaDueAt = 0;
             startHoopa(client, false);
@@ -2192,6 +3027,32 @@ public class RadiantAlertClient implements ClientModInitializer {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** The first party Pokémon that hasn't fainted (the shoulder ones don't count); slot 0 if that can't be worked out. */
+    private int firstHealthyPartySlot() {
+        try {
+            List<Pokemon> party = readParty();
+            for (int i = 0; i < party.size(); i++) {
+                Pokemon p = party.get(i);
+                if (p == null) continue;
+                String name = p.getSpecies().getName();
+                if (name.equalsIgnoreCase(HOOPA_SPECIES) || name.equalsIgnoreCase(TERAPAGOS_SPECIES)) continue;
+                if (p.getCurrentHealth() > 0) return i;
+            }
+        } catch (Throwable ignored) {
+            // fall back to the first slot
+        }
+        return 0;
+    }
+
+    /** One of your own Pokémon (not a shoulder one) is out near you. */
+    private boolean ownPokemonOut(MinecraftClient client) {
+        if (client.player == null || client.world == null) return false;
+        return !client.world.getEntitiesByClass(PokemonEntity.class, client.player.getBoundingBox().expand(48),
+            x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved()
+                && !x.getPokemon().getSpecies().getName().equalsIgnoreCase(HOOPA_SPECIES)
+                && !x.getPokemon().getSpecies().getName().equalsIgnoreCase(TERAPAGOS_SPECIES)).isEmpty();
     }
 
     /** Ultra Beasts don't spawn naturally in Ultra Space (the dimension "ultraspace:ultraspace"). */
@@ -2558,7 +3419,12 @@ public class RadiantAlertClient implements ClientModInitializer {
             case DROPPING -> {
                 if (dropDelay > 0) { dropDelay--; return; }
                 DropAction a = dropQueue.poll();
-                if (a == null) { finishClean(client); return; }
+                if (a == null) {
+                    cStage = CStage.WAITING;
+                    cTicks = 0;
+                    say(client, "Dropped everything - waiting " + (DEPOSIT_WAIT_TICKS / 20) + " seconds for the hoppers to catch up.");
+                    return;
+                }
                 if (client.interactionManager == null) return;
                 ItemStack s = player.getInventory().getStack(a.slot());
                 // skip anything that changed since it was planned
@@ -2568,6 +3434,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     a.wholeStack() ? 1 : 0, SlotActionType.THROW, player);
                 dropsDone++;
                 dropDelay = DROP_DELAY_TICKS;
+            }
+            case WAITING -> {
+                if (cTicks >= DEPOSIT_WAIT_TICKS) finishClean(client);
             }
         }
     }
@@ -2593,9 +3462,9 @@ public class RadiantAlertClient implements ClientModInitializer {
         PokemonEntity best = null;
         double bestDist = Double.MAX_VALUE;
         for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
-                client.player.getBoundingBox().expand(12),
+                client.player.getBoundingBox().expand(30),
                 x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved()
-                    && x.getPokemon().getSpecies().getName().equalsIgnoreCase(HOOPA_SPECIES))) {
+                    && x.getPokemon().getSpecies().getName().equalsIgnoreCase(shoulderSpecies))) {
             double d = pe.squaredDistanceTo(client.player);
             if (d < bestDist) { bestDist = d; best = pe; }
         }
@@ -2603,40 +3472,54 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void startHoopa(MinecraftClient client, boolean manual) {
+        startShoulder(client, manual, HOOPA_SPECIES, true, false);
+    }
+
+    /**
+     * Sends a Pokémon from the party out and puts it on your shoulder. normalOnly: for Hoopa, only a normal one.
+     * returnToWormhole: started from inside a wormhole run, which carries on afterwards. Returns true if it started.
+     */
+    private boolean startShoulder(MinecraftClient client, boolean manual, String species, boolean normalOnly, boolean returnToWormhole) {
         ClientPlayerEntity player = client.player;
-        if (player == null) return;
-        if (task != Task.IDLE) {
+        if (player == null) return false;
+        if (task != Task.IDLE && !(returnToWormhole && task == Task.WORMHOLE)) {
             if (manual) say(client, "Busy with something else right now.");
-            return;
+            return false;
         }
-        hoopaCooldownUntil = System.currentTimeMillis() + 60000;
+        String label = species.substring(0, 1).toUpperCase(Locale.ROOT) + species.substring(1);
+        if (!returnToWormhole) hoopaCooldownUntil = System.currentTimeMillis() + 60000;
 
         List<Pokemon> party;
         try {
             party = readParty();
         } catch (Throwable t) {
             say(client, "Couldn't read your party: " + t);
-            autoLog("HOOPA party read failed: " + t);
+            autoLog("SHOULDER party read failed: " + t);
             logPartyApi();
-            return;
+            return false;
         }
         int slot = -1;
         for (int i = 0; i < party.size(); i++) {
             Pokemon p = party.get(i);
-            if (p != null && isNormalHoopa(p)) { slot = i; break; }
+            if (p == null) continue;
+            boolean match = normalOnly ? isNormalHoopa(p) : p.getSpecies().getName().equalsIgnoreCase(species);
+            if (match) { slot = i; break; }
         }
         if (slot < 0) {
-            if (manual) say(client, "No normal Hoopa in your party (run /radiantalert party to see what it found).");
-            return;
+            if (manual) say(client, "No " + (normalOnly ? "normal " : "") + label + " in your party (run /radiantalert party to see what it found).");
+            return false;
         }
 
         String state = pokemonState(party.get(slot));
         if (state.toLowerCase(Locale.ROOT).contains("shoulder")) {
-            autoLog("HOOPA already on the shoulder (state=" + state + ")");
-            if (manual) say(client, "Your Hoopa is already on your shoulder.");
-            return;
+            autoLog("SHOULDER " + label + " already on the shoulder (state=" + state + ")");
+            if (manual) say(client, "Your " + label + " is already on your shoulder.");
+            return false;
         }
 
+        shoulderSpecies = species;
+        shoulderLabel = label;
+        hoopaReturn = returnToWormhole;
         hSlot = slot;
         hAttempts = 0;
         hTicks = 0;
@@ -2644,12 +3527,15 @@ public class RadiantAlertClient implements ClientModInitializer {
         hGuiTicks = 0;
         hWheelClicked = false;
         hEntity = findOwnHoopa(client);
+        resetRoute(client);
         task = Task.HOOPA;
         hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
-        autoLog("HOOPA start slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null));
+        autoLog("HOOPA start " + label + " slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null)
+            + " fromWormhole=" + returnToWormhole);
         say(client, hEntity != null
-            ? "Your Hoopa is already out - putting it on your shoulder."
-            : "Sending out your Hoopa (party slot " + (slot + 1) + ").");
+            ? "Your " + label + " is already out - putting it on your shoulder."
+            : "Sending out your " + label + " (party slot " + (slot + 1) + ").");
+        return true;
     }
 
     private void hoopaTick(MinecraftClient client, ClientPlayerEntity player) {
@@ -2686,19 +3572,17 @@ public class RadiantAlertClient implements ClientModInitializer {
                     hStage = HStage.APPROACH;
                     hTicks = 0;
                 } else if (hTicks > 100) {
-                    stopHoopa(client, "Hoopa didn't come out.");
+                    stopHoopa(client, shoulderLabel + " didn't come out.");
                 }
             }
             case APPROACH -> {
                 // wait for the send-out animation, and get within reach (about 3 blocks) of it
                 if (hEntity == null || hEntity.isRemoved()) hEntity = findOwnHoopa(client);
-                if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
-                boolean tooFar = player.distanceTo(hEntity) > 2.4f;
-                if (tooFar && hTicks < 100) {
-                    aimAt(player, hEntity);
-                    client.options.forwardKey.setPressed(true);
-                    client.options.sprintKey.setPressed(false);
-                    keysHeld = true;
+                if (hEntity == null) { stopHoopa(client, "Lost track of " + shoulderLabel + "."); return; }
+                boolean tooFar = Math.hypot(hEntity.getX() - player.getX(), hEntity.getZ() - player.getZ()) > 2.2;
+                if (tooFar && hTicks < 240) {
+                    // walk there with the route planner (around walls, up stairs, out of holes)
+                    followPath(client, player, hEntity.getPos(), hEntity.getEyeY(), false);
                 } else if (hTicks >= 20) {
                     releaseKeys(client);
                     // use an empty hand for the right-click if there is a free hotbar slot
@@ -2714,7 +3598,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
             }
             case SHOULDER -> {
-                if (hEntity == null) { stopHoopa(client, "Lost track of Hoopa."); return; }
+                if (hEntity == null) { stopHoopa(client, "Lost track of " + shoulderLabel + "."); return; }
 
                 // Attempts 1 and 2: send the message the wheel's "shoulder" button sends (first with the
                 // entity's id, then with the Pokémon's id). No crouching, right-clicking or wheel needed.
@@ -2732,7 +3616,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     }
                     if (hTicks > 1 && hEntity.isRemoved()) {
                         hoopaMountedAt = System.currentTimeMillis();
-                        stopHoopa(client, "Hoopa is on your shoulder.");
+                        stopHoopa(client, shoulderLabel + " is on your shoulder.");
                         return;
                     }
                     if (hTicks >= 16) {
@@ -2762,11 +3646,11 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
                 if (hTicks > 4 && hEntity.isRemoved()) {
                     hoopaMountedAt = System.currentTimeMillis();
-                    stopHoopa(client, "Hoopa is on your shoulder.");
+                    stopHoopa(client, shoulderLabel + " is on your shoulder.");
                     return;
                 }
                 if (hTicks >= 60) {
-                    stopHoopa(client, "Couldn't put Hoopa on your shoulder. See radiantalert-auto.txt (lines starting with HOOPA and DUMP).");
+                    stopHoopa(client, "Couldn't put " + shoulderLabel + " on your shoulder. See radiantalert-auto.txt (lines starting with HOOPA and DUMP).");
                 }
             }
         }
@@ -2950,6 +3834,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 continue;
             }
 
+            if (obj instanceof Pokemon) continue;
             if (!obj.getClass().getName().startsWith("com.cobblemon")) continue;
             result.add(obj);
             if (depth >= maxDepth) continue;
@@ -3029,6 +3914,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void stopHoopa(MinecraftClient client, String message) {
+        boolean backToWormhole = hoopaReturn;
+        hoopaReturn = false;
         task = Task.IDLE;
         hEntity = null;
         releaseKeys(client);
@@ -3042,6 +3929,11 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         autoLog("HOOPA stop: " + message);
         say(client, message);
+        if (backToWormhole) {            // carry on with the wormhole run
+            task = Task.WORMHOLE;
+            wStage = WStage.ARRIVED;
+            wTicks = Math.max(wTicks, 40);
+        }
     }
 
     // ============================== Listener (/radiantalert listen) ==============================

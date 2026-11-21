@@ -6,6 +6,7 @@ import com.google.common.collect.Multimap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -91,6 +92,7 @@ import java.util.stream.Stream;
  *  /radiantalert autoclean clean up automatically when about 5 slots are free
  *  /radiantalert hoopa     send out a normal Hoopa from your party and put it on your shoulder
  *  /radiantalert autohoopa do that automatically after you arrive somewhere
+ *  /radiantalert home <name>  which home the automatic trips use (e.g. guzzlord for /home guzzlord; starts as us)
  *  /radiantalert stop      cancel everything
  *  /radiantalert listen    record a timeline (packets, chat, teleports, screens) to radiantalert-listen.txt,
  *                          handy when you switch servers and want to see what happens
@@ -133,7 +135,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     // --- Catching ---
     /** Command sent after a catch (or when a Pokémon can't be captured). No slash. */
-    private static final String HOME_COMMAND = "home us";
+    private static final String DEFAULT_HOME_NAME = "us";   // the home used until you change it with /radiantalert home <name>
     /** After sending the home command, don't start anything new for this long (ms), so you don't walk off mid-teleport. */
     private static final long HOME_COOLDOWN_MS = 15000;
 
@@ -461,6 +463,8 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        loadHomeName();
+
         ClientEntityEvents.ENTITY_LOAD.register((entity, world) -> onEntityLoad(entity));
 
         // Watch what the server sends (particle effects, custom packets); also notices server switches
@@ -501,7 +505,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     MinecraftClient c = MinecraftClient.getInstance();
                     autoCatchEnabled = !autoCatchEnabled;
                     say(c, autoCatchEnabled
-                        ? "Auto-catch ON: I'll walk to radiants and shinies, throw balls, and send /" + HOME_COMMAND + " once caught. Cancel with /radiantalert stop."
+                        ? "Auto-catch ON: I'll walk to radiants and shinies, throw balls, and send /" + homeCommand() + " once caught. Cancel with /radiantalert stop."
                         : "Auto-catch OFF.");
                     return 1;
                 }))
@@ -568,13 +572,23 @@ public class RadiantAlertClient implements ClientModInitializer {
                         : "Auto-Hoopa OFF.");
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("home")
+                    .executes(ctx -> {
+                        say(MinecraftClient.getInstance(), "Automatic trips use /" + homeCommand()
+                            + ". Change it with /radiantalert home <name> (for example /radiantalert home guzzlord).");
+                        return 1;
+                    })
+                    .then(ClientCommandManager.argument("name", StringArgumentType.word()).executes(ctx -> {
+                        setHomeName(MinecraftClient.getInstance(), StringArgumentType.getString(ctx, "name"));
+                        return 1;
+                    })))
                 .then(ClientCommandManager.literal("status").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
                     say(c, "packet watcher: " + spyInstalled + " | recording: " + recording + " | listening: " + listening
                         + " | auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
                         + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
-                        + " | server: " + lastServerName);
+                        + " | home: /" + homeCommand() + " | server: " + lastServerName);
                     return 1;
                 }))));
     }
@@ -746,7 +760,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 return;
             }
             // the party menu Cobblemon opens when a revive is used: click the fainted Pokémon in it
-            if (reviveStage == 3 && client.currentScreen.getClass().getName().startsWith("com.cobblemon")
+            if (reviveStage == 3 && !client.currentScreen.getClass().getName().startsWith("net.minecraft.")
                     && !client.currentScreen.getClass().getName().toLowerCase(Locale.ROOT).contains("battle")) {
                 reviveScreen(client);
                 return;
@@ -808,7 +822,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (retryKind != RetryKind.NONE) retryAttempts++;
         }
         ubCatch = false; // we send the home command ourselves
-        abortCurrent(client, "Off course (" + reason + ") - going to /" + HOME_COMMAND
+        abortCurrent(client, "Off course (" + reason + ") - going to /" + homeCommand()
             + (retryKind != RetryKind.NONE ? " and trying again." : "."));
         sendHome(client);
     }
@@ -1111,7 +1125,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     if (wStage == WStage.ENCOUNTER || now - wArrivedAt > 8000) {
                         wStage = WStage.FINISHED;
                         wTicks = 0;
-                        say(client, "Left the wormhole - sending /" + HOME_COMMAND + " shortly.");
+                        say(client, "Left the wormhole - sending /" + homeCommand() + " shortly.");
                     }
                 }
                 default -> { }
@@ -1141,9 +1155,9 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (now - lastHomeSentAt < 5000) return; // already sent a moment ago
         lastHomeSentAt = now;
         homeCooldownUntil = now + HOME_COOLDOWN_MS;
-        client.player.networkHandler.sendChatCommand(HOME_COMMAND);
-        autoLog("SENT /" + HOME_COMMAND);
-        say(client, "Sent /" + HOME_COMMAND);
+        client.player.networkHandler.sendChatCommand(homeCommand());
+        autoLog("SENT /" + homeCommand());
+        say(client, "Sent /" + homeCommand());
     }
 
     // ============================== Catching ==============================
@@ -2597,8 +2611,13 @@ public class RadiantAlertClient implements ClientModInitializer {
                     noPokemonTicks = 100;
                     reviveCooldownUntil = now + 5000;
                 } else if (reviveTicks > 80) {
-                    reviveCooldownUntil = now + 30000;
-                    endRevive(client, "The revive didn't seem to work - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+                    if (reviveRetries++ < 1) {          // try the menu once more
+                        reviveStage = 2;
+                        reviveTicks = 0;
+                    } else {
+                        reviveCooldownUntil = now + 30000;
+                        endRevive(client, "The revive didn't seem to work - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+                    }
                 }
             }
             default -> { }
@@ -2653,23 +2672,68 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    /** In the menu that asks which Pokémon to use the revive on: find the entry for that Pokémon and press it. */
     private boolean tryClickPartySlot(Screen screen, int slot) {
         try {
             List<Pokemon> party = readParty();
             Pokemon wanted = slot >= 0 && slot < party.size() ? party.get(slot) : null;
             if (wanted == null) return false;
-            for (Object o : reachableObjects(screen, 4)) {
+            String species = wanted.getSpecies().getName().toLowerCase(Locale.ROOT);
+            List<Object> objects = reachableObjects(screen, 5);
+
+            // 1) the menu entry that holds this very Pokémon
+            for (Object o : objects) {
                 if (o == screen || !holdsPokemon(o, wanted)) continue;
-                double[] c = centerOf(o);
-                if (c != null) {
-                    screen.mouseClicked(c[0], c[1], 0);
-                    screen.mouseReleased(c[0], c[1], 0);
-                    return true;
+                autoLog("REVIVE entry holding the Pokémon: " + o.getClass().getName());
+                if (pressMenuEntry(screen, o)) return true;
+            }
+            // 2) an entry whose text mentions the Pokémon (its name)
+            for (Object o : objects) {
+                if (o == screen) continue;
+                if (optionLabel(o).contains(species)) {
+                    autoLog("REVIVE entry mentioning '" + species + "': " + o.getClass().getName());
+                    if (pressMenuEntry(screen, o)) return true;
                 }
-                if (invokeOptionAction(o)) return true;
+            }
+            // 3) an entry that knows its party slot number
+            for (Object o : objects) {
+                if (o == screen || !hasSlotNumber(o, slot)) continue;
+                autoLog("REVIVE entry with slot number " + slot + ": " + o.getClass().getName());
+                if (pressMenuEntry(screen, o)) return true;
             }
         } catch (Throwable t) {
             autoLog("REVIVE click failed: " + t);
+        }
+        return false;
+    }
+
+    /** Presses a menu entry: with the mouse in its middle if it has a position on screen, otherwise by running its click action. */
+    private boolean pressMenuEntry(Screen screen, Object entry) {
+        double[] c = centerOf(entry);
+        if (c != null) {
+            screen.mouseMoved(c[0], c[1]);
+            screen.mouseClicked(c[0], c[1], 0);
+            screen.mouseReleased(c[0], c[1], 0);
+            return true;
+        }
+        return invokeOptionAction(entry);
+    }
+
+    /** Does this object have an int field called slot / index / position that equals the number? */
+    private static boolean hasSlotNumber(Object o, int slot) {
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break;
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers()) || f.getType() != int.class) continue;
+                String n = f.getName().toLowerCase(Locale.ROOT);
+                if (!(n.contains("slot") || n.contains("index") || n.contains("position"))) continue;
+                try {
+                    f.setAccessible(true);
+                    if (f.getInt(o) == slot) return true;
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
         }
         return false;
     }
@@ -2897,6 +2961,48 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         autoLog("UB CHECK +" + (wTicks / 20) + "s dim=" + client.world.getRegistryKey().getValue()
             + " wild Pokémon nearby: " + found);
+    }
+
+    // ============================== Which home ==============================
+
+    private String homeName = DEFAULT_HOME_NAME;
+
+    /** The command used for every automatic trip home, without the slash. */
+    private String homeCommand() {
+        return "home " + homeName;
+    }
+
+    private static Path homeFile() {
+        return FabricLoader.getInstance().getConfigDir().resolve("radiantalert-home.txt");
+    }
+
+    private void loadHomeName() {
+        try {
+            Path file = homeFile();
+            if (Files.exists(file)) {
+                String name = Files.readString(file).trim();
+                if (name.matches("[A-Za-z0-9_-]{1,32}")) homeName = name;
+            }
+        } catch (Throwable t) {
+            LOG.warn("RadiantAlert: could not read the saved home name", t);
+        }
+    }
+
+    /** /radiantalert home <name>: changes which home automatic trips go to, and remembers it. */
+    private void setHomeName(MinecraftClient client, String name) {
+        if (!name.matches("[A-Za-z0-9_-]{1,32}")) {
+            say(client, "That isn't a valid home name (letters, numbers, - and _ only).");
+            return;
+        }
+        homeName = name;
+        try {
+            Files.writeString(homeFile(), name);
+        } catch (IOException e) {
+            LOG.warn("RadiantAlert: could not save the home name", e);
+        }
+        autoLog("HOME name set to " + name);
+        say(client, "Automatic trips now use /" + homeCommand() + ". (Change it back any time with /radiantalert home "
+            + DEFAULT_HOME_NAME + ".)");
     }
 
     // ============================== Idle checks ==============================

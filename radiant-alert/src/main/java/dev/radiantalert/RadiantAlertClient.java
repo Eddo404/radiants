@@ -158,6 +158,32 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** A plain SHINY is given up on after this many balls (then it goes home). Radiants have no ball limit. */
     private static final int MAX_BALLS_SHINY = 20;
+
+    /**
+     * Shinies of these species (names without spaces, lowercase) get no ball limit and a Master Ball - but only
+     * once every other ball (not counting Beast Balls) has been used up. Ralts only (not its evolutions), plus all
+     * the starters and their evolution lines.
+     */
+    private static final Set<String> MASTER_BALL_SPECIES = Set.of(
+        "ralts",
+        "bulbasaur", "ivysaur", "venusaur", "charmander", "charmeleon", "charizard", "squirtle", "wartortle", "blastoise",
+        "chikorita", "bayleef", "meganium", "cyndaquil", "quilava", "typhlosion", "totodile", "croconaw", "feraligatr",
+        "treecko", "grovyle", "sceptile", "torchic", "combusken", "blaziken", "mudkip", "marshtomp", "swampert",
+        "turtwig", "grotle", "torterra", "chimchar", "monferno", "infernape", "piplup", "prinplup", "empoleon",
+        "snivy", "servine", "serperior", "tepig", "pignite", "emboar", "oshawott", "dewott", "samurott",
+        "chespin", "quilladin", "chesnaught", "fennekin", "braixen", "delphox", "froakie", "frogadier", "greninja",
+        "rowlet", "dartrix", "decidueye", "litten", "torracat", "incineroar", "popplio", "brionne", "primarina",
+        "grookey", "thwackey", "rillaboom", "scorbunny", "raboot", "cinderace", "sobble", "drizzile", "inteleon",
+        "sprigatito", "floragato", "meowscarada", "fuecoco", "crocalor", "skeledirge", "quaxly", "quaxwell", "quaquaval");
+
+    /** Paradox Pokémon (names without spaces, lowercase). Like Alphas, they must be beaten down in melee before the battle starts. */
+    private static final Set<String> PARADOX_SPECIES = Set.of(
+        "greattusk", "screamtail", "brutebonnet", "fluttermane", "slitherwing", "sandyshocks", "roaringmoon",
+        "walkingwake", "gougingfire", "ragingbolt", "irontreads", "ironbundle", "ironhands", "ironjugulis",
+        "ironmoth", "ironthorns", "ironvaliant", "ironleaves", "ironboulder", "ironcrown", "koraidon", "miraidon");
+
+    /** In a battle catch, wait at most this long (ticks) after a throw for the turn to finish before throwing again. */
+    private static final int TURN_TIMEOUT_TICKS = 20 * 10;
     /** Give up on any catch after this long in total (ticks, 20 = 1 second): 10 minutes. */
     private static final int MAX_CATCH_TICKS = 20 * 60 * 10;
     /** Don't chase anything further away than this (blocks). */
@@ -424,6 +450,15 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
     private int noPokemonTicks = 0;
     private int ownHitTicks = 0, strafeTicks = 0;
+    private boolean killMode = false;        // an Alpha / Paradox: hit it until the battle starts
+    private boolean battleFirst = false;     // about to be cleared: go into a battle with it (R) first
+    private boolean battleStarted = false;   // a battle with the target is on: Esc out of the menu, then throw (one throw per turn)
+    private boolean turnReady = true;
+    private boolean sawBattleScreen = false;
+    private boolean allowMasterLast = false; // Master Ball only after every other ball (starters, Ralts)
+    private boolean weaponReady = false;
+    private int turnWait = 0, battleRTicks = 0, attacksDone = 0;
+    private long clearWarnAt = 0;
     private Screen lastUnblockScreen = null;
     private int screenOpenTicks = 0;
     private long lastEndBattleAt = 0;
@@ -772,6 +807,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         lastUnblockScreen = null;
         lastUnblockClass = "";
         screenOpenTicks = 0;
+        if (sawBattleScreen) {        // the battle menu has just been dismissed: the turn is over, we may throw
+            sawBattleScreen = false;
+            turnReady = true;
+        }
 
         // standing still while the chestplate goes on (inventory clicks while moving can be rejected by the server)
         if (chestPauseTicks > 0) {
@@ -783,7 +822,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         // already in a battle (e.g. an Alpha started one) and we need to walk: /endbattle
         // (never for the Ultra Beast catch - there you just back out of the battle screen)
-        if (!ubCatch && wantsToMove()) endBattleIfNeeded(client);
+        if (!ubCatch && !killMode && !battleFirst && !battleStarted && wantsToMove()) endBattleIfNeeded(client);
 
         switch (task) {
             case CATCH -> catchTick(client, player);
@@ -1055,11 +1094,20 @@ public class RadiantAlertClient implements ClientModInitializer {
         // don't chase Pokémon around a clean-up (wormholes are unaffected)
         if (lower.contains("ground items") && lower.contains("cleared")) {
             boolean warning = lower.contains("will be cleared");
-            autoLog("CLEAR message (" + (warning ? "warning - ignored" : "it happened") + ")");
-            if (!warning) {
-                // the clean-up has just happened: the Pokémon we were after are gone
+            autoLog("CLEAR message (" + (warning ? "warning" : "it happened") + ")");
+            if (warning) {
+                // Pokémon are going to be cleared: go into a battle with the shiny / radiant we are after (R), then Esc and throw
+                clearWarnAt = System.currentTimeMillis();
+                if (task == Task.CATCH && !ubCatch && !killMode && !battleStarted && !battleFirst) {
+                    battleFirst = true;
+                    battleRTicks = 0;
+                    say(MinecraftClient.getInstance(), "Pokémon are about to be cleared - going into a battle with " + targetName + " first.");
+                }
+            } else {
+                clearWarnAt = 0;
                 clearBlockUntil = System.currentTimeMillis() + 8000;
-                if (task == Task.CATCH && !ubCatch) {
+                // the clean-up has just happened: the Pokémon we were after are gone - unless we are already in a battle with it
+                if (task == Task.CATCH && !ubCatch && !battleStarted) {
                     MinecraftClient client = MinecraftClient.getInstance();
                     stopAuto(client, "Wild Pokémon were just cleared - stopping the catch and going home.");
                     sendHome(client);
@@ -1182,6 +1230,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         target = e;
         targetName = e.getPokemon().getSpecies().getName();
         allowPremiumBalls = radiant;
+        Pokemon pk = e.getPokemon();
+        allowMasterLast = pk.getShiny() && !radiant && !ultraBeast && MASTER_BALL_SPECIES.contains(normalizedName(pk));
+        killMode = !ultraBeast && isAlphaOrParadox(e);
+        battleFirst = !ultraBeast && !killMode && clearWarningActive();
+        battleStarted = ultraBeast;              // the Ultra Beast battle is already on
+        turnReady = false;
+        turnWait = 0;
+        battleRTicks = 0;
+        attacksDone = 0;
+        sawBattleScreen = false;
+        weaponReady = false;
         catchTicks = 0;
         throwsDone = 0;
         throwCooldown = 0;
@@ -1199,6 +1258,9 @@ public class RadiantAlertClient implements ClientModInitializer {
             say(client, "Heading to " + (radiant ? "Radiant " : "Shiny ") + targetName
                 + (radiant ? " (Master/Ancient Origin balls allowed)." : " (no Master/Ancient Origin balls).")
                 + " Open chat and run /radiantalert stop to cancel.");
+            if (killMode) say(client, "It's an Alpha/Paradox: I'll hit it until the battle starts, then Esc out of the menu and throw balls.");
+            if (allowMasterLast) say(client, "No ball limit for this one; a Master Ball only once every other ball is used up.");
+            if (battleFirst) say(client, "Pokémon are about to be cleared: I'll go into a battle with it first.");
         }
     }
 
@@ -1228,6 +1290,21 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (throwCooldown > 0) throwCooldown--;
         if (zoneOverrideTicks > 0) zoneOverrideTicks--;
 
+        // Alpha / Paradox: hit it until the battle starts. About to be cleared: go into a battle with it first (R).
+        if ((killMode || battleFirst) && !battleStarted) {
+            boolean tried = (killMode && attacksDone > 0) || (battleFirst && battleRTicks > 0);
+            if (tried && battleActive()) {
+                battleStarted = true;
+                turnReady = false;
+                turnWait = 0;
+                autoLog("CATCH a battle with " + targetName + " is on");
+                say(client, "In battle with " + targetName + ".");
+            } else {
+                if (killMode) killTick(client, player, current); else battleFirstTick(client, player, current);
+                return;
+            }
+        }
+
         if (inThrowZone(player, current) || zoneOverrideTicks > 0) {
             // close enough, not too close, and in view: stand still and throw
             releaseKeys(client);
@@ -1252,11 +1329,17 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void throwTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
         if (throwCooldown > 0) return;
-        if (!allowPremiumBalls && !ubCatch && throwsDone >= MAX_BALLS_SHINY) {
+        if (!allowPremiumBalls && !ubCatch && !allowMasterLast && throwsDone >= MAX_BALLS_SHINY) {
             // a plain shiny only gets MAX_BALLS_SHINY balls; then give up and go home
             stopAuto(client, "Used " + MAX_BALLS_SHINY + " balls on " + targetName + " - giving up.");
             sendHome(client);
             return;
+        }
+        // in a battle the Pokémon uses moves too: only throw once the turn has finished (the battle menu coming back = a new turn)
+        if (battleCatch() && !turnReady) {
+            if (++turnWait < TURN_TIMEOUT_TICKS) return;
+            autoLog("CATCH waited long enough for the turn - throwing anyway");
+            turnReady = true;
         }
         if (switchWait > 0) { switchWait--; return; }
         if (angleError(player, current) > 4.0f) return; // wait until we're aimed at it
@@ -1276,6 +1359,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (slot < 0) {
             stopAuto(client, ubCatch
                 ? "No Beast Ball anywhere in your inventory!"
+                : allowMasterLast
+                    ? "No ball of any kind left in your inventory."
                 : allowPremiumBalls
                     ? "No usable ball anywhere in your inventory."
                     : "No usable ball anywhere in your inventory (Master/Ancient Origin balls are not used for shinies).");
@@ -1312,6 +1397,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         ball = null;
         captureStarted = false;
         ownHitTicks = 0;
+        turnReady = false;
+        turnWait = 0;
         autoLog("THROW #" + throwsDone);
         say(client, "Threw ball #" + throwsDone + " at " + targetName + ". Waiting for the result...");
     }
@@ -1338,8 +1425,23 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (s.isEmpty()) continue;
             String id = Registries.ITEM.getId(s.getItem()).toString();
             if (!id.startsWith("cobblemon:") || !id.endsWith("_ball")) continue;
-            if (!allowPremiumBalls && (id.endsWith("master_ball") || id.endsWith("ancient_origin_ball"))) continue;
+            if (id.endsWith("beast_ball")) continue;                       // Beast Balls are for Ultra Beasts only
+            if (id.endsWith("master_ball") || id.endsWith("ancient_origin_ball")) continue; // premium balls: handled below
             return i;
+        }
+        // premium balls: a radiant may use them; a starter / Ralts shiny only falls back to the Master Ball, last of all
+        if (allowPremiumBalls) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (s.isEmpty()) continue;
+                String id = Registries.ITEM.getId(s.getItem()).toString();
+                if (id.endsWith("master_ball") || id.endsWith("ancient_origin_ball")) return i;
+            }
+        } else if (allowMasterLast) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (!s.isEmpty() && Registries.ITEM.getId(s.getItem()).toString().endsWith("master_ball")) return i;
+            }
         }
         return -1;
     }
@@ -1423,6 +1525,14 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void stopAuto(MinecraftClient client, String message) {
         boolean goHome = ubCatch; // an Ultra Beast catch always ends by going home, however it ended
         ubCatch = false;
+        killMode = false;
+        battleFirst = false;
+        battleStarted = false;
+        turnReady = true;
+        allowMasterLast = false;
+        sawBattleScreen = false;
+        weaponReady = false;
+        attacksDone = 0;
         task = Task.IDLE;
         target = null;
         phase = Phase.READY;
@@ -2770,6 +2880,111 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    // ============================== Alphas, Paradoxes and clean-ups ==============================
+
+    private static String normalizedName(Pokemon p) {
+        return p.getSpecies().getName().toLowerCase(Locale.ROOT).replace(" ", "").replace("-", "");
+    }
+
+    /** An Alpha (has the "alpha" aspect) or a Paradox Pokémon: it has to be beaten down in melee before the battle starts. */
+    private static boolean isAlphaOrParadox(PokemonEntity e) {
+        Pokemon p = e.getPokemon();
+        for (String aspect : p.getAspects()) {
+            if (aspect.toLowerCase(Locale.ROOT).contains("alpha")) return true;
+        }
+        return PARADOX_SPECIES.contains(normalizedName(p));
+    }
+
+    /** A "will be cleared" warning came in recently and the clean-up hasn't happened yet. */
+    private boolean clearWarningActive() {
+        return clearWarnAt != 0 && System.currentTimeMillis() - clearWarnAt < 40000;
+    }
+
+    /** A battle is on with the Pokémon we are catching: Esc out of the menu, then throw (one throw per turn). */
+    private boolean battleCatch() {
+        return ubCatch || battleStarted;
+    }
+
+    /** Alpha / Paradox: walk up to it and hit it (camera on it) until the battle starts. */
+    private void killTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        lookAtPoint(player, current.getX(), current.getY() + current.getHeight() * 0.6, current.getZ(), 0.5f);
+        double hd = Math.hypot(current.getX() - player.getX(), current.getZ() - player.getZ());
+        if (hd > 2.6) {
+            followPath(client, player, current.getPos(), current.getEyeY(), false); // get right next to it
+            return;
+        }
+        releaseKeys(client);
+        if (client.interactionManager == null) return;
+        if (!weaponReady) {
+            weaponReady = equipBestWeapon(client, player);
+            return;
+        }
+        if (player.getAttackCooldownProgress(0.5f) >= 0.95f) {
+            client.interactionManager.attackEntity(player, current);
+            player.swingHand(Hand.MAIN_HAND);
+            attacksDone++;
+            if (attacksDone == 1) autoLog("KILL hitting " + targetName);
+        }
+    }
+
+    /** Pokémon are about to be cleared: get close, aim at it and press R (send out) to start a battle with it. */
+    private void battleFirstTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        lookAtPoint(player, current.getX(), current.getEyeY(), current.getZ(), 0.5f);
+        double hd = Math.hypot(current.getX() - player.getX(), current.getZ() - player.getZ());
+        if (hd > 6.0 || !player.canSee(current)) {
+            followPath(client, player, current.getPos(), current.getEyeY(), true);
+            return;
+        }
+        releaseKeys(client);
+        if (angleError(player, current) > 6.0f) return;
+        if (battleRTicks++ % 60 == 0) {                // now, then every 3 seconds until the battle starts
+            int slot = firstHealthyPartySlot();
+            lastSentOutSlot = slot;
+            autoLog("BATTLE-FIRST pressing R (party slot " + (slot + 1) + ") at " + targetName);
+            say(client, "Sending out party slot " + (slot + 1) + " to start a battle with " + targetName + ".");
+            trySelectPartySlot(slot);
+            pressSendOutKey();
+        }
+    }
+
+    private static int weaponScore(ItemStack s) {
+        if (s.isEmpty()) return 0;
+        String id = itemIdOf(s);
+        String name = itemNameOf(s).toLowerCase(Locale.ROOT);
+        int material = id.contains("netherite") ? 6 : id.contains("diamond") ? 5 : id.contains("iron") ? 4
+            : id.contains("stone") ? 3 : id.contains("golden") ? 2 : id.contains("wooden") ? 1 : 0;
+        if (id.endsWith("_sword")) return 100 + material;
+        if (id.equals("minecraft:mace")) return 98;
+        if (id.equals("minecraft:trident")) return 90;
+        if (id.endsWith("_axe")) return 80 + material;
+        if (name.contains("sword") || name.contains("blade")) return 70;
+        return 0;
+    }
+
+    /** Puts the best melee weapon in your hand (swapped in from the inventory if needed; put back at the end). */
+    private boolean equipBestWeapon(MinecraftClient client, ClientPlayerEntity player) {
+        int best = -1;
+        int bestScore = 0;
+        for (int i = 0; i < 36; i++) {
+            int score = weaponScore(player.getInventory().getStack(i));
+            if (score > bestScore) { bestScore = score; best = i; }
+        }
+        if (best < 0) {
+            autoLog("KILL no weapon found - hitting with whatever is in hand");
+            return true;
+        }
+        if (catchPrevSlot < 0) catchPrevSlot = player.getInventory().selectedSlot;
+        if (best >= 9) {
+            ballSwaps.add(new int[]{best, player.getInventory().selectedSlot});
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, best,
+                player.getInventory().selectedSlot, SlotActionType.SWAP, player);
+        } else {
+            player.getInventory().selectedSlot = best;
+        }
+        autoLog("KILL equipped " + itemIdOf(player.getInventory().getStack(best)) + " (inventory slot " + best + ")");
+        return true;
+    }
+
     // ============================== A clear shot ==============================
 
     /** One of our own Pokémon (not a shoulder one) that is in the way of a throw from you to the target, or null. */
@@ -2888,7 +3103,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (battle) {
             // Ultra Beast (catching it, or looking for it at the end of a wormhole): only back out of the battle
             // screen - then you can walk around and throw the ball
-            boolean escOnly = ubCatch || (task == Task.WORMHOLE && wStage == WStage.FINISHED);
+            // a battle with the Pokémon we are after has started (an Alpha / Paradox beaten down, or going in before a clean-up)
+            if (task == Task.CATCH && (killMode || battleFirst) && !battleStarted) {
+                battleStarted = true;
+                turnReady = false;
+                turnWait = 0;
+                autoLog("CATCH the battle has started");
+                say(client, "The battle has started - backing out of the menu to throw balls.");
+            }
+            boolean catchBattle = task == Task.CATCH && (ubCatch || battleStarted);
+            if (catchBattle) sawBattleScreen = true;
+            boolean escOnly = catchBattle || (task == Task.WORMHOLE && wStage == WStage.FINISHED);
             if (escOnly) {
                 dismiss(client, screen, 5);
                 return;

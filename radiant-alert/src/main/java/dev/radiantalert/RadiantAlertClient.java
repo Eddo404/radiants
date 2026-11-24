@@ -424,6 +424,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int hTicks = 0, hSlot = -1, hAttempts = 0, hPrevSlot = -1, hGuiTicks = 0;
     private PokemonEntity hEntity = null;
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
+    private static final int SR_STARTED = 1, SR_BUSY = 2, SR_PARTY_UNREADABLE = 3, SR_NOT_IN_PARTY = 4, SR_ALREADY = 5;
+    private int shoulderResult = 0;
     private boolean sneakHeld = false;
     private boolean hWheelClicked = false;
     private String shoulderSpecies = HOOPA_SPECIES;
@@ -449,6 +451,9 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int chestSwapSlot = -1;                          // where the elytra was put when a chestplate went on
     private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
     private int noPokemonTicks = 0;
+    private long pendingRecallAtMs = 0, pendingHomeAtMs = 0;
+    private int recallSlot = -1;
+    private boolean noHomeOnStop = false;
     private int ownHitTicks = 0, strafeTicks = 0;
     private boolean killMode = false;        // an Alpha / Paradox: hit it until the battle starts
     private boolean battleFirst = false;     // about to be cleared: go into a battle with it (R) first
@@ -560,7 +565,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoHoopaEnabled = false;
                     ubCatch = false;
                     hoopaReturn = false;
+                    noHomeOnStop = true;
                     abortCurrent(c, "Stopped.");
+                    noHomeOnStop = false;
                     say(c, "All automatic features are OFF.");
                     return 1;
                 }))
@@ -667,6 +674,20 @@ public class RadiantAlertClient implements ClientModInitializer {
             reviveCheck(client);
         }
         if (chestTestStage != 0) chestTestTick(client);
+        if (pendingRecallAtMs != 0 || pendingHomeAtMs != 0) {
+            long nowMs = System.currentTimeMillis();
+            client.player.setPitch(85.0f);                          // keep looking at the ground: R recalls instead of starting a battle
+            if (pendingRecallAtMs != 0 && nowMs >= pendingRecallAtMs) {
+                pendingRecallAtMs = 0;
+                if (recallSlot >= 0) trySelectPartySlot(recallSlot);
+                pressSendOutKey();
+                autoLog("RECALL pressed R");
+            }
+            if (pendingHomeAtMs != 0 && nowMs >= pendingHomeAtMs) {
+                pendingHomeAtMs = 0;
+                sendHome(client);
+            }
+        }
 
         // Dying: respawn, put a chestplate back on, and
         //  - inside the wormhole (a life is lost, the run goes on): send your first Pokémon out again with R;
@@ -682,7 +703,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     say(client, "You died in the wormhole - respawning, then sending your first Pokémon out again.");
                 } else {
                     ubCatch = false;
+                    noHomeOnStop = true;
                     abortCurrent(client, "You died - respawning.");
+                    noHomeOnStop = false;
                 }
                 lastRespawnAt = System.currentTimeMillis();
                 client.player.requestRespawn();
@@ -1155,6 +1178,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         if (task == Task.CATCH) {
             ubCatch = false;
+            noHomeOnStop = true;
             stopAuto(client, "The server changed - stopping the catch.");
         } else if (task == Task.WORMHOLE && (respawnPending || now - lastRespawnAt < 6000)) {
             autoLog("HOP ignored (just respawned)");
@@ -1517,13 +1541,47 @@ public class RadiantAlertClient implements ClientModInitializer {
         autoLog("RESULT caught");
         String name = targetName;
         int balls = throwsDone;
+        int outSlot = outPartySlot(client);   // a Pokémon of ours is out (a battle catch): it has to be brought back
+        if (outSlot >= 0) noHomeOnStop = true; // stopAuto must not send /home before the recall
+        ubCatch = false;                      // we send the home command ourselves, after the recall
         stopAuto(client, "✔ Caught " + name + " with ball #" + balls + "!");
         if (client.player != null) client.player.playSound(SoundEvents.ENTITY_PLAYER_LEVELUP, 1.0f, 1.0f);
-        sendHome(client);
+        if (outSlot >= 0 && client.player != null) {
+            long now = System.currentTimeMillis();
+            recallSlot = outSlot;
+            pendingRecallAtMs = now + 300;    // look at the ground first, then press R
+            pendingHomeAtMs = now + 1800;
+            homeCooldownUntil = now + 20000;  // nothing else starts meanwhile
+            client.player.setPitch(85.0f);
+            autoLog("RECALL will bring back party slot " + (outSlot + 1) + " before going home");
+            say(client, "Recalling your Pokémon before going home.");
+        } else {
+            sendHome(client);
+        }
+    }
+
+    /** Party slot of the Pokémon of ours that is out (not a shoulder one), or -1. */
+    private int outPartySlot(MinecraftClient client) {
+        if (client.player == null || client.world == null) return -1;
+        try {
+            List<Pokemon> party = readParty();
+            for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                    client.player.getBoundingBox().expand(48),
+                    x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved() && !isShoulderSpecies(x.getPokemon()))) {
+                for (int i = 0; i < party.size(); i++) {
+                    Pokemon p = party.get(i);
+                    if (p != null && p.getUuid().equals(pe.getPokemon().getUuid())) return i;
+                }
+            }
+        } catch (Throwable ignored) {
+            // can't tell
+        }
+        return -1;
     }
 
     private void stopAuto(MinecraftClient client, String message) {
-        boolean goHome = ubCatch; // an Ultra Beast catch always ends by going home, however it ended
+        boolean goHome = !noHomeOnStop;   // a catch always ends by going home, however it ended - except when stopped by hand / by a server change
+        noHomeOnStop = false;
         ubCatch = false;
         killMode = false;
         battleFirst = false;
@@ -3120,13 +3178,13 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
             boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH;
             long now = System.currentTimeMillis();
-            if (mayEnd && screenOpenTicks >= 20 && now - lastEndBattleAt > 4000 && client.player != null) {
+            if (mayEnd && screenOpenTicks >= 10 && now - lastEndBattleAt > 4000 && client.player != null) {
                 lastEndBattleAt = now;
                 client.player.networkHandler.sendChatCommand("endbattle");
                 autoLog("MENU battle screen in the way: sent /endbattle (" + cls + ")");
                 say(client, "In a battle - sending /endbattle so I can carry on.");
             }
-            if (mayEnd) dismiss(client, screen, 40);
+            if (mayEnd) dismiss(client, screen, 3);   // Esc first to get rid of the battle screen, then /endbattle (above)
             return;
         }
 
@@ -3266,10 +3324,21 @@ public class RadiantAlertClient implements ClientModInitializer {
             startClean(client, true);
             return;
         }
-        if (autoHoopaEnabled && isUltraWildServer() && hoopaDueAt != 0 && now >= hoopaDueAt && now >= hoopaCooldownUntil
-                && now - hoopaMountedAt > HOOPA_RECHECK_MS) {
-            hoopaDueAt = 0;
-            startHoopa(client, false);
+        if (autoHoopaEnabled && hoopaDueAt != 0 && now >= hoopaDueAt) {
+            if (now > hoopaDueAt + 120000) {
+                hoopaDueAt = 0;
+                autoLog("AUTOHOOPA gave up (nothing worked within 2 minutes of arriving)");
+            } else if (now >= hoopaCooldownUntil && now - hoopaMountedAt > HOOPA_RECHECK_MS) {
+                if (!isUltraWildServer() && !inUltraSpace(client)) {
+                    hoopaDueAt = 0;
+                    autoLog("AUTOHOOPA not in the Ultra Wild area (server=" + lastServerName + ")");
+                } else {
+                    startHoopa(client, false);
+                    autoLog("AUTOHOOPA tried on " + lastServerName + ": result=" + shoulderResult);
+                    // only keep trying (every 5 s) if the party couldn't be read - the server may still be sending it
+                    hoopaDueAt = shoulderResult == SR_PARTY_UNREADABLE ? now + 5000 : 0;
+                }
+            }
         }
     }
 
@@ -3814,11 +3883,11 @@ public class RadiantAlertClient implements ClientModInitializer {
         ClientPlayerEntity player = client.player;
         if (player == null) return false;
         if (task != Task.IDLE && !(returnToWormhole && task == Task.WORMHOLE)) {
+            shoulderResult = SR_BUSY;
             if (manual) say(client, "Busy with something else right now.");
             return false;
         }
         String label = species.substring(0, 1).toUpperCase(Locale.ROOT) + species.substring(1);
-        if (!returnToWormhole) hoopaCooldownUntil = System.currentTimeMillis() + 60000;
 
         List<Pokemon> party;
         try {
@@ -3827,6 +3896,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             say(client, "Couldn't read your party: " + t);
             autoLog("SHOULDER party read failed: " + t);
             logPartyApi();
+            shoulderResult = SR_PARTY_UNREADABLE;
             return false;
         }
         int slot = -1;
@@ -3837,13 +3907,16 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (match) { slot = i; break; }
         }
         if (slot < 0) {
+            shoulderResult = SR_NOT_IN_PARTY;
             if (manual) say(client, "No " + (normalOnly ? "normal " : "") + label + " in your party (run /radiantalert party to see what it found).");
             return false;
         }
+        if (!returnToWormhole) hoopaCooldownUntil = System.currentTimeMillis() + 60000;
 
         String state = pokemonState(party.get(slot));
         if (state.toLowerCase(Locale.ROOT).contains("shoulder")) {
             autoLog("SHOULDER " + label + " already on the shoulder (state=" + state + ")");
+            shoulderResult = SR_ALREADY;
             if (manual) say(client, "Your " + label + " is already on your shoulder.");
             return false;
         }
@@ -3859,6 +3932,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         hWheelClicked = false;
         hEntity = findOwnHoopa(client);
         resetRoute(client);
+        shoulderResult = SR_STARTED;
         task = Task.HOOPA;
         hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
         autoLog("HOOPA start " + label + " slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null)

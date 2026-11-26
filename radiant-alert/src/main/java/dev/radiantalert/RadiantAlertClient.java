@@ -77,25 +77,21 @@ import java.util.stream.Stream;
 
 /**
  * Radiant Alert: tells you about radiants, shinies, Lunala/Solgaleo and Ultra Wormholes, and can
- * optionally go and deal with them for you:
+ * go and deal with them for you.
  *
- *  /radiantalert auto      walk to radiants and shinies, throw balls, wait for each result,
- *                          then send "/home us" once caught
- *  /radiantalert wormhole  walk into wormholes, send out a Pokémon after the first teleport,
- *                          then send "/home us" after the second teleport
- *                          (at the end of a wormhole it also catches an Ultra Beast with Beast Balls,
- *                          and if you die inside the wormhole it respawns you, re-equips a chestplate and
- *                          sends your first Pokémon out again with R, then carries on)
- *  /radiantalert party     show what is in your party (and which one counts as a normal Hoopa)
- *  /radiantalert items     list your inventory items and which ones the clean-up would drop
- *  /radiantalert clean     dry run: show what the clean-up would drop ('clean go' really does it)
- *  /radiantalert autoclean clean up automatically when about 5 slots are free
- *  /radiantalert hoopa     send out a normal Hoopa from your party and put it on your shoulder
- *  /radiantalert autohoopa do that automatically after you arrive somewhere
+ *  /radiantalert ultraspace   switch on everything below that runs by itself (auto, wormhole, autoclean, autohoopa)
+ *  /radiantalert stop         switch everything off and cancel what it is doing
+ *
+ *  /radiantalert auto         walk to radiants and shinies, throw balls, wait for each result, then go home
+ *                             (Alphas / Paradoxes are hit until the battle starts; Esc out of the battle menu, then balls)
+ *  /radiantalert wormhole     walk into wormholes, handle the encounter, catch the Ultra Beast at the end, go home
+ *  /radiantalert autoclean    drop the junk at the deposit spot when about 5 slots are free
+ *  /radiantalert autohoopa    put a normal Hoopa on your shoulder after arriving on an Ultra Wild server
+ *
+ *  /radiantalert clean        go to the deposit spot and drop the junk, right now
+ *  /radiantalert hoopa        put a normal Hoopa on your shoulder right now
  *  /radiantalert home <name>  which home the automatic trips use (e.g. guzzlord for /home guzzlord; starts as us)
- *  /radiantalert stop      cancel everything
- *  /radiantalert listen    record a timeline (packets, chat, teleports, screens) to radiantalert-listen.txt,
- *                          handy when you switch servers and want to see what happens
+ *  /radiantalert status       what is switched on and what it is doing
  */
 public class RadiantAlertClient implements ClientModInitializer {
 
@@ -109,7 +105,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final boolean ALERT_SPECIES = true;
     private static final boolean ALERT_WORMHOLE = true;
 
-    /** Aspect names that mark a Pokémon as Radiant. Use /radiantalert debug to check what Delta uses. */
+    /** Aspect names that mark a Pokémon as Radiant. */
     private static final Set<String> RADIANT_ASPECTS = Set.of("radiant");
 
     /** Species to alert on (lowercase). Alert only: these are NOT caught automatically. */
@@ -525,22 +521,6 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
             dispatcher.register(ClientCommandManager.literal("radiantalert")
-                .then(ClientCommandManager.literal("debug").executes(ctx -> {
-                    debugNearest(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("entities").executes(ctx -> {
-                    listEntities(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("record").executes(ctx -> {
-                    toggleRecord(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("listen").executes(ctx -> {
-                    toggleListen(MinecraftClient.getInstance());
-                    return 1;
-                }))
                 .then(ClientCommandManager.literal("auto").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
                     autoCatchEnabled = !autoCatchEnabled;
@@ -557,6 +537,36 @@ public class RadiantAlertClient implements ClientModInitializer {
                         : "Auto-wormhole OFF.");
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("autoclean").executes(ctx -> {
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    autoCleanEnabled = !autoCleanEnabled;
+                    say(c, autoCleanEnabled
+                        ? "Auto-clean ON: when " + INVENTORY_FREE_THRESHOLD + " or fewer slots are free I'll go to /" + DEPOSIT_COMMAND
+                            + " and drop the junk. (/radiantalert clean does it right now.)"
+                        : "Auto-clean OFF.");
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("autohoopa").executes(ctx -> {
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    autoHoopaEnabled = !autoHoopaEnabled;
+                    if (autoHoopaEnabled) hoopaDueAt = System.currentTimeMillis() + 2000;
+                    say(c, autoHoopaEnabled
+                        ? "Auto-Hoopa ON: after you arrive on an Ultra Wild server (ultrawild1/2) I'll put a normal Hoopa from your party on your shoulder."
+                        : "Auto-Hoopa OFF.");
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("ultraspace").executes(ctx -> {
+                    // everything for the Ultra Space area in one go
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    autoCatchEnabled = true;
+                    autoWormholeEnabled = true;
+                    autoCleanEnabled = true;
+                    autoHoopaEnabled = true;
+                    hoopaDueAt = System.currentTimeMillis() + 2000;
+                    say(c, "Ultra Space mode ON: auto-catch, auto-wormhole, auto-clean and auto-Hoopa are all running. "
+                        + "Stop everything with /radiantalert stop.");
+                    return 1;
+                }))
                 .then(ClientCommandManager.literal("stop").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
                     autoCatchEnabled = false;
@@ -571,47 +581,13 @@ public class RadiantAlertClient implements ClientModInitializer {
                     say(c, "All automatic features are OFF.");
                     return 1;
                 }))
-                .then(ClientCommandManager.literal("party").executes(ctx -> {
-                    showParty(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("items").executes(ctx -> {
-                    dumpItems(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("chestplate").executes(ctx -> {
-                    startChestTest(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("clean")
-                    .executes(ctx -> {
-                        showCleanPlan(MinecraftClient.getInstance());
-                        return 1;
-                    })
-                    .then(ClientCommandManager.literal("go").executes(ctx -> {
-                        startClean(MinecraftClient.getInstance(), false);
-                        return 1;
-                    })))
-                .then(ClientCommandManager.literal("autoclean").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoCleanEnabled = !autoCleanEnabled;
-                    say(c, autoCleanEnabled
-                        ? "Auto-clean ON: when " + INVENTORY_FREE_THRESHOLD + " or fewer slots are free I'll go to /" + DEPOSIT_COMMAND
-                            + " and drop the junk. Check the list first with /radiantalert clean."
-                        : "Auto-clean OFF.");
+                .then(ClientCommandManager.literal("clean").executes(ctx -> {
+                    // go to the deposit spot and drop the junk, right now
+                    startClean(MinecraftClient.getInstance(), false);
                     return 1;
                 }))
                 .then(ClientCommandManager.literal("hoopa").executes(ctx -> {
                     startHoopa(MinecraftClient.getInstance(), true);
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("autohoopa").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoHoopaEnabled = !autoHoopaEnabled;
-                    if (autoHoopaEnabled) hoopaDueAt = System.currentTimeMillis() + 2000;
-                    say(c, autoHoopaEnabled
-                        ? "Auto-Hoopa ON: after you arrive on an Ultra Wild server (ultrawild1/2) I'll put a normal Hoopa from your party on your shoulder."
-                        : "Auto-Hoopa OFF.");
                     return 1;
                 }))
                 .then(ClientCommandManager.literal("home")
@@ -626,8 +602,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     })))
                 .then(ClientCommandManager.literal("status").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
-                    say(c, "packet watcher: " + spyInstalled + " | recording: " + recording + " | listening: " + listening
-                        + " | auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
+                    say(c, "auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
                         + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
                         + " | home: /" + homeCommand() + " | server: " + lastServerName);
@@ -1803,7 +1778,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (found < 0) {
             if (chestAttempts++ % 10 == 0) {
                 autoLog("CHEST no chestplate found in the inventory");
-                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory! (Run /radiantalert items to see what you carry.)");
+                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
             }
             return;
         }
@@ -3908,7 +3883,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         if (slot < 0) {
             shoulderResult = SR_NOT_IN_PARTY;
-            if (manual) say(client, "No " + (normalOnly ? "normal " : "") + label + " in your party (run /radiantalert party to see what it found).");
+            if (manual) say(client, "No " + (normalOnly ? "normal " : "") + label + " in your party.");
             return false;
         }
         if (!returnToWormhole) hoopaCooldownUntil = System.currentTimeMillis() + 60000;

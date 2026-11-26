@@ -22,12 +22,17 @@ import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.screen.DeathScreen;
+import net.minecraft.client.gui.screen.DisconnectedScreen;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.network.ServerAddress;
+import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
@@ -79,7 +84,7 @@ import java.util.stream.Stream;
  * Radiant Alert: tells you about radiants, shinies, Lunala/Solgaleo and Ultra Wormholes, and can
  * go and deal with them for you.
  *
- *  /radiantalert ultraspace   switch on everything below that runs by itself (auto, wormhole, autoclean, autohoopa)
+ *  /radiantalert ultraspace   switch on everything below that runs by itself (auto, wormhole, autoclean, autohoopa, rejoin)
  *  /radiantalert stop         switch everything off and cancel what it is doing
  *
  *  /radiantalert auto         walk to radiants and shinies, throw balls, wait for each result, then go home
@@ -87,6 +92,7 @@ import java.util.stream.Stream;
  *  /radiantalert wormhole     walk into wormholes, handle the encounter, catch the Ultra Beast at the end, go home
  *  /radiantalert autoclean    drop the junk at the deposit spot when about 5 slots are free
  *  /radiantalert autohoopa    put a normal Hoopa on your shoulder after arriving on an Ultra Wild server
+ *  /radiantalert rejoin       if the server closes on you (nightly restart) keep trying to join again, then go home
  *
  *  /radiantalert clean        go to the deposit spot and drop the junk, right now
  *  /radiantalert hoopa        put a normal Hoopa on your shoulder right now
@@ -214,7 +220,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final double WORMHOLE_JUMP_DISTANCE = 1.3;
     private static final double WORMHOLE_MAX_DISTANCE = 150;
     private static final int WORMHOLE_WALK_TIMEOUT_TICKS = 20 * 90;
-    private static final int WORMHOLE_PUSH_TICKS = 100;
+    private static final int WORMHOLE_PUSH_TICKS = 400;   // 20 s: a wormhole that is still opening can take a while
     /** Wait after a teleport before acting, so the new world has loaded. */
     private static final int AFTER_TELEPORT_WAIT_TICKS = 60;
     /** Give up waiting for the second teleport after this long. */
@@ -448,6 +454,14 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
     private int noPokemonTicks = 0;
     private long pendingRecallAtMs = 0, pendingHomeAtMs = 0;
+    private boolean autoRejoinEnabled = false;
+    private boolean wasInGame = false;
+    private int rejoinAttempts = 0;
+    private long nextRejoinAt = 0, rejoinHomeAtMs = 0;
+    private String lastServerAddress = "play.cobblemondelta.com";
+    private static final long REJOIN_FIRST_DELAY_MS = 20000, REJOIN_INTERVAL_MS = 60000, REJOIN_HOME_DELAY_MS = 10000;
+    private Vec3d pendingWormhole = null;   // a wormhole we want to go to as soon as nothing important is going on
+    private long pendingWormholeAt = 0;
     private int recallSlot = -1;
     private boolean noHomeOnStop = false;
     private int ownHitTicks = 0, strafeTicks = 0;
@@ -555,6 +569,15 @@ public class RadiantAlertClient implements ClientModInitializer {
                         : "Auto-Hoopa OFF.");
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("rejoin").executes(ctx -> {
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    autoRejoinEnabled = !autoRejoinEnabled;
+                    say(c, autoRejoinEnabled
+                        ? "Auto-rejoin ON: if the server closes on you (the nightly restart) I'll try to join " + lastServerAddress
+                            + " again - after 20 s, then once a minute - and go home when I'm back in."
+                        : "Auto-rejoin OFF.");
+                    return 1;
+                }))
                 .then(ClientCommandManager.literal("ultraspace").executes(ctx -> {
                     // everything for the Ultra Space area in one go
                     MinecraftClient c = MinecraftClient.getInstance();
@@ -562,8 +585,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoWormholeEnabled = true;
                     autoCleanEnabled = true;
                     autoHoopaEnabled = true;
+                    autoRejoinEnabled = true;
                     hoopaDueAt = System.currentTimeMillis() + 2000;
-                    say(c, "Ultra Space mode ON: auto-catch, auto-wormhole, auto-clean and auto-Hoopa are all running. "
+                    say(c, "Ultra Space mode ON: auto-catch, auto-wormhole, auto-clean, auto-Hoopa and auto-rejoin are all running. "
                         + "Stop everything with /radiantalert stop.");
                     return 1;
                 }))
@@ -573,6 +597,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoWormholeEnabled = false;
                     autoCleanEnabled = false;
                     autoHoopaEnabled = false;
+                    autoRejoinEnabled = false;
+                    pendingWormhole = null;
                     ubCatch = false;
                     hoopaReturn = false;
                     noHomeOnStop = true;
@@ -604,6 +630,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     MinecraftClient c = MinecraftClient.getInstance();
                     say(c, "auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
                         + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
+                        + " | auto-rejoin: " + autoRejoinEnabled
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
                         + " | home: /" + homeCommand() + " | server: " + lastServerName);
                     return 1;
@@ -640,7 +667,14 @@ public class RadiantAlertClient implements ClientModInitializer {
             KeyBinding.setKeyPressed(InputUtil.fromTranslationKey(SEND_OUT_KEY), false);
         }
 
+        rejoinTick(client);
+
         if (client.player == null || client.world == null) { pending.clear(); return; }
+
+        if (pendingWormhole != null) {
+            if (!autoWormholeEnabled) pendingWormhole = null;
+            else if (client.currentScreen == null) startPendingWormhole(client);
+        }
 
         if (++idleCheckTicks >= 20) {
             idleCheckTicks = 0;
@@ -1048,17 +1082,40 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (Math.sqrt(dx * dx + dy * dy + dz * dz) < DEDUPE_RADIUS) {
                 // same wormhole still sending effects: refresh its timer, don't alert again
                 wormholesSeen.set(i, new Seen(s.x(), s.y(), s.z(), now));
+                if (pendingWormhole != null) pendingWormholeAt = now;   // still open
                 return;
             }
         }
         wormholesSeen.add(new Seen(p[0], p[1], p[2], now));
         announceWormhole(client, p[0], p[1], p[2], describe(info));
 
-        if (autoWormholeEnabled && canStartTask()) {
+        if (autoWormholeEnabled) {
             retryAttempts = 0;
             wormholeDetectedAt = now;
-            startWormhole(client, new Vec3d(p[0], p[1], p[2]));
+            pendingWormhole = new Vec3d(p[0], p[1], p[2]);
+            pendingWormholeAt = now;
+            startPendingWormhole(client);
+            if (pendingWormhole != null) autoLog("WORMHOLE queued - busy right now (task=" + task + ")");
         }
+    }
+
+    /** Starts the wormhole we are waiting to go to as soon as nothing important is going on. */
+    private void startPendingWormhole(MinecraftClient client) {
+        if (pendingWormhole == null || client.player == null) return;
+        long now = System.currentTimeMillis();
+        if (now - pendingWormholeAt > 25000) {            // no sign of life for a while: it has closed
+            autoLog("WORMHOLE closed before I could start");
+            pendingWormhole = null;
+            return;
+        }
+        if (task == Task.CLEAN || task == Task.HOOPA) {   // those can wait, a wormhole can't
+            autoLog("WORMHOLE takes over from " + task);
+            abortCurrent(client, "A wormhole opened - leaving that for later.");
+        }
+        if (!canStartTask()) return;
+        Vec3d pos = pendingWormhole;
+        pendingWormhole = null;
+        startWormhole(client, pos);
     }
 
     /** Short label for the alert: the matching effect name, e.g. "us_portal_rift_red". */
@@ -1620,7 +1677,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                     stopWormhole(client, "Reached the wormhole but wasn't teleported.");
                     return;
                 }
-                // walk toward the centre and jump exactly once when we're right at it
+                // walk toward the centre and jump when we're right at it; if nothing happens (it may still be opening) jump again every 2 s
+                if (wormholeJumped && wTicks % 40 == 0) wormholeJumped = false;
                 double hd = Math.hypot(player.getX() - wormholePos.x, player.getZ() - wormholePos.z);
                 float yaw = (float) Math.toDegrees(Math.atan2(wormholePos.z - player.getZ(), wormholePos.x - player.getX())) - 90.0f;
                 player.setYaw(MathHelper.lerpAngleDegrees(0.5f, player.getYaw(), yaw));
@@ -2822,6 +2880,19 @@ public class RadiantAlertClient implements ClientModInitializer {
             Pokemon wanted = slot >= 0 && slot < party.size() ? party.get(slot) : null;
             if (wanted == null) return false;
             String species = wanted.getSpecies().getName().toLowerCase(Locale.ROOT);
+            String nick = wanted.getNickname() != null ? wanted.getNickname().getString().toLowerCase(Locale.ROOT) : "";
+
+            // 0) a button on the screen whose text is the Pokémon's name
+            for (var child : screen.children()) {
+                if (!(child instanceof net.minecraft.client.gui.widget.ClickableWidget cw)) continue;
+                String text = cw.getMessage().getString().toLowerCase(Locale.ROOT);
+                if (text.isEmpty()) continue;
+                if (text.contains(species) || (!nick.isEmpty() && text.contains(nick))) {
+                    autoLog("REVIVE button with text '" + text + "'");
+                    if (pressMenuEntry(screen, cw)) return true;
+                }
+            }
+
             List<Object> objects = reachableObjects(screen, 5);
 
             // 1) the menu entry that holds this very Pokémon
@@ -2844,6 +2915,27 @@ public class RadiantAlertClient implements ClientModInitializer {
                 autoLog("REVIVE entry with slot number " + slot + ": " + o.getClass().getName());
                 if (pressMenuEntry(screen, o)) return true;
             }
+            // 4) a row of clickable things of the same kind - one per Pokémon (or one per fainted Pokémon): take the one in our slot's place
+            Map<Class<?>, List<Object>> groups = new LinkedHashMap<>();
+            for (Object o : objects) {
+                if (o == screen || centerOf(o) == null) continue;
+                groups.computeIfAbsent(o.getClass(), k -> new ArrayList<>()).add(o);
+            }
+            List<Integer> faintedSlots = new ArrayList<>();
+            for (int i = 0; i < party.size(); i++) {
+                if (party.get(i) != null && party.get(i).getCurrentHealth() <= 0) faintedSlots.add(i);
+            }
+            StringBuilder seen = new StringBuilder();
+            for (Map.Entry<Class<?>, List<Object>> e : groups.entrySet()) {
+                List<Object> g = e.getValue();
+                seen.append(e.getKey().getSimpleName()).append('x').append(g.size()).append(' ');
+                if (g.size() < 2) continue;
+                int idx = g.size() == party.size() ? slot : g.size() == faintedSlots.size() ? faintedSlots.indexOf(slot) : -1;
+                if (idx < 0 || idx >= g.size()) continue;
+                autoLog("REVIVE group " + e.getKey().getName() + " x" + g.size() + ": taking entry " + (idx + 1));
+                if (pressMenuEntry(screen, g.get(idx))) return true;
+            }
+            autoLog("REVIVE nothing matched. Clickable things on the screen: " + seen);
         } catch (Throwable t) {
             autoLog("REVIVE click failed: " + t);
         }
@@ -2902,15 +2994,44 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** The middle of a widget on screen (via its x / y / width / height getters), or null. */
     private static double[] centerOf(Object widget) {
+        // a normal widget: ask it directly (looking up "getX" by name does not work on Minecraft's own classes in the real game)
+        if (widget instanceof net.minecraft.client.gui.widget.ClickableWidget cw) {
+            return new double[]{cw.getX() + cw.getWidth() / 2.0, cw.getY() + cw.getHeight() / 2.0};
+        }
         try {
             double x = ((Number) invoke(widget, "getX")).doubleValue();
             double y = ((Number) invoke(widget, "getY")).doubleValue();
             double w = ((Number) invoke(widget, "getWidth")).doubleValue();
             double h = ((Number) invoke(widget, "getHeight")).doubleValue();
             return new double[]{x + w / 2.0, y + h / 2.0};
-        } catch (Throwable t) {
-            return null;
+        } catch (Throwable ignored) {
+            // fall through
         }
+        // a mod's own object with plain x / y / width / height fields
+        double x = numberField(widget, "x");
+        double y = numberField(widget, "y");
+        double w = numberField(widget, "width");
+        double h = numberField(widget, "height");
+        if (Double.isNaN(x) || Double.isNaN(y) || Double.isNaN(w) || Double.isNaN(h) || w <= 0 || h <= 0) return null;
+        return new double[]{x + w / 2.0, y + h / 2.0};
+    }
+
+    /** A number stored in a field with this name (searching the class and its parents), or NaN. */
+    private static double numberField(Object o, String name) {
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            try {
+                Field f = k.getDeclaredField(name);
+                if (Modifier.isStatic(f.getModifiers())) return Double.NaN;
+                f.setAccessible(true);
+                Object v = f.get(o);
+                return v instanceof Number n ? n.doubleValue() : Double.NaN;
+            } catch (NoSuchFieldException e) {
+                // try the parent
+            } catch (Throwable t) {
+                return Double.NaN;
+            }
+        }
+        return Double.NaN;
     }
 
     // ============================== Alphas, Paradoxes and clean-ups ==============================
@@ -3219,6 +3340,71 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         autoLog("UB CHECK +" + (wTicks / 20) + "s dim=" + client.world.getRegistryKey().getValue()
             + " wild Pokémon nearby: " + found);
+    }
+
+    // ============================== Rejoining after a restart ==============================
+
+    /**
+     * When the server closes on us (the nightly restart) the game shows a "disconnected" screen. While that screen is
+     * up and auto-rejoin is on, try to join the same server again: first after 20 s, then once a minute until it works.
+     * Once in, go home a few seconds later. Leaving on purpose (title screen, Disconnect button) is left alone.
+     */
+    private void rejoinTick(MinecraftClient client) {
+        long now = System.currentTimeMillis();
+        if (client.world != null && client.player != null) {
+            ServerInfo info = client.getCurrentServerEntry();
+            if (info != null && info.address != null && !info.address.isBlank()) lastServerAddress = info.address;
+            if (!wasInGame) {
+                wasInGame = true;
+                if (rejoinAttempts > 0) {                      // this is the rejoin working
+                    autoLog("REJOIN back in the game after " + rejoinAttempts + " attempt(s)");
+                    say(client, "Rejoined the server - going home in a few seconds.");
+                    rejoinHomeAtMs = now + REJOIN_HOME_DELAY_MS;
+                    homeCooldownUntil = rejoinHomeAtMs + 15000;   // nothing else starts meanwhile
+                    rejoinAttempts = 0;
+                }
+            }
+            if (rejoinHomeAtMs != 0 && now >= rejoinHomeAtMs && client.currentScreen == null) {
+                rejoinHomeAtMs = 0;
+                sendHome(client);
+            }
+            return;
+        }
+
+        if (!(client.currentScreen instanceof DisconnectedScreen)) return;   // not kicked: a normal load, or you left on purpose
+
+        if (wasInGame) {                                   // we have just been thrown out
+            wasInGame = false;
+            nextRejoinAt = now + REJOIN_FIRST_DELAY_MS;
+            rejoinHomeAtMs = 0;
+            pendingWormhole = null;
+            pendingRecallAtMs = 0;
+            pendingHomeAtMs = 0;
+            try {
+                noHomeOnStop = true;
+                abortCurrent(client, "Disconnected.");
+            } catch (Throwable t) {
+                task = Task.IDLE;
+            }
+            noHomeOnStop = false;
+            ubCatch = false;
+            killMode = false;
+            battleFirst = false;
+            battleStarted = false;
+            autoLog("REJOIN disconnected from " + lastServerAddress + (autoRejoinEnabled ? " - will try to rejoin" : " (auto-rejoin is off)"));
+        }
+        if (!autoRejoinEnabled || now < nextRejoinAt) return;
+
+        nextRejoinAt = now + REJOIN_INTERVAL_MS;
+        rejoinAttempts++;
+        autoLog("REJOIN attempt " + rejoinAttempts + " to " + lastServerAddress);
+        try {
+            ServerAddress address = ServerAddress.parse(lastServerAddress);
+            ServerInfo info = new ServerInfo("Cobblemon Delta", lastServerAddress, ServerInfo.ServerType.OTHER);
+            ConnectScreen.connect(new TitleScreen(), client, address, info, false, null);
+        } catch (Throwable t) {
+            autoLog("REJOIN could not start: " + t);
+        }
     }
 
     // ============================== Which home ==============================

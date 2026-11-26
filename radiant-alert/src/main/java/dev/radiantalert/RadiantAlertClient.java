@@ -87,6 +87,9 @@ import java.util.stream.Stream;
  *  /radiantalert ultraspace   switch on everything below that runs by itself (auto, wormhole, autoclean, autohoopa, rejoin)
  *  /radiantalert stop         switch everything off and cancel what it is doing
  *
+ *  While any of the automatic features is on, a battle you didn't ask for (even while just waiting for a wormhole)
+ *  gets Esc for the battle screen and then /endbattle.
+ *
  *  /radiantalert auto         walk to radiants and shinies, throw balls, wait for each result, then go home
  *                             (Alphas / Paradoxes are hit until the battle starts; Esc out of the battle menu, then balls)
  *  /radiantalert wormhole     walk into wormholes, handle the encounter, catch the Ultra Beast at the end, go home
@@ -817,7 +820,11 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void autoTickInner(MinecraftClient client) {
-        if (task == Task.IDLE) { releaseKeys(client); return; }
+        if (task == Task.IDLE) {
+            releaseKeys(client);
+            idleBattleWatch(client);   // even while just waiting (e.g. for a wormhole): a battle we didn't ask for gets Esc, then /endbattle
+            return;
+        }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); return; }
         if (client.currentScreen != null) {
@@ -3207,6 +3214,27 @@ public class RadiantAlertClient implements ClientModInitializer {
     private long lastBattleCheck = 0;
 
     /** Already in a battle when we need to walk somewhere: end it with /endbattle (at most once every 4 seconds). */
+    /**
+     * Nothing is going on (for example waiting for a wormhole), but if a battle starts anyway - something attacked us,
+     * or a Pokémon was bumped - get out of it: Esc for the battle screen, then /endbattle. Only while an automatic
+     * feature is switched on, so a battle you start yourself with everything off is left alone.
+     */
+    private void idleBattleWatch(MinecraftClient client) {
+        if (!(autoCatchEnabled || autoWormholeEnabled || autoCleanEnabled || autoHoopaEnabled)) return;
+        if (client.player == null || client.world == null) return;
+        Screen screen = client.currentScreen;
+        if (screen != null) {
+            String cls = screen.getClass().getName();
+            if (cls.startsWith("com.cobblemon") && cls.toLowerCase(Locale.ROOT).contains("battle")) {
+                unblockScreen(client);          // Esc after 3 ticks, /endbattle after 10 (at most every 4 s)
+            }
+            return;
+        }
+        lastUnblockClass = "";
+        screenOpenTicks = 0;
+        endBattleIfNeeded(client);              // no screen, but a battle is still on: /endbattle (checked twice a second)
+    }
+
     private void endBattleIfNeeded(MinecraftClient client) {
         long now = System.currentTimeMillis();
         if (now - lastBattleCheck < 500 || client.player == null) return;

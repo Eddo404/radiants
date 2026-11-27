@@ -6,6 +6,7 @@ import com.google.common.collect.Multimap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
@@ -84,7 +85,10 @@ import java.util.stream.Stream;
  * Radiant Alert: tells you about radiants, shinies, Lunala/Solgaleo and Ultra Wormholes, and can
  * go and deal with them for you.
  *
- *  /radiantalert ultraspace   switch on everything below that runs by itself (auto, wormhole, autoclean, autohoopa, rejoin)
+ *  /radiantalert ultraspace   switch on everything that runs by itself: auto-catch, wormholes, auto-clean, auto-Hoopa and rejoin
+ *  /radiantalert areazero     auto-catch and auto-clean; after a catch you stay in the same spot (no home teleport),
+ *                             after a clean-up you warp back with /warp center<N>
+ *  /radiantalert center <1-6> which centre Area Zero warps back to (starts as 4, so /warp center4)
  *  /radiantalert stop         switch everything off and cancel what it is doing
  *
  *  While any of the automatic features is on, a battle you didn't ask for (even while just waiting for a wormhole)
@@ -92,13 +96,8 @@ import java.util.stream.Stream;
  *
  *  /radiantalert auto         walk to radiants and shinies, throw balls, wait for each result, then go home
  *                             (Alphas / Paradoxes are hit until the battle starts; Esc out of the battle menu, then balls)
- *  /radiantalert wormhole     walk into wormholes, handle the encounter, catch the Ultra Beast at the end, go home
- *  /radiantalert autoclean    drop the junk at the deposit spot when about 5 slots are free
- *  /radiantalert autohoopa    put a normal Hoopa on your shoulder after arriving on an Ultra Wild server
  *  /radiantalert rejoin       if the server closes on you (nightly restart) keep trying to join again, then go home
  *
- *  /radiantalert clean        go to the deposit spot and drop the junk, right now
- *  /radiantalert hoopa        put a normal Hoopa on your shoulder right now
  *  /radiantalert home <name>  which home the automatic trips use (e.g. guzzlord for /home guzzlord; starts as us)
  *  /radiantalert status       what is switched on and what it is doing
  */
@@ -244,7 +243,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 15;
     private static final double ULTRA_BEAST_SEARCH_RADIUS = 128;
 
-    // --- Inventory clean-up (/radiantalert autoclean) ---
+    // --- Inventory clean-up (auto-clean, or /radiantalert clean) ---
     /** Command that takes you to the drop-off spot. No slash. */
     private static final String DEPOSIT_COMMAND = "home deposit";
     /** Clean up when this many inventory slots (or fewer) are free. */
@@ -315,7 +314,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Never dropped, even though they look like a pattern above. */
     private static final Set<String> JUNK_NAME_EXCEPTIONS = Set.of("eviolite", "ender pearl");
 
-    // --- Hoopa on your shoulder (/radiantalert autohoopa) ---
+    // --- Hoopa on your shoulder (auto-Hoopa, or /radiantalert hoopa) ---
     private static final String HOOPA_SPECIES = "hoopa";
     /** Terapagos goes on the shoulder only while you are inside a wormhole (right after the first teleport). */
     private static final String TERAPAGOS_SPECIES = "terapagos";
@@ -458,6 +457,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int noPokemonTicks = 0;
     private long pendingRecallAtMs = 0, pendingHomeAtMs = 0;
     private boolean autoRejoinEnabled = false;
+    private boolean areaZeroMode = false;   // auto-catch only; after a catch (or any end) stay where you are - no home teleport
     private boolean wasInGame = false;
     private int rejoinAttempts = 0;
     private long nextRejoinAt = 0, rejoinHomeAtMs = 0;
@@ -517,6 +517,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         loadHomeName();
+        loadCenterNumber();
 
         ClientEntityEvents.ENTITY_LOAD.register((entity, world) -> onEntityLoad(entity));
 
@@ -540,36 +541,11 @@ public class RadiantAlertClient implements ClientModInitializer {
             dispatcher.register(ClientCommandManager.literal("radiantalert")
                 .then(ClientCommandManager.literal("auto").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
+                    areaZeroMode = false;
                     autoCatchEnabled = !autoCatchEnabled;
                     say(c, autoCatchEnabled
                         ? "Auto-catch ON: I'll walk to radiants and shinies, throw balls, and send /" + homeCommand() + " once caught. Cancel with /radiantalert stop."
                         : "Auto-catch OFF.");
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("wormhole").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoWormholeEnabled = !autoWormholeEnabled;
-                    say(c, autoWormholeEnabled
-                        ? "Auto-wormhole ON: I'll walk into wormholes that open near you. Cancel with /radiantalert stop."
-                        : "Auto-wormhole OFF.");
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("autoclean").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoCleanEnabled = !autoCleanEnabled;
-                    say(c, autoCleanEnabled
-                        ? "Auto-clean ON: when " + INVENTORY_FREE_THRESHOLD + " or fewer slots are free I'll go to /" + DEPOSIT_COMMAND
-                            + " and drop the junk. (/radiantalert clean does it right now.)"
-                        : "Auto-clean OFF.");
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("autohoopa").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoHoopaEnabled = !autoHoopaEnabled;
-                    if (autoHoopaEnabled) hoopaDueAt = System.currentTimeMillis() + 2000;
-                    say(c, autoHoopaEnabled
-                        ? "Auto-Hoopa ON: after you arrive on an Ultra Wild server (ultrawild1/2) I'll put a normal Hoopa from your party on your shoulder."
-                        : "Auto-Hoopa OFF.");
                     return 1;
                 }))
                 .then(ClientCommandManager.literal("rejoin").executes(ctx -> {
@@ -581,9 +557,31 @@ public class RadiantAlertClient implements ClientModInitializer {
                         : "Auto-rejoin OFF.");
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("center")
+                    .executes(ctx -> {
+                        say(MinecraftClient.getInstance(), "Area Zero warps back with /" + warpCommand()
+                            + " after a clean-up. Change it with /radiantalert center <1-6>.");
+                        return 1;
+                    })
+                    .then(ClientCommandManager.argument("number", IntegerArgumentType.integer(1, 6)).executes(ctx -> {
+                        setCenterNumber(MinecraftClient.getInstance(), IntegerArgumentType.getInteger(ctx, "number"));
+                        return 1;
+                    })))
+                .then(ClientCommandManager.literal("areazero").executes(ctx -> {
+                    // catching only, and after a catch stay exactly where you are
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    resetAllFeatures(c, "Switching to Area Zero.");   // whatever was running (e.g. Ultra Space mode) is stopped first
+                    areaZeroMode = true;
+                    autoCatchEnabled = true;
+                    autoCleanEnabled = true;
+                    say(c, "Area Zero mode ON (everything else is off): auto-catch and auto-clean. After a catch I stay where I am (no home teleport); "
+                        + "after a clean-up I warp back with /" + warpCommand() + ". Stop with /radiantalert stop.");
+                    return 1;
+                }))
                 .then(ClientCommandManager.literal("ultraspace").executes(ctx -> {
                     // everything for the Ultra Space area in one go
                     MinecraftClient c = MinecraftClient.getInstance();
+                    resetAllFeatures(c, "Switching to Ultra Space.");  // whatever was running (e.g. Area Zero mode) is stopped first
                     autoCatchEnabled = true;
                     autoWormholeEnabled = true;
                     autoCleanEnabled = true;
@@ -596,27 +594,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }))
                 .then(ClientCommandManager.literal("stop").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
-                    autoCatchEnabled = false;
-                    autoWormholeEnabled = false;
-                    autoCleanEnabled = false;
-                    autoHoopaEnabled = false;
-                    autoRejoinEnabled = false;
-                    pendingWormhole = null;
-                    ubCatch = false;
-                    hoopaReturn = false;
-                    noHomeOnStop = true;
-                    abortCurrent(c, "Stopped.");
-                    noHomeOnStop = false;
+                    resetAllFeatures(c, "Stopped.");
                     say(c, "All automatic features are OFF.");
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("clean").executes(ctx -> {
-                    // go to the deposit spot and drop the junk, right now
-                    startClean(MinecraftClient.getInstance(), false);
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("hoopa").executes(ctx -> {
-                    startHoopa(MinecraftClient.getInstance(), true);
                     return 1;
                 }))
                 .then(ClientCommandManager.literal("home")
@@ -633,7 +612,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     MinecraftClient c = MinecraftClient.getInstance();
                     say(c, "auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
                         + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
-                        + " | auto-rejoin: " + autoRejoinEnabled
+                        + " | auto-rejoin: " + autoRejoinEnabled + " | area zero: " + areaZeroMode + " (/" + warpCommand() + ")"
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
                         + " | home: /" + homeCommand() + " | server: " + lastServerName);
                     return 1;
@@ -1263,6 +1242,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (client.player == null) return;
         restoreSwaps(client);
         long now = System.currentTimeMillis();
+        if (areaZeroMode) {                      // Area Zero: stay in the same spot
+            autoLog("HOME skipped - area zero, staying here");
+            return;
+        }
         if (now - lastHomeSentAt < 5000) return; // already sent a moment ago
         lastHomeSentAt = now;
         homeCooldownUntil = now + HOME_COOLDOWN_MS;
@@ -1590,7 +1573,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             recallSlot = outSlot;
             pendingRecallAtMs = now + 300;    // look at the ground first, then press R
             pendingHomeAtMs = now + 1800;
-            homeCooldownUntil = now + 20000;  // nothing else starts meanwhile
+            homeCooldownUntil = areaZeroMode ? now + 3000 : now + 20000;  // nothing else starts meanwhile
             client.player.setPitch(85.0f);
             autoLog("RECALL will bring back party slot " + (outSlot + 1) + " before going home");
             say(client, "Recalling your Pokémon before going home.");
@@ -3435,6 +3418,89 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    // ============================== Switching modes ==============================
+
+    /**
+     * A clean slate: every automatic feature off and whatever is going on cancelled (without any trip home).
+     * /radiantalert stop uses it, and so do areazero and ultraspace before they switch on their own set - so
+     * running one while the other is active replaces it completely.
+     */
+    private void resetAllFeatures(MinecraftClient c, String why) {
+        areaZeroMode = false;
+        autoCatchEnabled = false;
+        autoWormholeEnabled = false;
+        autoCleanEnabled = false;
+        autoHoopaEnabled = false;
+        autoRejoinEnabled = false;
+        pendingWormhole = null;
+        hoopaDueAt = 0;
+        retryKind = RetryKind.NONE;
+        retryAt = 0;
+        retryAttempts = 0;
+        pendingRecallAtMs = 0;
+        pendingHomeAtMs = 0;
+        rejoinHomeAtMs = 0;
+        ubCatch = false;
+        hoopaReturn = false;
+        noHomeOnStop = true;
+        try {
+            abortCurrent(c, why);
+        } finally {
+            noHomeOnStop = false;
+        }
+        if (c.player != null) restoreSwaps(c);
+        autoLog("MODE reset: " + why);
+    }
+
+    // ============================== Area Zero centre ==============================
+
+    private int centerNumber = 4;                       // /warp center4 unless changed with /radiantalert center <1-6>
+
+    private String warpCommand() {
+        return "warp center" + centerNumber;
+    }
+
+    private static Path centerFile() {
+        return FabricLoader.getInstance().getConfigDir().resolve("radiantalert-center.txt");
+    }
+
+    private void loadCenterNumber() {
+        try {
+            Path file = centerFile();
+            if (Files.exists(file)) {
+                int n = Integer.parseInt(Files.readString(file).trim());
+                if (n >= 1 && n <= 6) centerNumber = n;
+            }
+        } catch (Throwable t) {
+            LOG.warn("RadiantAlert: could not read the saved centre number", t);
+        }
+    }
+
+    /** /radiantalert center <1-6>: which centre Area Zero warps back to after a clean-up. Remembered. */
+    private void setCenterNumber(MinecraftClient client, int n) {
+        centerNumber = n;
+        try {
+            Files.writeString(centerFile(), Integer.toString(n));
+        } catch (IOException e) {
+            LOG.warn("RadiantAlert: could not save the centre number", e);
+        }
+        autoLog("CENTER set to " + n);
+        say(client, "Area Zero will warp back with /" + warpCommand() + " after a clean-up.");
+    }
+
+    /** Area Zero: after the clean-up, go back to the centre warp. */
+    private void sendWarpCenter(MinecraftClient client) {
+        if (client.player == null) return;
+        restoreSwaps(client);
+        long now = System.currentTimeMillis();
+        if (now - lastHomeSentAt < 5000) return;        // already sent a moment ago
+        lastHomeSentAt = now;
+        homeCooldownUntil = now + HOME_COOLDOWN_MS;
+        client.player.networkHandler.sendChatCommand(warpCommand());
+        autoLog("SENT /" + warpCommand());
+        say(client, "Sent /" + warpCommand());
+    }
+
     // ============================== Which home ==============================
 
     private String homeName = DEFAULT_HOME_NAME;
@@ -4034,7 +4100,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         int n = dropsDone;
         cleanCooldownUntil = System.currentTimeMillis() + CLEAN_COOLDOWN_MS;
         stopClean(client, "Dropped " + n + " item action(s).");
-        if (RETURN_HOME_AFTER_CLEAN) sendHome(client);
+        if (areaZeroMode) sendWarpCenter(client);      // Area Zero: back to the centre warp, not home
+        else if (RETURN_HOME_AFTER_CLEAN) sendHome(client);
     }
 
     private void stopClean(MinecraftClient client, String message) {

@@ -94,9 +94,8 @@ import java.util.stream.Stream;
  *  /radiantalert areazero     auto-catch and auto-clean; after a catch you stay in the same spot (no home teleport),
  *                             after a clean-up you warp back with /warp center<N>
  *  /radiantalert center <1-6> which centre Area Zero warps back to (starts as 4, so /warp center4)
- *  /radiantalert scan         Area Zero dowsing spots: matches the "getting closer" bar against the known (fixed) spots, works out
- *                             new ones, uses the exact spot once the particle shows, keeps pointing at it above the hotbar;
- *                             log in radiantalert-scan.txt, spots in radiantalert-spots.txt; run again to stop
+ *  /radiantalert scan         Area Zero dowsing: shows the bar as warmer / colder and points at the actual spawn spot (the
+ *                             dowsing particle's exact coordinates, sent within about 20 blocks); log in radiantalert-scan.txt
  *  /radiantalert stop         switch everything off and cancel what it is doing
  *
  *  While any of the automatic features is on, a battle you didn't ask for (even while just waiting for a wormhole)
@@ -3467,59 +3466,43 @@ public class RadiantAlertClient implements ClientModInitializer {
         autoLog("MODE reset: " + why);
     }
 
-    // ============================== Scan (Area Zero dowsing spots) ==============================
+    // ============================== Scan (Area Zero dowsing spawn spot) ==============================
     //
     // What the scans showed:
-    //  - The spots are FIXED places (always whole-number coordinates, e.g. 94 7 1134 and 391 2 1383). The same spot came back
-    //    in four different bars minutes apart.
-    //  - The "getting closer" bar is a boss bar that appears when you come within about 98 blocks of a spot and goes away
-    //    when you leave that range again (or reach the spot). Its progress steps 0.1, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0 as you
-    //    get closer (the name goes "!", "!!", "!!!" and the colour red, yellow, green).
-    //  - The cobblemon:dowsing particle (the exact spot) is only sent within about 20 blocks.
-    // So: a list of known spots is kept (the ones seen so far are built in; every new one is added to radiantalert-spots.txt),
-    // each bar reading is checked against that list, and for a spot that is not on the list yet it is worked out from the
-    // distance rings the readings give. The contents of Delta's own packets are also written to the log, to find out whether
-    // the server sends the coordinates somewhere (a map marker, for example).
+    //  - A dowsing spawn spot is a ONE-TIME random spot: once you reach it (the bar goes away and you are paid out) it is gone and
+    //    the next one is somewhere else. So nothing about a spot is remembered.
+    //  - The server only sends the spot's coordinates inside the cobblemon:dowsing particle packet, and only when you are within
+    //    about 20 blocks. A search of every packet and every entity found them nowhere else.
+    //  - Before that the only information is the "getting closer" boss bar (appears within about 98 blocks of the spot; progress
+    //    0.1, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0 as you get closer).
+    // So the pointer aims at the actual spawn spot (the particle position) and nothing else. The bar is shown as warmer / colder.
+    // A rough position worked out from the bar is still computed, but only for the log (to measure how good it is against the
+    // real spawn spot); set SCAN_POINT_AT_BAR_ESTIMATE to true to point at it as well.
 
     private volatile boolean scanning = false;
     private static final String SCAN_FILE = "radiantalert-scan.txt";
-    private static final String SPOTS_FILE = "radiantalert-spots.txt";
     private static final int SCAN_MAX_LINES = 5000;
-    private static final double[][] SCAN_SEED_SPOTS = {{94, 7, 1134}, {391, 2, 1383}};
-    /** {bar progress, nearest, farthest distance in blocks}, measured in Area Zero at two different spots. */
+    private static final boolean SCAN_POINT_AT_BAR_ESTIMATE = false;
+    /** {bar progress, nearest, farthest distance in blocks}: measured against the real spawn spots of three different spots. */
     private static final double[][] SCAN_BANDS = {
-        {0.1, 76, 100}, {0.3, 66, 76}, {0.4, 55, 66}, {0.5, 47.5, 55}, {0.6, 36.4, 47.5}, {0.7, 17, 36.4}, {0.8, 3.5, 17}, {1.0, 0, 3.5}};
-    private long scanStart = 0, scanLastSnapAt = 0, scanFoundAt = 0, scanTrendAt = 0, scanLastEstimateAt = 0, scanLastDowsingLogAt = 0;
+        {0.1, 76, 100}, {0.3, 66, 79}, {0.4, 55, 67}, {0.5, 47.5, 57}, {0.6, 36.4, 48.5}, {0.7, 17, 36.4}, {0.8, 3.5, 17.5}, {1.0, 0, 3.5}};
+    private long scanStart = 0, scanLastSnapAt = 0, scanFoundAt = 0, scanTrendAt = 0, scanLastEstimateAt = 0, scanLastDowsingLogAt = 0, scanExactSeenAt = 0;
     private int scanLines = 0;
     private final Map<String, Long> scanLastLogged = new HashMap<>();      // main thread only
     private final Map<String, int[]> scanCounts = new LinkedHashMap<>();   // main thread only
     private final Map<String, ScanBar> scanBars = new HashMap<>();         // main thread only
     private final List<double[]> scanSamples = new ArrayList<>();          // {x, z, bar progress, 1 = "just appeared / just went away"}
-    private final List<double[]> scanSpots = new ArrayList<>();            // known spots {x, y, z}
-    private final Deque<String[]> scanRecent = new ArrayDeque<>();         // {time, id, text} of recent Delta packets
-    private final Map<String, String> scanDumpLast = new HashMap<>();
-    private final Map<String, Integer> scanDumpCount = new HashMap<>();
-    private volatile double[][] scanSpotSnapshot = new double[0][];        // copy of the known spots for the network thread
-    private final Set<String> scanHitKinds = new LinkedHashSet<>();        // packets / entities that carried a known spot's coordinates
-    private final Set<String> scanEntityTypes = new HashSet<>();           // entity types already reported
-    private final Map<Integer, Long> scanEntityLogged = new HashMap<>();
-    private int scanHitLines = 0;
-    private long scanLastEntityScanAt = 0;
-    private Vec3d scanExact = null;                                        // the exact spot, from the dowsing particle
-    private Vec3d scanEstimate = null;                                     // a known spot that fits the bar, or a spot worked out from it
-    private boolean scanEstimateKnown = false;
+    private Vec3d scanExact = null;                                        // the real spawn spot, from the dowsing particle
+    private Vec3d scanEstimate = null;                                     // a rough spot from the bar (log only unless SCAN_POINT_AT_BAR_ESTIMATE)
     private double scanEstimateErr = 0;
     private double scanBarProgress = -1, scanBarPrevProgress = -1;
+    private String scanBarColor = "";
     private boolean scanBarActive = false;
-    private String scanLastBar = "";
-    private static final Pattern SCAN_VEC3 = Pattern.compile(
-        "\\(\\s*(-?[0-9.]+(?:E-?\\d+)?)[ ,]+(-?[0-9.]+(?:E-?\\d+)?)[ ,]+(-?[0-9.]+(?:E-?\\d+)?)\\s*\\)");
     private static final Pattern SCAN_UUID = Pattern.compile("\\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\s");
     private static final Pattern SCAN_BAR_ADD = Pattern.compile("^\"(.*)\" f([0-9.E-]+) ([A-Z_]+) ([A-Z_0-9]+)\\b.*$");
     private static final Pattern SCAN_BAR_NAME = Pattern.compile("^\"(.*)\"$");
     private static final Pattern SCAN_BAR_PROGRESS = Pattern.compile("^f([0-9.E-]+)$");
     private static final Pattern SCAN_BAR_STYLE = Pattern.compile("^([A-Z_]+) ([A-Z_0-9]+)$");
-    private static final Pattern SCAN_NUMBER = Pattern.compile("-?\\d+(?:\\.\\d+)?");
 
     private static final class ScanBar {
         String name = "";
@@ -3538,86 +3521,34 @@ public class RadiantAlertClient implements ClientModInitializer {
         return String.format("%.1f, %.1f, %.1f", v.x, v.y, v.z);
     }
 
-    private boolean scanSpotKnown(double x, double z) {
-        for (double[] sp : scanSpots) {
-            if (Math.hypot(sp[0] - x, sp[2] - z) < 3.5) return true;
-        }
-        return false;
-    }
-
-    private void loadScanSpots() {
-        scanSpots.clear();
-        for (double[] seed : SCAN_SEED_SPOTS) scanSpots.add(seed.clone());
-        try {
-            Path file = FabricLoader.getInstance().getGameDir().resolve(SPOTS_FILE);
-            if (!Files.exists(file)) { scanSpotSnapshot = scanSpots.toArray(new double[0][]); return; }
-            for (String line : Files.readAllLines(file)) {
-                String[] t = line.trim().split("[ ,]+");
-                if (t.length < 3) continue;
-                try {
-                    double x = Double.parseDouble(t[0]);
-                    double y = Double.parseDouble(t[1]);
-                    double z = Double.parseDouble(t[2]);
-                    if (!scanSpotKnown(x, z)) scanSpots.add(new double[]{x, y, z});
-                } catch (NumberFormatException ignored) {
-                    // not a coordinate line
-                }
-            }
-        } catch (IOException e) {
-            LOG.warn("RadiantAlert: could not read " + SPOTS_FILE, e);
-        }
-        scanSpotSnapshot = scanSpots.toArray(new double[0][]);
-    }
-
-    /** A spot seen exactly for the first time: remember it for good. */
-    private void scanLearnSpot(Vec3d spot) {
-        if (scanSpotKnown(spot.x, spot.z)) return;
-        scanSpots.add(new double[]{spot.x, spot.y, spot.z});
-        scanSpotSnapshot = scanSpots.toArray(new double[0][]);
-        appendToFile(SPOTS_FILE, String.format(Locale.ROOT, "%.0f %.0f %.0f", spot.x, spot.y, spot.z));
-        scanLog("NEW SPOT saved to " + SPOTS_FILE + ": " + xyz(spot) + " (" + scanSpots.size() + " known now)");
-    }
-
-    /** /radiantalert scan: start or stop looking for the dowsing spots. */
+    /** /radiantalert scan: start or stop looking for the dowsing spawn spot. */
     private void toggleScan(MinecraftClient client) {
         if (!scanning) {
             scanCounts.clear();
             scanLastLogged.clear();
             scanBars.clear();
             scanSamples.clear();
-            scanRecent.clear();
-            scanHitKinds.clear();
-            scanEntityTypes.clear();
-            scanEntityLogged.clear();
-            scanHitLines = 0;
-            scanLastEntityScanAt = 0;
-            scanDumpLast.clear();
-            scanDumpCount.clear();
             scanExact = null;
             scanEstimate = null;
-            scanEstimateKnown = false;
             scanEstimateErr = 0;
             scanBarProgress = -1;
             scanBarPrevProgress = -1;
+            scanBarColor = "";
             scanBarActive = false;
-            scanLastBar = "";
             scanLines = 0;
             scanFoundAt = 0;
             scanTrendAt = 0;
             scanLastSnapAt = 0;
             scanLastEstimateAt = 0;
             scanLastDowsingLogAt = 0;
+            scanExactSeenAt = 0;
             scanStart = System.currentTimeMillis();
-            loadScanSpots();
             appendToFile(SCAN_FILE, "---- new scan " + new Date() + " ----");
             appendToFile(SCAN_FILE, "START " + contextString(client));
-            StringBuilder known = new StringBuilder();
-            for (double[] sp : scanSpots) known.append(String.format(" (%.0f, %.0f, %.0f)", sp[0], sp[1], sp[2]));
-            appendToFile(SCAN_FILE, "KNOWN SPOTS" + known);
             scanning = true;
-            say(client, "Scanning for the dowsing spots (" + scanSpots.size() + " known). Ride around Area Zero: when the bar appears I check it "
-                + "against the known spots and point at the one that fits, otherwise I work the spot out as you move, and the particle gives the "
-                + "exact spot. New spots are saved to " + SPOTS_FILE + ". Run /radiantalert scan again to stop; the log is " + SCAN_FILE + ".");
+            say(client, "Scanning for the dowsing spawn spot. Ride around Area Zero: the bar is shown above your hotbar as warmer / colder, and "
+                + "once you are within about 20 blocks the spawn spot shows up and I point at its exact coordinates. Run /radiantalert scan "
+                + "again to stop; the log is " + SCAN_FILE + ".");
             return;
         }
         scanning = false;
@@ -3627,18 +3558,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         for (int i = 0; i < Math.min(30, sorted.size()); i++) {
             appendToFile(SCAN_FILE, "x" + sorted.get(i).getValue()[0] + "  " + sorted.get(i).getKey());
         }
-        StringBuilder known = new StringBuilder();
-        for (double[] sp : scanSpots) known.append(String.format(" (%.0f, %.0f, %.0f)", sp[0], sp[1], sp[2]));
-        appendToFile(SCAN_FILE, "KNOWN SPOTS" + known);
-        appendToFile(SCAN_FILE, scanHitKinds.isEmpty()
-            ? "COORDINATES NOT FOUND in any packet or entity during this scan (the server did not send a known spot's coordinates)"
-            : "COORDINATES FOUND IN: " + String.join(" | ", scanHitKinds));
-        appendToFile(SCAN_FILE, "EXACT " + (scanExact == null ? "never seen" : xyz(scanExact)));
-        appendToFile(SCAN_FILE, "ESTIMATE " + (scanEstimate == null ? "none" : xyz(scanEstimate)
-            + (scanEstimateKnown ? " (a known spot)" : String.format(" (spread %.1f)", scanEstimateErr))));
+        appendToFile(SCAN_FILE, "SPAWN SPOT " + (scanExact == null ? "never seen" : xyz(scanExact)));
         scanExact = null;
         scanEstimate = null;
-        say(client, "Scan stopped. Send me " + SCAN_FILE + " (and " + SPOTS_FILE + ") from your Minecraft folder.");
+        say(client, "Scan stopped. Send me " + SCAN_FILE + " from your Minecraft folder.");
     }
 
     /** A one-line description of an object's values (numbers, text, vectors), going a couple of levels into Minecraft's own classes. */
@@ -3680,118 +3603,13 @@ public class RadiantAlertClient implements ClientModInitializer {
         sb.append('}');
     }
 
-    /** Like describeObject, but for any mod's packet: lists, maps, nested objects, with the field names. Capped at about 600 characters. */
-    private static void deepInto(StringBuilder sb, Object o, int depth, Set<Object> seen) {
-        if (o == null || sb.length() > 600) return;
-        if (o instanceof CharSequence || o instanceof Number || o instanceof Boolean || o instanceof Character
-                || o instanceof UUID || o instanceof Enum<?> || o instanceof Identifier) {
-            sb.append(o);
-            return;
-        }
-        if (o instanceof Text t) { sb.append('"').append(t.getString()).append('"'); return; }
-        if (o instanceof Vec3d v) { sb.append('(').append(v.x).append(' ').append(v.y).append(' ').append(v.z).append(')'); return; }
-        if (o instanceof Vec3i v) { sb.append('(').append(v.getX()).append(' ').append(v.getY()).append(' ').append(v.getZ()).append(')'); return; }
-        if (o instanceof Optional<?> opt) { if (opt.isPresent()) deepInto(sb, opt.get(), depth, seen); return; }
-        if (depth <= 0) return;
-        if (o instanceof Collection<?> c) {
-            sb.append('[');
-            int i = 0;
-            for (Object e : c) {
-                if (i++ >= 10 || sb.length() > 600) { sb.append("..."); break; }
-                if (i > 1) sb.append(", ");
-                deepInto(sb, e, depth - 1, seen);
-            }
-            sb.append(']');
-            return;
-        }
-        if (o instanceof Map<?, ?> m) {
-            sb.append('{');
-            int i = 0;
-            for (Map.Entry<?, ?> e : m.entrySet()) {
-                if (i++ >= 10 || sb.length() > 600) { sb.append("..."); break; }
-                if (i > 1) sb.append(", ");
-                deepInto(sb, e.getKey(), depth - 1, seen);
-                sb.append('=');
-                deepInto(sb, e.getValue(), depth - 1, seen);
-            }
-            sb.append('}');
-            return;
-        }
-        if (o.getClass().isArray()) {
-            sb.append('[');
-            int len = java.lang.reflect.Array.getLength(o);
-            for (int i = 0; i < Math.min(len, 10) && sb.length() <= 600; i++) {
-                if (i > 0) sb.append(", ");
-                deepInto(sb, java.lang.reflect.Array.get(o, i), depth - 1, seen);
-            }
-            if (len > 10) sb.append("...");
-            sb.append(']');
-            return;
-        }
-        String cn = o.getClass().getName();
-        if (cn.startsWith("java.") || cn.startsWith("javax.") || cn.startsWith("sun.") || cn.startsWith("jdk.")
-                || cn.startsWith("io.netty") || cn.startsWith("com.mojang") || cn.startsWith("com.google")) return;
-        if (!seen.add(o)) return;
-        sb.append(o.getClass().getSimpleName()).append('{');
-        boolean first = true;
-        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
-            for (Field f : k.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers()) || sb.length() > 600) continue;
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(o);
-                    if (v == null) continue;
-                    int before = sb.length();
-                    if (!first) sb.append(' ');
-                    sb.append(f.getName()).append('=');
-                    int mark = sb.length();
-                    deepInto(sb, v, depth - 1, seen);
-                    if (sb.length() == mark) { sb.setLength(before); continue; }
-                    first = false;
-                } catch (Throwable ignored) {
-                    // skip this field
-                }
-            }
-        }
-        sb.append('}');
-    }
-
-    private static boolean looksGreen(double r, double g, double b) {
-        return g > 0.45 && g > r * 1.5 && g > b * 1.5;
-    }
-
     /** Runs on the network thread: pick out what a scan cares about and hand it to the main thread. */
     private void scanPacket(Object msg, Info info) {
         String kind = null;
         String key = null;
         String text = null;
         double[] pos = null;
-        boolean green = false;
-        String dumpId = null;
-        String dumpText = null;
-        if (msg instanceof CustomPayloadS2CPacket cpk) {                  // what Delta's own packets contain (looking for coordinates)
-            String pid = cpk.payload().getId().id().toString();
-            if (pid.startsWith("deltaclient:") || pid.startsWith("delta:")) {
-                StringBuilder sb = new StringBuilder();
-                Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-                deepInto(sb, cpk.payload(), 3, seen);
-                dumpId = pid;
-                dumpText = sb.toString();
-            }
-        }
-        if (msg instanceof ParticleS2CPacket pp) {
-            Identifier type = Registries.PARTICLE_TYPE.getId(pp.getParameters().getType());
-            String effect = describeObject(pp.getParameters(), 1);
-            Matcher m = SCAN_VEC3.matcher(effect);
-            double[] rgb = m.find()
-                ? new double[]{Double.parseDouble(m.group(1)), Double.parseDouble(m.group(2)), Double.parseDouble(m.group(3))} : null;
-            String path = type.getPath();
-            green = (rgb != null && looksGreen(rgb[0], rgb[1], rgb[2])) || path.contains("happy_villager") || path.contains("composter");
-            kind = "PARTICLE";
-            key = type.toString();
-            text = String.format("%s count=%d effect=%s", type, pp.getCount(), effect);
-            pos = new double[]{pp.getX(), pp.getY(), pp.getZ()};
-        } else if (msg instanceof BossBarS2CPacket bb) {
+        if (msg instanceof BossBarS2CPacket bb) {
             kind = "BOSSBAR";
             text = describeObject(bb, 3);
             key = "bossbar";
@@ -3803,240 +3621,63 @@ public class RadiantAlertClient implements ClientModInitializer {
             kind = "TITLE";
             text = describeObject(msg, 1);
             key = text;
-        } else if (info != null && info.id().equals("cobblemon:spawn_snowstorm_particle")) {
-            String strings = String.join(" | ", info.strings());
-            boolean dowsing = strings.contains("dowsing");
-            kind = dowsing ? "DOWSING" : "EFFECT";
-            key = dowsing ? "dowsing" : strings;
-            text = info.id() + " " + strings;
-            pos = info.pos();
-        } else if (info != null && !info.id().startsWith("particle:") && !isListenNoise(info.id())) {
-            kind = "PAYLOAD";
-            String strings = String.join(" | ", info.strings());
-            text = info.id() + (strings.isEmpty() ? "" : " " + (strings.length() > 300 ? strings.substring(0, 300) + "..." : strings));
-            key = info.id();
+        } else if (info != null && info.id().equals("cobblemon:spawn_snowstorm_particle")
+                && String.join(" | ", info.strings()).contains("dowsing")) {
+            kind = "DOWSING";
+            key = "dowsing";
+            text = "dowsing";
             pos = info.pos();
         }
-        // the hunt: does ANY packet contain the coordinates of a spot we already know? (needle in a haystack)
-        String huntSpot = null;
-        String huntText = dumpText;
-        double[][] spots = scanSpotSnapshot;
-        if (spots.length > 0 && !(msg instanceof BossBarS2CPacket)) {
-            if (huntText == null) {
-                StringBuilder sb2 = new StringBuilder();
-                Set<Object> seen2 = Collections.newSetFromMap(new IdentityHashMap<>());
-                deepInto(sb2, msg, 3, seen2);
-                huntText = sb2.toString();
-            }
-            for (double[] sp : spots) {
-                if (scanTextHasCoords(huntText, sp[0], sp[2])) {
-                    huntSpot = String.format(Locale.ROOT, "%.0f %.0f", sp[0], sp[2]);
-                    break;
-                }
-            }
-        }
-        if (huntSpot != null) {
-            final String who = msg instanceof CustomPayloadS2CPacket cp3 ? cp3.payload().getId().id().toString() : msg.getClass().getName();
-            final String hs = huntSpot;
-            final String ht = huntText;
-            MinecraftClient.getInstance().execute(() -> {
-                try {
-                    scanHit(who, hs, ht);
-                } catch (Throwable ex) {
-                    scanLog("ERROR in scan: " + ex);
-                }
-            });
-        }
-        final String di = dumpId, dt = dumpText;
+        if (kind == null) return;
         final String k = kind, ke = key, t = text;
         final double[] p = pos;
-        final boolean g = green;
-        if (kind == null && dumpId == null) return;
         MinecraftClient.getInstance().execute(() -> {
             try {
-                if (di != null) scanDump(di, dt);
-                if (k != null) scanRecord(k, ke, t, p, g);
+                scanRecord(k, ke, t, p);
             } catch (Throwable ex) {
                 scanLog("ERROR in scan: " + ex);
             }
         });
     }
 
-    /** Does the text contain both the x and the z of a spot as numbers? */
-    private static boolean scanTextHasCoords(String text, double x, double z) {
-        if (!text.contains(Long.toString(Math.round(x))) || !text.contains(Long.toString(Math.round(z)))) return false;
-        boolean hasX = false;
-        boolean hasZ = false;
-        Matcher m = SCAN_NUMBER.matcher(text);
-        while (m.find()) {
-            double v;
-            try {
-                v = Double.parseDouble(m.group());
-            } catch (NumberFormatException e) {
-                continue;
-            }
-            if (Math.abs(v - x) < 0.6) hasX = true;
-            if (Math.abs(v - z) < 0.6) hasZ = true;
-        }
-        return hasX && hasZ;
-    }
-
-    /** A packet contained the coordinates of a known spot. */
-    private void scanHit(String who, String spot, String text) {
-        if (!scanning) return;
-        scanHitKinds.add(who);
-        long now = System.currentTimeMillis();
-        String key = "hit" + who + spot;
-        Long last = scanLastLogged.get(key);
-        if ((last != null && now - last < 5000) || scanHitLines++ > 80) return;
-        scanLastLogged.put(key, now);
-        MinecraftClient client = MinecraftClient.getInstance();
-        String[] sp = spot.split(" ");
-        String away = "";
-        if (client.player != null && sp.length == 2) {
-            away = String.format(" | you are %.0f blocks from that spot", Math.hypot(client.player.getX() - Double.parseDouble(sp[0]),
-                client.player.getZ() - Double.parseDouble(sp[1])));
-        }
-        scanLog("HIT the coordinates of spot " + spot + " are in " + who + away + " | " + (text.length() > 400 ? text.substring(0, 400) + "..." : text));
-    }
-
-    /** Is there an entity (marker, armor stand, display...) at a known spot, or one of a kind not seen before? */
-    private void scanEntities(MinecraftClient client, long now) {
-        if (client.world == null || client.player == null || now - scanLastEntityScanAt < 1000) return;
-        scanLastEntityScanAt = now;
-        double[][] spots = scanSpotSnapshot;
-        for (net.minecraft.entity.Entity e : client.world.getEntities()) {
-            if (e == client.player) continue;
-            String type = Registries.ENTITY_TYPE.getId(e.getType()).toString();
-            boolean atSpot = false;
-            for (double[] sp : spots) {
-                if (Math.hypot(e.getX() - sp[0], e.getZ() - sp[2]) < 6) { atSpot = true; break; }
-            }
-            if (atSpot) {
-                Long last = scanEntityLogged.get(e.getId());
-                if (last == null || now - last > 20000) {
-                    scanEntityLogged.put(e.getId(), now);
-                    scanHitKinds.add("entity " + type);
-                    scanLog(String.format("ENTITY %s at %.1f, %.1f, %.1f is at a known spot (%.0f blocks from you)%s", type, e.getX(), e.getY(), e.getZ(),
-                        client.player.distanceTo(e), e.hasCustomName() ? " name=\"" + e.getCustomName().getString() + "\"" : ""));
-                }
-            } else if (!type.equals("minecraft:item") && !type.startsWith("cobblemon:") && scanEntityTypes.add(type)) {
-                scanLog(String.format("ENTITY first sighting of type %s at %.1f, %.1f, %.1f (%.0f blocks from you)", type, e.getX(), e.getY(), e.getZ(),
-                    client.player.distanceTo(e)));
-            }
-        }
-    }
-
     /** Main thread: handle one thing the server sent. */
-    private void scanRecord(String kind, String key, String text, double[] pos, boolean green) {
+    private void scanRecord(String kind, String key, String text, double[] pos) {
         if (!scanning) return;
         MinecraftClient client = MinecraftClient.getInstance();
         long now = System.currentTimeMillis();
         scanCounts.computeIfAbsent(kind + " " + (key.length() > 120 ? key.substring(0, 120) : key), x -> new int[1])[0]++;
-        String player = client.player == null ? ""
-            : String.format(" | you at %.1f, %.1f, %.1f", client.player.getX(), client.player.getY(), client.player.getZ());
-        String where = pos == null || client.player == null ? ""
-            : String.format(" @ %.1f, %.1f, %.1f (%.1f blocks away)", pos[0], pos[1], pos[2],
-                client.player.getPos().distanceTo(new Vec3d(pos[0], pos[1], pos[2])));
-
         switch (kind) {
             case "DOWSING" -> scanDowsing(client, pos, now);
             case "BOSSBAR" -> scanBarEvent(client, text, now);
-            case "ACTIONBAR", "TITLE" -> {
-                scanLastBar = text;
+            default -> {                              // action bar / title text
                 Long last = scanLastLogged.get(kind + key);
                 if (last == null || now - last > 300) {
                     scanLastLogged.put(kind + key, now);
-                    scanLog(kind + " " + text + player);
-                }
-            }
-            case "EFFECT" -> {                        // other Cobblemon particle effects: once every 20 s per effect
-                Long last = scanLastLogged.get(kind + key);
-                if (last == null || now - last > 20000) {
-                    scanLastLogged.put(kind + key, now);
-                    scanLog("EFFECT " + text + where + player);
-                }
-            }
-            case "PARTICLE" -> {                      // vanilla particles: once every 5 s per kind (green ones flagged)
-                Long last = scanLastLogged.get(kind + key);
-                if (last == null || now - last > 5000) {
-                    scanLastLogged.put(kind + key, now);
-                    scanLog("PARTICLE" + (green ? " GREEN " : " ") + text + where + player);
-                }
-            }
-            default -> {                              // everything else: the first time only
-                if (!scanLastLogged.containsKey(kind + key)) {
-                    scanLastLogged.put(kind + key, now);
-                    scanLog(kind + " " + text + where + player);
+                    scanLog(kind + " " + text);
                 }
             }
         }
     }
 
-    /** The contents of one of Delta's packets: write it down when it changes, and keep it to look for coordinates in. */
-    private void scanDump(String id, String text) {
-        if (!scanning || text == null || text.isEmpty()) return;
-        long now = System.currentTimeMillis();
-        scanRecent.addLast(new String[]{String.valueOf(now), id, text});
-        while (scanRecent.size() > 300) scanRecent.removeFirst();
-        if (scanExact != null) scanCarrierCheck(id, text, scanExact);
-        if (text.equals(scanDumpLast.get(id))) return;
-        scanDumpLast.put(id, text);
-        int count = scanDumpCount.getOrDefault(id, 0);
-        if (count >= 25) return;
-        scanDumpCount.put(id, count + 1);
-        MinecraftClient client = MinecraftClient.getInstance();
-        String player = client.player == null ? ""
-            : String.format(" | you at %.1f, %.1f, %.1f", client.player.getX(), client.player.getY(), client.player.getZ());
-        scanLog("DUMP " + id + " " + text + player);
-    }
-
-    /** Does this packet text contain the spot's x and z? Then the server is sending the coordinates through it. */
-    private boolean scanCarrierCheck(String id, String text, Vec3d spot) {
-        boolean hasX = false;
-        boolean hasZ = false;
-        Matcher m = SCAN_NUMBER.matcher(text);
-        while (m.find()) {
-            double v;
-            try {
-                v = Double.parseDouble(m.group());
-            } catch (NumberFormatException e) {
-                continue;
-            }
-            if (Math.abs(v - spot.x) < 0.6) hasX = true;
-            if (Math.abs(v - spot.z) < 0.6) hasZ = true;
-        }
-        if (hasX && hasZ) {
-            scanLog("CARRIER the spot's coordinates are in " + id + ": " + text);
-            return true;
-        }
-        return false;
-    }
-
-    /** The dowsing particle itself: this is the exact spot. */
+    /** The dowsing particle itself: this is the actual spawn spot. */
     private void scanDowsing(MinecraftClient client, double[] pos, long now) {
         if (pos == null) return;
         Vec3d spot = new Vec3d(pos[0], pos[1], pos[2]);
         boolean isNew = scanExact == null || scanExact.distanceTo(spot) > 1.0;
         scanExact = spot;
+        scanExactSeenAt = now;
+        scanFoundAt = 0;
         String dist = client.player == null ? "" : String.format(" (%.1f blocks away)", client.player.getPos().distanceTo(spot));
         if (isNew) {
-            scanLog("DOWSING exact spot " + xyz(spot) + dist);
+            scanLog("DOWSING spawn spot " + xyz(spot) + dist);
             if (scanEstimate != null) {
-                scanLog(String.format("The %s was %.1f blocks off", scanEstimateKnown ? "known spot" : "estimate",
-                    Math.hypot(scanEstimate.x - spot.x, scanEstimate.z - spot.z)));
+                scanLog(String.format("The rough position from the bar was %.1f blocks off", Math.hypot(scanEstimate.x - spot.x, scanEstimate.z - spot.z)));
             }
-            for (double[] smp : scanSamples) {          // what each bar level really meant
+            for (double[] smp : scanSamples) {          // what each bar level really meant at this spawn spot
                 scanLog(String.format("CAL progress=%.2f%s distance=%.1f", smp[2], smp[3] > 0 ? " (edge of range)" : "",
                     Math.hypot(smp[0] - spot.x, smp[1] - spot.z)));
             }
-            boolean carrier = false;
-            for (String[] d : scanRecent) {
-                if (scanCarrierCheck(d[1], d[2], spot)) carrier = true;
-            }
-            if (!carrier) scanLog("CARRIER none of the last " + scanRecent.size() + " Delta packets contain these coordinates");
-            scanLearnSpot(spot);
-            say(client, "Found the spot: " + xyz(spot) + dist + ". It stays marked above your hotbar.");
+            say(client, "Spawn spot found: " + xyz(spot) + dist + ". It is shown above your hotbar.");
             scanLastDowsingLogAt = now;
         } else if (now - scanLastDowsingLogAt > 5000) {
             scanLastDowsingLogAt = now;
@@ -4063,10 +3704,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             double lastP = bar.progress;
             double life = (now - bar.addedAt) / 1000.0;
             scanBars.remove(id);
-            if (!was) {
-                scanLog("BAR " + shortId + " removed");
-                return;
-            }
+            if (!was) return;
             boolean reached = lastP >= 0.8;
             scanLog(String.format("BAR %s removed after %.1fs %s", shortId, life,
                 reached ? "- you reached the spot" : "- you went out of range (about 98 blocks from the spot)"));
@@ -4074,12 +3712,11 @@ public class RadiantAlertClient implements ClientModInitializer {
             scanBarProgress = -1;
             scanBarPrevProgress = -1;
             if (reached) {
-                scanFoundAt = now;
+                scanFoundAt = now;                                          // the spot is used up: the pointer goes in a few seconds
                 say(client, "The bar is gone - you've reached the spot.");
             } else if (client.player != null && !scanSamples.isEmpty()) {
                 double[] last = scanSamples.get(scanSamples.size() - 1);
-                double moved = Math.hypot(last[0] - client.player.getX(), last[1] - client.player.getZ());
-                if (moved < 40) {                                           // (a teleport would put us far from the last reading)
+                if (Math.hypot(last[0] - client.player.getX(), last[1] - client.player.getZ()) < 40) {   // (a teleport would put us far away)
                     scanSamples.add(new double[]{client.player.getX(), client.player.getZ(), 0.1, 1});
                     scanEstimateFromBar(client);
                 }
@@ -4093,14 +3730,13 @@ public class RadiantAlertClient implements ClientModInitializer {
             scanLog("BAR " + shortId + " added name=\"" + bar.name + "\" colour=" + bar.color + (bar.dowsing ? " (the dowsing bar)" : ""));
             if (bar.dowsing) {
                 scanSamples.clear();                                        // a new run: forget the old readings
-                scanExact = null;
-                scanFoundAt = 0;
+                scanEstimate = null;
                 scanBarProgress = -1;
                 scanBarPrevProgress = -1;
+                scanBarColor = bar.color;
                 scanBarActive = true;
                 if (client.player != null) {                                // it appears about 98 blocks from the spot
                     scanSamples.add(new double[]{client.player.getX(), client.player.getZ(), 0.1, 1});
-                    scanEstimateFromBar(client);
                 }
             }
         } else if ((m = SCAN_BAR_NAME.matcher(inner)).matches()) {          // name changed
@@ -4111,31 +3747,24 @@ public class RadiantAlertClient implements ClientModInitializer {
                 scanBarActive = true;
             }
             scanLog("BAR " + shortId + " name=\"" + bar.name + "\"");
-        } else if ((m = SCAN_BAR_PROGRESS.matcher(inner)).matches()) {      // progress changed: the reading we want
+        } else if ((m = SCAN_BAR_PROGRESS.matcher(inner)).matches()) {      // progress changed: a reading
             bar.progress = Double.parseDouble(m.group(1));
             if (bar.dowsing) {
                 scanAddSample(client, bar.progress, now);
                 String trend = scanBarPrevProgress < 0 ? "" : bar.progress > scanBarPrevProgress ? " warmer" : bar.progress < scanBarPrevProgress ? " colder" : "";
                 String at = client.player == null ? "" : String.format(" | you at %.1f, %.1f, %.1f", client.player.getX(), client.player.getY(), client.player.getZ());
-                String exact = scanExact == null || client.player == null ? ""
+                String real = scanExact == null || client.player == null ? ""
                     : String.format(" | real distance %.1f", Math.hypot(client.player.getX() - scanExact.x, client.player.getZ() - scanExact.z));
-                scanLog(String.format("BAR %s progress=%.2f%s colour=%s name=\"%s\"%s%s", shortId, bar.progress, trend, bar.color, bar.name, at, exact));
-            } else {
-                Long last = scanLastLogged.get("otherbar" + id);
-                if (last == null || now - last > 2000) {
-                    scanLastLogged.put("otherbar" + id, now);
-                    scanLog("BAR " + shortId + " (not the dowsing bar) name=\"" + bar.name + "\" progress=" + bar.progress);
-                }
+                scanLog(String.format("BAR %s progress=%.2f%s colour=%s name=\"%s\"%s%s", shortId, bar.progress, trend, bar.color, bar.name, at, real));
             }
         } else if ((m = SCAN_BAR_STYLE.matcher(inner)).matches()) {         // colour / style changed
             bar.color = m.group(1);
+            if (bar.dowsing) scanBarColor = bar.color;
             scanLog("BAR " + shortId + " colour=" + bar.color + " style=" + m.group(2));
-        } else {
-            scanLog("BAR " + shortId + " other: " + inner);
         }
     }
 
-    /** One bar reading together with where you stood: one distance ring around the spot. */
+    /** One bar reading together with where you stood: one distance ring around the spot (only used for the rough log estimate). */
     private void scanAddSample(MinecraftClient client, double progress, long now) {
         if (client.player == null) return;
         double px = client.player.getX();
@@ -4150,13 +3779,13 @@ public class RadiantAlertClient implements ClientModInitializer {
             scanSamples.add(new double[]{px, pz, progress, 0});
             if (scanSamples.size() > 80) scanSamples.remove(1);            // keep the first one: the edge of the range
         }
-        if (now - scanLastEstimateAt > 500) {
+        if (scanExact == null && now - scanLastEstimateAt > 1000) {
             scanLastEstimateAt = now;
             scanEstimateFromBar(client);
         }
     }
 
-    /** How far a reading is from what it should be at this distance (0 = fits; the bands are measured with some slack). */
+    /** How far a reading is from what it should be at this distance (0 = fits; the bands carry some slack). */
     private static double scanBandCost(double[] sample, double d) {
         double lo = -1;
         double hi = -1;
@@ -4186,38 +3815,9 @@ public class RadiantAlertClient implements ClientModInitializer {
         return cost;
     }
 
-    /** Which spot is it? First try the known spots, then work it out from the rings. */
+    /** A rough position from the distance rings (log only by default). Cleared again whenever the readings do not agree. */
     private void scanEstimateFromBar(MinecraftClient client) {
-        if (scanSamples.isEmpty() || client.player == null) return;
-
-        // 1) a known spot that fits every reading
-        double[] best = null;
-        double bestCost = Double.MAX_VALUE;
-        int fits = 0;
-        for (double[] sp : scanSpots) {
-            double c = scanCostAt(sp[0], sp[2]);
-            if (c <= 4) fits++;
-            if (c < bestCost) { bestCost = c; best = sp; }
-        }
-        if (best != null && bestCost <= 4) {
-            Vec3d k = new Vec3d(best[0], best[1], best[2]);
-            boolean changed = scanEstimate == null || scanEstimate.distanceTo(k) > 1 || !scanEstimateKnown;
-            scanEstimate = k;
-            scanEstimateKnown = true;
-            scanEstimateErr = 0;
-            if (changed) {
-                scanLog(String.format("KNOWN SPOT %s fits the bar (%d known spot(s) fit, %d reading(s))", xyz(k), fits, scanSamples.size()));
-                if (scanExact == null) {
-                    say(client, String.format("This is the known spot at %.0f, %.0f, %.0f (%.0f blocks away)%s.", k.x, k.y, k.z,
-                        client.player.getPos().distanceTo(k), fits > 1 ? " - another known spot also fits, so keep moving to be sure" : ""));
-                }
-            }
-            return;
-        }
-        scanEstimateKnown = false;
-
-        // 2) a new spot: every point near the first reading that fits all the readings, and where they are
-        if (scanSamples.size() < 2) return;
+        if (scanSamples.size() < 2 || client.player == null) return;
         double ox = scanSamples.get(0)[0];
         double oz = scanSamples.get(0)[1];
         double minCost = Double.MAX_VALUE;
@@ -4234,7 +3834,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 if (scanCostAt(x, z) <= minCost + 1.0) { sx += x; sz += z; cnt++; }
             }
         }
-        if (cnt == 0) return;
+        if (cnt == 0) { scanEstimate = null; return; }
         double cx = sx / cnt;
         double cz = sz / cnt;
         double var = 0;
@@ -4244,37 +3844,46 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
         }
         double spread = Math.sqrt(var / cnt);
-        if (spread > 35) return;                                           // still too many places fit: need more readings
+        if (spread > 35) { scanEstimate = null; return; }                  // still too many places fit: no estimate (and never a stale one)
         Vec3d old = scanEstimate;
         scanEstimate = new Vec3d(cx, client.player.getY(), cz);
         scanEstimateErr = spread;
         if (old == null || Math.hypot(old.x - cx, old.z - cz) > 12) {
-            scanLog(String.format("ESTIMATE %s (spread %.0f blocks, %d reading(s))", xyz(scanEstimate), spread, scanSamples.size()));
-            if (scanExact == null) {
-                say(client, String.format("A new spot, probably around %.0f, %.0f (%.0f blocks away).", cx, cz,
-                    client.player.getPos().distanceTo(scanEstimate)));
-            }
+            scanLog(String.format("ESTIMATE from the bar (log only) %s (spread %.0f blocks, %d reading(s))", xyz(scanEstimate), spread, scanSamples.size()));
         }
     }
 
-    /** Every tick while scanning: point at the spot above the hotbar and write a short snapshot now and then. */
+    private static String scanTurnWords(float diff) {
+        float a = Math.abs(diff);
+        String side = diff < 0 ? "left" : "right";
+        if (a < 15) return "straight ahead";
+        if (a < 60) return "slightly " + side;
+        if (a < 120) return side;
+        if (a < 165) return "behind you, " + side;
+        return "behind you";
+    }
+
+    /** Every tick while scanning: point at the spawn spot above the hotbar and write a short snapshot now and then. */
     private void scanTick(MinecraftClient client) {
         if (client.player == null) return;
         long now = System.currentTimeMillis();
-        if (scanFoundAt != 0 && now - scanFoundAt > 15000) {                // reached it a while ago: ready for the next one
+        if (scanFoundAt != 0 && now - scanFoundAt > 4000) {                 // reached it: the spot is used up
             scanFoundAt = 0;
             scanExact = null;
             scanEstimate = null;
-            scanEstimateKnown = false;
             scanSamples.clear();
         }
-        scanEntities(client, now);
-        Vec3d target = scanExact != null ? scanExact : scanEstimate;
+        // the particle is sent about every 0.3 s while you are within ~20 blocks: if it stops while you are close, the spot is gone
+        if (scanExact != null && now - scanExactSeenAt > 6000 && client.player.getPos().distanceTo(scanExact) < 15) {
+            scanLog("DOWSING spawn spot " + xyz(scanExact) + " is gone (no particle for 6 s while close)");
+            scanExact = null;
+        }
+        Vec3d target = scanExact != null ? scanExact : (SCAN_POINT_AT_BAR_ESTIMATE ? scanEstimate : null);
         String barText = "";
         if (scanBarActive && scanBarProgress >= 0) {
             String trend = now - scanTrendAt < 4000 && scanBarPrevProgress >= 0
-                ? (scanBarProgress > scanBarPrevProgress ? " - warmer" : " - colder") : "";
-            barText = String.format("  bar %.1f%s", scanBarProgress, trend);
+                ? (scanBarProgress > scanBarPrevProgress ? ", warmer" : ", colder") : "";
+            barText = String.format("  [bar %.1f %s%s]", scanBarProgress, scanBarColor.toLowerCase(Locale.ROOT), trend);
         }
         if (target != null) {
             double dx = target.x - client.player.getX();
@@ -4283,21 +3892,18 @@ public class RadiantAlertClient implements ClientModInitializer {
             double dist = client.player.getPos().distanceTo(target);
             float bearing = (float) Math.toDegrees(Math.atan2(-dx, dz));
             float diff = MathHelper.wrapDegrees(bearing - client.player.getYaw());
-            String[] arrows = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
-            String arrow = arrows[Math.floorMod((int) Math.round(diff / 45.0), 8)];
-            String how = scanExact != null ? "exact" : scanEstimateKnown ? "known spot" : String.format("estimate +-%.0f", Math.max(scanEstimateErr, 5));
-            client.inGameHud.setOverlayMessage(Text.literal(String.format("Spot: %.0f blocks %s (height %+.0f) [%s]%s", dist, arrow, dy, how, barText))
-                .formatted(Formatting.GREEN), false);
+            String what = scanExact != null ? "Spawn spot" : "Rough spot";
+            client.inGameHud.setOverlayMessage(Text.literal(String.format("%s %.0f, %.0f, %.0f - %.0f blocks, %s (height %+.0f)%s",
+                what, target.x, target.y, target.z, dist, scanTurnWords(diff), dy, barText)).formatted(Formatting.GREEN), false);
         } else if (!barText.isEmpty()) {
-            client.inGameHud.setOverlayMessage(Text.literal("Bar" + barText + " - keep riding so I can place the spot")
+            client.inGameHud.setOverlayMessage(Text.literal("Dowsing" + barText + " - keep riding, the spawn spot shows up within about 20 blocks")
                 .formatted(Formatting.YELLOW), false);
         }
         if (now - scanLastSnapAt >= 2000 && (target != null || scanBarActive)) {
             scanLastSnapAt = now;
-            scanLog(String.format("SNAP you at %.1f, %.1f, %.1f | bar %s | exact %s | estimate %s | distance %s", client.player.getX(),
-                client.player.getY(), client.player.getZ(), scanBarProgress < 0 ? "none" : String.format("%.2f", scanBarProgress),
-                scanExact == null ? "none" : xyz(scanExact), scanEstimate == null ? "none" : xyz(scanEstimate),
-                target == null ? "?" : String.format("%.1f", client.player.getPos().distanceTo(target))));
+            scanLog(String.format("SNAP you at %.1f, %.1f, %.1f | bar %s | spawn spot %s | rough %s", client.player.getX(), client.player.getY(),
+                client.player.getZ(), scanBarProgress < 0 ? "none" : String.format("%.2f", scanBarProgress),
+                scanExact == null ? "none" : xyz(scanExact), scanEstimate == null ? "none" : xyz(scanEstimate)));
         }
     }
 

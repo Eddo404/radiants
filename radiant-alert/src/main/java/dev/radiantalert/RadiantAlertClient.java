@@ -45,6 +45,11 @@ import net.minecraft.network.ClientConnection;
 import net.minecraft.network.packet.CustomPayload;
 import net.minecraft.network.packet.s2c.common.CustomPayloadS2CPacket;
 import net.minecraft.network.packet.s2c.play.ParticleS2CPacket;
+import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
+import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
+import net.minecraft.network.packet.s2c.play.OverlayMessageS2CPacket;
+import net.minecraft.network.packet.s2c.play.GameMessageS2CPacket;
+import net.minecraft.network.packet.s2c.play.BossBarS2CPacket;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
@@ -89,6 +94,8 @@ import java.util.stream.Stream;
  *  /radiantalert areazero     auto-catch and auto-clean; after a catch you stay in the same spot (no home teleport),
  *                             after a clean-up you warp back with /warp center<N>
  *  /radiantalert center <1-6> which centre Area Zero warps back to (starts as 4, so /warp center4)
+ *  /radiantalert scan         record the green particles, bars and messages around you (Area Zero) to radiantalert-scan.txt
+ *                             and point at the green spot; run it again to stop and get the summary
  *  /radiantalert stop         switch everything off and cancel what it is doing
  *
  *  While any of the automatic features is on, a battle you didn't ask for (even while just waiting for a wormhole)
@@ -557,6 +564,10 @@ public class RadiantAlertClient implements ClientModInitializer {
                         : "Auto-rejoin OFF.");
                     return 1;
                 }))
+                .then(ClientCommandManager.literal("scan").executes(ctx -> {
+                    toggleScan(MinecraftClient.getInstance());
+                    return 1;
+                }))
                 .then(ClientCommandManager.literal("center")
                     .executes(ctx -> {
                         say(MinecraftClient.getInstance(), "Area Zero warps back with /" + warpCommand()
@@ -612,7 +623,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     MinecraftClient c = MinecraftClient.getInstance();
                     say(c, "auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
                         + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
-                        + " | auto-rejoin: " + autoRejoinEnabled + " | area zero: " + areaZeroMode + " (/" + warpCommand() + ")"
+                        + " | scan: " + scanning + " | auto-rejoin: " + autoRejoinEnabled + " | area zero: " + areaZeroMode + " (/" + warpCommand() + ")"
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
                         + " | home: /" + homeCommand() + " | server: " + lastServerName);
                     return 1;
@@ -652,6 +663,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         rejoinTick(client);
 
         if (client.player == null || client.world == null) { pending.clear(); return; }
+
+        if (scanning) scanTick(client);
 
         if (pendingWormhole != null) {
             if (!autoWormholeEnabled) pendingWormhole = null;
@@ -2574,6 +2587,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     Identifier type = Registries.PARTICLE_TYPE.getId(pp.getParameters().getType());
                     info = new Info("particle:" + type, List.of(), new double[]{pp.getX(), pp.getY(), pp.getZ()}, pp.getCount());
                 }
+                if (scanning) scanPacket(msg, info);
                 if (info != null) {
                     boolean rec = recording;
                     boolean wormhole = ALERT_WORMHOLE && matchesWormhole(info);
@@ -3450,6 +3464,245 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         if (c.player != null) restoreSwaps(c);
         autoLog("MODE reset: " + why);
+    }
+
+    // ============================== Scan (Area Zero green particles) ==============================
+
+    private volatile boolean scanning = false;
+    private static final String SCAN_FILE = "radiantalert-scan.txt";
+    private static final int SCAN_MAX_LINES = 6000;
+    private long scanStart = 0, scanLastSnapAt = 0, scanLastGreenSayAt = 0;
+    private int scanLines = 0, scanGreenCount = 0;
+    private final Map<String, int[]> scanCounts = new LinkedHashMap<>();   // main thread only
+    private final Map<String, Long> scanLastLogged = new HashMap<>();      // main thread only
+    private final List<double[]> scanGreen = new ArrayList<>();            // main thread only
+    private Vec3d scanMarker = null;
+    private String scanLastBar = "";
+    private static final Pattern SCAN_VEC3 = Pattern.compile(
+        "\\(\\s*(-?[0-9.]+(?:E-?\\d+)?)[ ,]+(-?[0-9.]+(?:E-?\\d+)?)[ ,]+(-?[0-9.]+(?:E-?\\d+)?)\\s*\\)");
+
+    /** /radiantalert scan: start or stop recording what the server sends about the green particle and its "getting closer" bar. */
+    private void toggleScan(MinecraftClient client) {
+        if (!scanning) {
+            scanCounts.clear();
+            scanLastLogged.clear();
+            scanGreen.clear();
+            scanMarker = null;
+            scanLastBar = "";
+            scanLines = 0;
+            scanGreenCount = 0;
+            scanLastSnapAt = 0;
+            scanLastGreenSayAt = 0;
+            scanStart = System.currentTimeMillis();
+            appendToFile(SCAN_FILE, "---- new scan " + new Date() + " ----");
+            appendToFile(SCAN_FILE, "START " + contextString(client));
+            scanning = true;
+            say(client, "Scanning. Walk around Area Zero: green particles are shown here with how far away they are, and the spot is "
+                + "pointed out above your hotbar. Everything is saved to " + SCAN_FILE + " in your Minecraft folder. "
+                + "Run /radiantalert scan again to stop.");
+            return;
+        }
+        scanning = false;
+        appendToFile(SCAN_FILE, "---- SUMMARY ----");
+        List<Map.Entry<String, int[]>> sorted = new ArrayList<>(scanCounts.entrySet());
+        sorted.sort((a, b) -> Integer.compare(b.getValue()[0], a.getValue()[0]));
+        for (int i = 0; i < Math.min(40, sorted.size()); i++) {
+            appendToFile(SCAN_FILE, "x" + sorted.get(i).getValue()[0] + "  " + sorted.get(i).getKey());
+        }
+        if (!scanGreen.isEmpty()) {
+            double sx = 0, sy = 0, sz = 0;
+            for (double[] g : scanGreen) { sx += g[0]; sy += g[1]; sz += g[2]; }
+            int n = scanGreen.size();
+            appendToFile(SCAN_FILE, String.format("GREEN %d packets, average spot %.1f, %.1f, %.1f (last seen %.1f, %.1f, %.1f)",
+                scanGreenCount, sx / n, sy / n, sz / n,
+                scanGreen.get(n - 1)[0], scanGreen.get(n - 1)[1], scanGreen.get(n - 1)[2]));
+        } else {
+            appendToFile(SCAN_FILE, "GREEN nothing greenish seen");
+        }
+        scanMarker = null;
+        say(client, "Scan stopped (" + scanGreenCount + " green particle packets). Send me " + SCAN_FILE + " from your Minecraft folder.");
+    }
+
+    /** A one-line description of an object's values (numbers, text, vectors), going a couple of levels into Minecraft's own classes. */
+    private static String describeObject(Object o, int depth) {
+        StringBuilder sb = new StringBuilder();
+        describeInto(sb, o, depth);
+        return sb.length() > 400 ? sb.substring(0, 400) + "..." : sb.toString();
+    }
+
+    private static void describeInto(StringBuilder sb, Object o, int depth) {
+        if (o == null) return;
+        if (o instanceof Text t) { sb.append('"').append(t.getString()).append('"'); return; }
+        if (o instanceof Float || o instanceof Double) { sb.append('f').append(o); return; }
+        if (o instanceof Number) { sb.append('i').append(o); return; }
+        if (o instanceof Boolean || o instanceof CharSequence || o instanceof UUID || o instanceof Enum<?>) { sb.append(o); return; }
+        String cn = o.getClass().getName();
+        if (cn.startsWith("org.joml.")) { sb.append(o); return; }
+        if (depth < 0 || !cn.startsWith("net.minecraft.")) return;
+        sb.append(o.getClass().getSimpleName()).append('{');
+        boolean first = true;
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v == null) continue;
+                    int before = sb.length();
+                    if (!first) sb.append(' ');
+                    int mark = sb.length();
+                    describeInto(sb, v, depth - 1);
+                    if (sb.length() == mark) { sb.setLength(before); continue; }
+                    first = false;
+                } catch (Throwable ignored) {
+                    // skip this field
+                }
+            }
+        }
+        sb.append('}');
+    }
+
+    private static boolean looksGreen(double r, double g, double b) {
+        return g > 0.45 && g > r * 1.5 && g > b * 1.5;
+    }
+
+    /** Runs on the network thread: pick out what a scan cares about and hand it to the main thread. */
+    private void scanPacket(Object msg, Info info) {
+        String kind = null;
+        String key = null;
+        String text = null;
+        double[] pos = null;
+        boolean green = false;
+        if (msg instanceof ParticleS2CPacket pp) {
+            Identifier type = Registries.PARTICLE_TYPE.getId(pp.getParameters().getType());
+            String effect = describeObject(pp.getParameters(), 1);
+            List<Float> floats = new ArrayList<>();                    // offsetX, offsetY, offsetZ, speed (in that order)
+            for (Field f : ParticleS2CPacket.class.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers()) || f.getType() != float.class) continue;
+                try {
+                    f.setAccessible(true);
+                    floats.add(f.getFloat(pp));
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+            double[] rgb = null;
+            Matcher m = SCAN_VEC3.matcher(effect);
+            if (m.find()) {                                           // dust: the colour is part of the effect
+                rgb = new double[]{Double.parseDouble(m.group(1)), Double.parseDouble(m.group(2)), Double.parseDouble(m.group(3))};
+            } else if (pp.getCount() == 0 && floats.size() >= 3 && type.getPath().contains("effect")) {
+                rgb = new double[]{floats.get(0), floats.get(1), floats.get(2)};   // potion swirls: colour in the offsets
+            }
+            String path = type.getPath();
+            green = (rgb != null && looksGreen(rgb[0], rgb[1], rgb[2]))
+                || path.contains("happy_villager") || path.contains("composter") || path.contains("spore");
+            String colour = rgb == null ? "" : String.format(" colour=(%.2f,%.2f,%.2f)", rgb[0], rgb[1], rgb[2]);
+            kind = "PARTICLE";
+            key = type + colour;
+            text = String.format("%s count=%d%s offsets=%s effect=%s", type, pp.getCount(), colour, floats, effect);
+            pos = new double[]{pp.getX(), pp.getY(), pp.getZ()};
+        } else if (msg instanceof BossBarS2CPacket bb) {
+            kind = "BOSSBAR";
+            text = describeObject(bb, 3);
+            key = text;
+        } else if (msg instanceof OverlayMessageS2CPacket om) {
+            kind = "ACTIONBAR";
+            text = describeObject(om, 1);
+            key = text;
+        } else if (msg instanceof TitleS2CPacket || msg instanceof SubtitleS2CPacket) {
+            kind = "TITLE";
+            text = describeObject(msg, 1);
+            key = text;
+        } else if (msg instanceof GameMessageS2CPacket gm) {
+            kind = "MESSAGE";
+            text = describeObject(gm, 1);
+            key = text;
+        } else if (info != null && !info.id().startsWith("particle:") && !isListenNoise(info.id())) {
+            kind = "PAYLOAD";
+            String strings = String.join(" | ", info.strings());
+            text = info.id() + (strings.isEmpty() ? "" : " " + (strings.length() > 300 ? strings.substring(0, 300) + "..." : strings));
+            key = info.id();
+            pos = info.pos();
+        }
+        if (kind == null) return;
+        final String k = kind, ke = key, t = text;
+        final double[] p = pos;
+        final boolean g = green;
+        MinecraftClient.getInstance().execute(() -> scanRecord(k, ke, t, p, g));
+    }
+
+    /** Main thread: count it, remember the green spot, and write a line (repeats of the same thing are thinned out). */
+    private void scanRecord(String kind, String key, String text, double[] pos, boolean green) {
+        if (!scanning) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        long now = System.currentTimeMillis();
+        scanCounts.computeIfAbsent(kind + " " + (key.length() > 160 ? key.substring(0, 160) : key), x -> new int[1])[0]++;
+        if (kind.equals("BOSSBAR") || kind.equals("ACTIONBAR")) scanLastBar = text;
+
+        String where = "";
+        if (pos != null && client.player != null) {
+            where = String.format(" @ %.1f, %.1f, %.1f (%.1f blocks away)", pos[0], pos[1], pos[2],
+                client.player.getPos().distanceTo(new Vec3d(pos[0], pos[1], pos[2])));
+        }
+        if (green && pos != null) {
+            scanGreenCount++;
+            scanGreen.add(pos);
+            if (scanGreen.size() > 400) scanGreen.remove(0);
+            double sx = 0, sy = 0, sz = 0;
+            int n = Math.min(8, scanGreen.size());
+            for (int i = scanGreen.size() - n; i < scanGreen.size(); i++) {
+                sx += scanGreen.get(i)[0]; sy += scanGreen.get(i)[1]; sz += scanGreen.get(i)[2];
+            }
+            scanMarker = new Vec3d(sx / n, sy / n, sz / n);
+            if (now - scanLastGreenSayAt > 5000) {
+                scanLastGreenSayAt = now;
+                say(client, "Green particle" + where + ". The spot is marked above your hotbar.");
+            }
+        }
+
+        String logKey = kind + key;
+        Long last = scanLastLogged.get(logKey);
+        long gap = kind.equals("PARTICLE") ? 3000 : 300;
+        if (last != null && now - last < gap) return;
+        scanLastLogged.put(logKey, now);
+        if (scanLines++ > SCAN_MAX_LINES) return;
+        String player = client.player == null ? ""
+            : String.format(" | you at %.1f, %.1f, %.1f", client.player.getX(), client.player.getY(), client.player.getZ());
+        String marker = scanMarker == null || client.player == null ? ""
+            : String.format(" | green spot %.1f blocks away", client.player.getPos().distanceTo(scanMarker));
+        appendToFile(SCAN_FILE, String.format("[+%.2fs] %s%s %s%s%s%s", (now - scanStart) / 1000.0, kind,
+            green ? " GREEN" : "", text, where, player, marker));
+    }
+
+    /** Every tick while scanning: point at the green spot above the hotbar and write a short snapshot now and then. */
+    private void scanTick(MinecraftClient client) {
+        if (client.player == null) return;
+        long now = System.currentTimeMillis();
+        if (scanMarker != null) {
+            double dx = scanMarker.x - client.player.getX();
+            double dz = scanMarker.z - client.player.getZ();
+            double dy = scanMarker.y - client.player.getY();
+            double dist = client.player.getPos().distanceTo(scanMarker);
+            float bearing = (float) Math.toDegrees(Math.atan2(-dx, dz));
+            float diff = MathHelper.wrapDegrees(bearing - client.player.getYaw());
+            String[] arrows = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
+            String arrow = arrows[Math.floorMod((int) Math.round(diff / 45.0), 8)];
+            client.inGameHud.setOverlayMessage(Text.literal(String.format("Green spot: %.0f blocks %s  (height %+.0f)", dist, arrow, dy))
+                .formatted(Formatting.GREEN), false);
+        }
+        if (now - scanLastSnapAt >= 2000) {
+            scanLastSnapAt = now;
+            if (scanMarker != null || !scanLastBar.isEmpty()) {
+                String marker = scanMarker == null ? "none"
+                    : String.format("%.1f, %.1f, %.1f (%.1f blocks)", scanMarker.x, scanMarker.y, scanMarker.z,
+                        client.player.getPos().distanceTo(scanMarker));
+                if (scanLines++ <= SCAN_MAX_LINES) {
+                    appendToFile(SCAN_FILE, String.format("[+%.2fs] SNAP you at %.1f, %.1f, %.1f | green spot %s | last bar/message: %s",
+                        (now - scanStart) / 1000.0, client.player.getX(), client.player.getY(), client.player.getZ(), marker,
+                        scanLastBar.isEmpty() ? "none" : scanLastBar));
+                }
+            }
+        }
     }
 
     // ============================== Area Zero centre ==============================

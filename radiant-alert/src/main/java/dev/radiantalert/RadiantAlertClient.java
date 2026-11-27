@@ -6,6 +6,8 @@ import com.google.common.collect.Multimap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -21,12 +23,17 @@ import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.screen.DeathScreen;
+import net.minecraft.client.gui.screen.DisconnectedScreen;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.network.ServerAddress;
+import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
@@ -76,24 +83,23 @@ import java.util.stream.Stream;
 
 /**
  * Radiant Alert: tells you about radiants, shinies, Lunala/Solgaleo and Ultra Wormholes, and can
- * optionally go and deal with them for you:
+ * go and deal with them for you.
  *
- *  /radiantalert auto      walk to radiants and shinies, throw balls, wait for each result,
- *                          then send "/home us" once caught
- *  /radiantalert wormhole  walk into wormholes, send out a Pokémon after the first teleport,
- *                          then send "/home us" after the second teleport
- *                          (at the end of a wormhole it also catches an Ultra Beast with Beast Balls,
- *                          and if you die inside the wormhole it respawns you, re-equips a chestplate and
- *                          sends your first Pokémon out again with R, then carries on)
- *  /radiantalert party     show what is in your party (and which one counts as a normal Hoopa)
- *  /radiantalert items     list your inventory items and which ones the clean-up would drop
- *  /radiantalert clean     dry run: show what the clean-up would drop ('clean go' really does it)
- *  /radiantalert autoclean clean up automatically when about 5 slots are free
- *  /radiantalert hoopa     send out a normal Hoopa from your party and put it on your shoulder
- *  /radiantalert autohoopa do that automatically after you arrive somewhere
- *  /radiantalert stop      cancel everything
- *  /radiantalert listen    record a timeline (packets, chat, teleports, screens) to radiantalert-listen.txt,
- *                          handy when you switch servers and want to see what happens
+ *  /radiantalert ultraspace   switch on everything that runs by itself: auto-catch, wormholes, auto-clean, auto-Hoopa and rejoin
+ *  /radiantalert areazero     auto-catch and auto-clean; after a catch you stay in the same spot (no home teleport),
+ *                             after a clean-up you warp back with /warp center<N>
+ *  /radiantalert center <1-6> which centre Area Zero warps back to (starts as 4, so /warp center4)
+ *  /radiantalert stop         switch everything off and cancel what it is doing
+ *
+ *  While any of the automatic features is on, a battle you didn't ask for (even while just waiting for a wormhole)
+ *  gets Esc for the battle screen and then /endbattle.
+ *
+ *  /radiantalert auto         walk to radiants and shinies, throw balls, wait for each result, then go home
+ *                             (Alphas / Paradoxes are hit until the battle starts; Esc out of the battle menu, then balls)
+ *  /radiantalert rejoin       if the server closes on you (nightly restart) keep trying to join again, then go home
+ *
+ *  /radiantalert home <name>  which home the automatic trips use (e.g. guzzlord for /home guzzlord; starts as us)
+ *  /radiantalert status       what is switched on and what it is doing
  */
 public class RadiantAlertClient implements ClientModInitializer {
 
@@ -107,7 +113,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final boolean ALERT_SPECIES = true;
     private static final boolean ALERT_WORMHOLE = true;
 
-    /** Aspect names that mark a Pokémon as Radiant. Use /radiantalert debug to check what Delta uses. */
+    /** Aspect names that mark a Pokémon as Radiant. */
     private static final Set<String> RADIANT_ASPECTS = Set.of("radiant");
 
     /** Species to alert on (lowercase). Alert only: these are NOT caught automatically. */
@@ -133,7 +139,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     // --- Catching ---
     /** Command sent after a catch (or when a Pokémon can't be captured). No slash. */
-    private static final String HOME_COMMAND = "home us";
+    private static final String DEFAULT_HOME_NAME = "us";   // the home used until you change it with /radiantalert home <name>
     /** After sending the home command, don't start anything new for this long (ms), so you don't walk off mid-teleport. */
     private static final long HOME_COOLDOWN_MS = 15000;
 
@@ -156,6 +162,32 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** A plain SHINY is given up on after this many balls (then it goes home). Radiants have no ball limit. */
     private static final int MAX_BALLS_SHINY = 20;
+
+    /**
+     * Shinies of these species (names without spaces, lowercase) get no ball limit and a Master Ball - but only
+     * once every other ball (not counting Beast Balls) has been used up. Ralts only (not its evolutions), plus all
+     * the starters and their evolution lines.
+     */
+    private static final Set<String> MASTER_BALL_SPECIES = Set.of(
+        "ralts",
+        "bulbasaur", "ivysaur", "venusaur", "charmander", "charmeleon", "charizard", "squirtle", "wartortle", "blastoise",
+        "chikorita", "bayleef", "meganium", "cyndaquil", "quilava", "typhlosion", "totodile", "croconaw", "feraligatr",
+        "treecko", "grovyle", "sceptile", "torchic", "combusken", "blaziken", "mudkip", "marshtomp", "swampert",
+        "turtwig", "grotle", "torterra", "chimchar", "monferno", "infernape", "piplup", "prinplup", "empoleon",
+        "snivy", "servine", "serperior", "tepig", "pignite", "emboar", "oshawott", "dewott", "samurott",
+        "chespin", "quilladin", "chesnaught", "fennekin", "braixen", "delphox", "froakie", "frogadier", "greninja",
+        "rowlet", "dartrix", "decidueye", "litten", "torracat", "incineroar", "popplio", "brionne", "primarina",
+        "grookey", "thwackey", "rillaboom", "scorbunny", "raboot", "cinderace", "sobble", "drizzile", "inteleon",
+        "sprigatito", "floragato", "meowscarada", "fuecoco", "crocalor", "skeledirge", "quaxly", "quaxwell", "quaquaval");
+
+    /** Paradox Pokémon (names without spaces, lowercase). Like Alphas, they must be beaten down in melee before the battle starts. */
+    private static final Set<String> PARADOX_SPECIES = Set.of(
+        "greattusk", "screamtail", "brutebonnet", "fluttermane", "slitherwing", "sandyshocks", "roaringmoon",
+        "walkingwake", "gougingfire", "ragingbolt", "irontreads", "ironbundle", "ironhands", "ironjugulis",
+        "ironmoth", "ironthorns", "ironvaliant", "ironleaves", "ironboulder", "ironcrown", "koraidon", "miraidon");
+
+    /** In a battle catch, wait at most this long (ticks) after a throw for the turn to finish before throwing again. */
+    private static final int TURN_TIMEOUT_TICKS = 20 * 10;
     /** Give up on any catch after this long in total (ticks, 20 = 1 second): 10 minutes. */
     private static final int MAX_CATCH_TICKS = 20 * 60 * 10;
     /** Don't chase anything further away than this (blocks). */
@@ -190,7 +222,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final double WORMHOLE_JUMP_DISTANCE = 1.3;
     private static final double WORMHOLE_MAX_DISTANCE = 150;
     private static final int WORMHOLE_WALK_TIMEOUT_TICKS = 20 * 90;
-    private static final int WORMHOLE_PUSH_TICKS = 100;
+    private static final int WORMHOLE_PUSH_TICKS = 400;   // 20 s: a wormhole that is still opening can take a while
     /** Wait after a teleport before acting, so the new world has loaded. */
     private static final int AFTER_TELEPORT_WAIT_TICKS = 60;
     /** Give up waiting for the second teleport after this long. */
@@ -211,7 +243,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final int ULTRA_BEAST_WAIT_TICKS = 20 * 15;
     private static final double ULTRA_BEAST_SEARCH_RADIUS = 128;
 
-    // --- Inventory clean-up (/radiantalert autoclean) ---
+    // --- Inventory clean-up (auto-clean, or /radiantalert clean) ---
     /** Command that takes you to the drop-off spot. No slash. */
     private static final String DEPOSIT_COMMAND = "home deposit";
     /** Clean up when this many inventory slots (or fewer) are free. */
@@ -282,7 +314,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     /** Never dropped, even though they look like a pattern above. */
     private static final Set<String> JUNK_NAME_EXCEPTIONS = Set.of("eviolite", "ender pearl");
 
-    // --- Hoopa on your shoulder (/radiantalert autohoopa) ---
+    // --- Hoopa on your shoulder (auto-Hoopa, or /radiantalert hoopa) ---
     private static final String HOOPA_SPECIES = "hoopa";
     /** Terapagos goes on the shoulder only while you are inside a wormhole (right after the first teleport). */
     private static final String TERAPAGOS_SPECIES = "terapagos";
@@ -396,6 +428,8 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int hTicks = 0, hSlot = -1, hAttempts = 0, hPrevSlot = -1, hGuiTicks = 0;
     private PokemonEntity hEntity = null;
     private long hoopaDueAt = 0, hoopaCooldownUntil = 0, hoopaMountedAt = 0;
+    private static final int SR_STARTED = 1, SR_BUSY = 2, SR_PARTY_UNREADABLE = 3, SR_NOT_IN_PARTY = 4, SR_ALREADY = 5;
+    private int shoulderResult = 0;
     private boolean sneakHeld = false;
     private boolean hWheelClicked = false;
     private String shoulderSpecies = HOOPA_SPECIES;
@@ -421,7 +455,28 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int chestSwapSlot = -1;                          // where the elytra was put when a chestplate went on
     private int catchPrevSlot = -1;                          // the hotbar slot that was selected before we started throwing
     private int noPokemonTicks = 0;
+    private long pendingRecallAtMs = 0, pendingHomeAtMs = 0;
+    private boolean autoRejoinEnabled = false;
+    private boolean areaZeroMode = false;   // auto-catch only; after a catch (or any end) stay where you are - no home teleport
+    private boolean wasInGame = false;
+    private int rejoinAttempts = 0;
+    private long nextRejoinAt = 0, rejoinHomeAtMs = 0;
+    private String lastServerAddress = "play.cobblemondelta.com";
+    private static final long REJOIN_FIRST_DELAY_MS = 20000, REJOIN_INTERVAL_MS = 60000, REJOIN_HOME_DELAY_MS = 10000;
+    private Vec3d pendingWormhole = null;   // a wormhole we want to go to as soon as nothing important is going on
+    private long pendingWormholeAt = 0;
+    private int recallSlot = -1;
+    private boolean noHomeOnStop = false;
     private int ownHitTicks = 0, strafeTicks = 0;
+    private boolean killMode = false;        // an Alpha / Paradox: hit it until the battle starts
+    private boolean battleFirst = false;     // about to be cleared: go into a battle with it (R) first
+    private boolean battleStarted = false;   // a battle with the target is on: Esc out of the menu, then throw (one throw per turn)
+    private boolean turnReady = true;
+    private boolean sawBattleScreen = false;
+    private boolean allowMasterLast = false; // Master Ball only after every other ball (starters, Ralts)
+    private boolean weaponReady = false;
+    private int turnWait = 0, battleRTicks = 0, attacksDone = 0;
+    private long clearWarnAt = 0;
     private Screen lastUnblockScreen = null;
     private int screenOpenTicks = 0;
     private long lastEndBattleAt = 0;
@@ -461,6 +516,9 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        loadHomeName();
+        loadCenterNumber();
+
         ClientEntityEvents.ENTITY_LOAD.register((entity, world) -> onEntityLoad(entity));
 
         // Watch what the server sends (particle effects, custom packets); also notices server switches
@@ -481,100 +539,82 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
             dispatcher.register(ClientCommandManager.literal("radiantalert")
-                .then(ClientCommandManager.literal("debug").executes(ctx -> {
-                    debugNearest(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("entities").executes(ctx -> {
-                    listEntities(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("record").executes(ctx -> {
-                    toggleRecord(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("listen").executes(ctx -> {
-                    toggleListen(MinecraftClient.getInstance());
-                    return 1;
-                }))
                 .then(ClientCommandManager.literal("auto").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
+                    areaZeroMode = false;
                     autoCatchEnabled = !autoCatchEnabled;
                     say(c, autoCatchEnabled
-                        ? "Auto-catch ON: I'll walk to radiants and shinies, throw balls, and send /" + HOME_COMMAND + " once caught. Cancel with /radiantalert stop."
+                        ? "Auto-catch ON: I'll walk to radiants and shinies, throw balls, and send /" + homeCommand() + " once caught. Cancel with /radiantalert stop."
                         : "Auto-catch OFF.");
                     return 1;
                 }))
-                .then(ClientCommandManager.literal("wormhole").executes(ctx -> {
+                .then(ClientCommandManager.literal("rejoin").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
-                    autoWormholeEnabled = !autoWormholeEnabled;
-                    say(c, autoWormholeEnabled
-                        ? "Auto-wormhole ON: I'll walk into wormholes that open near you. Cancel with /radiantalert stop."
-                        : "Auto-wormhole OFF.");
+                    autoRejoinEnabled = !autoRejoinEnabled;
+                    say(c, autoRejoinEnabled
+                        ? "Auto-rejoin ON: if the server closes on you (the nightly restart) I'll try to join " + lastServerAddress
+                            + " again - after 20 s, then once a minute - and go home when I'm back in."
+                        : "Auto-rejoin OFF.");
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("center")
+                    .executes(ctx -> {
+                        say(MinecraftClient.getInstance(), "Area Zero warps back with /" + warpCommand()
+                            + " after a clean-up. Change it with /radiantalert center <1-6>.");
+                        return 1;
+                    })
+                    .then(ClientCommandManager.argument("number", IntegerArgumentType.integer(1, 6)).executes(ctx -> {
+                        setCenterNumber(MinecraftClient.getInstance(), IntegerArgumentType.getInteger(ctx, "number"));
+                        return 1;
+                    })))
+                .then(ClientCommandManager.literal("areazero").executes(ctx -> {
+                    // catching only, and after a catch stay exactly where you are
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    resetAllFeatures(c, "Switching to Area Zero.");   // whatever was running (e.g. Ultra Space mode) is stopped first
+                    areaZeroMode = true;
+                    autoCatchEnabled = true;
+                    autoCleanEnabled = true;
+                    say(c, "Area Zero mode ON (everything else is off): auto-catch and auto-clean. After a catch I stay where I am (no home teleport); "
+                        + "after a clean-up I warp back with /" + warpCommand() + ". Stop with /radiantalert stop.");
+                    return 1;
+                }))
+                .then(ClientCommandManager.literal("ultraspace").executes(ctx -> {
+                    // everything for the Ultra Space area in one go
+                    MinecraftClient c = MinecraftClient.getInstance();
+                    resetAllFeatures(c, "Switching to Ultra Space.");  // whatever was running (e.g. Area Zero mode) is stopped first
+                    autoCatchEnabled = true;
+                    autoWormholeEnabled = true;
+                    autoCleanEnabled = true;
+                    autoHoopaEnabled = true;
+                    autoRejoinEnabled = true;
+                    hoopaDueAt = System.currentTimeMillis() + 2000;
+                    say(c, "Ultra Space mode ON: auto-catch, auto-wormhole, auto-clean, auto-Hoopa and auto-rejoin are all running. "
+                        + "Stop everything with /radiantalert stop.");
                     return 1;
                 }))
                 .then(ClientCommandManager.literal("stop").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
-                    autoCatchEnabled = false;
-                    autoWormholeEnabled = false;
-                    autoCleanEnabled = false;
-                    autoHoopaEnabled = false;
-                    ubCatch = false;
-                    hoopaReturn = false;
-                    abortCurrent(c, "Stopped.");
+                    resetAllFeatures(c, "Stopped.");
                     say(c, "All automatic features are OFF.");
                     return 1;
                 }))
-                .then(ClientCommandManager.literal("party").executes(ctx -> {
-                    showParty(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("items").executes(ctx -> {
-                    dumpItems(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("chestplate").executes(ctx -> {
-                    startChestTest(MinecraftClient.getInstance());
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("clean")
+                .then(ClientCommandManager.literal("home")
                     .executes(ctx -> {
-                        showCleanPlan(MinecraftClient.getInstance());
+                        say(MinecraftClient.getInstance(), "Automatic trips use /" + homeCommand()
+                            + ". Change it with /radiantalert home <name> (for example /radiantalert home guzzlord).");
                         return 1;
                     })
-                    .then(ClientCommandManager.literal("go").executes(ctx -> {
-                        startClean(MinecraftClient.getInstance(), false);
+                    .then(ClientCommandManager.argument("name", StringArgumentType.word()).executes(ctx -> {
+                        setHomeName(MinecraftClient.getInstance(), StringArgumentType.getString(ctx, "name"));
                         return 1;
                     })))
-                .then(ClientCommandManager.literal("autoclean").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoCleanEnabled = !autoCleanEnabled;
-                    say(c, autoCleanEnabled
-                        ? "Auto-clean ON: when " + INVENTORY_FREE_THRESHOLD + " or fewer slots are free I'll go to /" + DEPOSIT_COMMAND
-                            + " and drop the junk. Check the list first with /radiantalert clean."
-                        : "Auto-clean OFF.");
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("hoopa").executes(ctx -> {
-                    startHoopa(MinecraftClient.getInstance(), true);
-                    return 1;
-                }))
-                .then(ClientCommandManager.literal("autohoopa").executes(ctx -> {
-                    MinecraftClient c = MinecraftClient.getInstance();
-                    autoHoopaEnabled = !autoHoopaEnabled;
-                    if (autoHoopaEnabled) hoopaDueAt = System.currentTimeMillis() + 2000;
-                    say(c, autoHoopaEnabled
-                        ? "Auto-Hoopa ON: after you arrive on an Ultra Wild server (ultrawild1/2) I'll put a normal Hoopa from your party on your shoulder."
-                        : "Auto-Hoopa OFF.");
-                    return 1;
-                }))
                 .then(ClientCommandManager.literal("status").executes(ctx -> {
                     MinecraftClient c = MinecraftClient.getInstance();
-                    say(c, "packet watcher: " + spyInstalled + " | recording: " + recording + " | listening: " + listening
-                        + " | auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
+                    say(c, "auto-catch: " + autoCatchEnabled + " | auto-wormhole: " + autoWormholeEnabled
                         + " | auto-clean: " + autoCleanEnabled + " | auto-hoopa: " + autoHoopaEnabled
+                        + " | auto-rejoin: " + autoRejoinEnabled + " | area zero: " + areaZeroMode + " (/" + warpCommand() + ")"
                         + " | task: " + task + (task == Task.WORMHOLE ? " (" + wStage + ")" : "")
-                        + " | server: " + lastServerName);
+                        + " | home: /" + homeCommand() + " | server: " + lastServerName);
                     return 1;
                 }))));
     }
@@ -609,7 +649,14 @@ public class RadiantAlertClient implements ClientModInitializer {
             KeyBinding.setKeyPressed(InputUtil.fromTranslationKey(SEND_OUT_KEY), false);
         }
 
+        rejoinTick(client);
+
         if (client.player == null || client.world == null) { pending.clear(); return; }
+
+        if (pendingWormhole != null) {
+            if (!autoWormholeEnabled) pendingWormhole = null;
+            else if (client.currentScreen == null) startPendingWormhole(client);
+        }
 
         if (++idleCheckTicks >= 20) {
             idleCheckTicks = 0;
@@ -618,6 +665,20 @@ public class RadiantAlertClient implements ClientModInitializer {
             reviveCheck(client);
         }
         if (chestTestStage != 0) chestTestTick(client);
+        if (pendingRecallAtMs != 0 || pendingHomeAtMs != 0) {
+            long nowMs = System.currentTimeMillis();
+            client.player.setPitch(85.0f);                          // keep looking at the ground: R recalls instead of starting a battle
+            if (pendingRecallAtMs != 0 && nowMs >= pendingRecallAtMs) {
+                pendingRecallAtMs = 0;
+                if (recallSlot >= 0) trySelectPartySlot(recallSlot);
+                pressSendOutKey();
+                autoLog("RECALL pressed R");
+            }
+            if (pendingHomeAtMs != 0 && nowMs >= pendingHomeAtMs) {
+                pendingHomeAtMs = 0;
+                sendHome(client);
+            }
+        }
 
         // Dying: respawn, put a chestplate back on, and
         //  - inside the wormhole (a life is lost, the run goes on): send your first Pokémon out again with R;
@@ -633,7 +694,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     say(client, "You died in the wormhole - respawning, then sending your first Pokémon out again.");
                 } else {
                     ubCatch = false;
+                    noHomeOnStop = true;
                     abortCurrent(client, "You died - respawning.");
+                    noHomeOnStop = false;
                 }
                 lastRespawnAt = System.currentTimeMillis();
                 client.player.requestRespawn();
@@ -736,7 +799,11 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void autoTickInner(MinecraftClient client) {
-        if (task == Task.IDLE) { releaseKeys(client); return; }
+        if (task == Task.IDLE) {
+            releaseKeys(client);
+            idleBattleWatch(client);   // even while just waiting (e.g. for a wormhole): a battle we didn't ask for gets Esc, then /endbattle
+            return;
+        }
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) { releaseKeys(client); return; }
         if (client.currentScreen != null) {
@@ -746,7 +813,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 return;
             }
             // the party menu Cobblemon opens when a revive is used: click the fainted Pokémon in it
-            if (reviveStage == 3 && client.currentScreen.getClass().getName().startsWith("com.cobblemon")
+            if (reviveStage == 3 && !client.currentScreen.getClass().getName().startsWith("net.minecraft.")
                     && !client.currentScreen.getClass().getName().toLowerCase(Locale.ROOT).contains("battle")) {
                 reviveScreen(client);
                 return;
@@ -758,6 +825,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         lastUnblockScreen = null;
         lastUnblockClass = "";
         screenOpenTicks = 0;
+        if (sawBattleScreen) {        // the battle menu has just been dismissed: the turn is over, we may throw
+            sawBattleScreen = false;
+            turnReady = true;
+        }
 
         // standing still while the chestplate goes on (inventory clicks while moving can be rejected by the server)
         if (chestPauseTicks > 0) {
@@ -769,7 +840,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         // already in a battle (e.g. an Alpha started one) and we need to walk: /endbattle
         // (never for the Ultra Beast catch - there you just back out of the battle screen)
-        if (!ubCatch && wantsToMove()) endBattleIfNeeded(client);
+        if (!ubCatch && !killMode && !battleFirst && !battleStarted && wantsToMove()) endBattleIfNeeded(client);
 
         switch (task) {
             case CATCH -> catchTick(client, player);
@@ -808,7 +879,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (retryKind != RetryKind.NONE) retryAttempts++;
         }
         ubCatch = false; // we send the home command ourselves
-        abortCurrent(client, "Off course (" + reason + ") - going to /" + HOME_COMMAND
+        abortCurrent(client, "Off course (" + reason + ") - going to /" + homeCommand()
             + (retryKind != RetryKind.NONE ? " and trying again." : "."));
         sendHome(client);
     }
@@ -997,17 +1068,40 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (Math.sqrt(dx * dx + dy * dy + dz * dz) < DEDUPE_RADIUS) {
                 // same wormhole still sending effects: refresh its timer, don't alert again
                 wormholesSeen.set(i, new Seen(s.x(), s.y(), s.z(), now));
+                if (pendingWormhole != null) pendingWormholeAt = now;   // still open
                 return;
             }
         }
         wormholesSeen.add(new Seen(p[0], p[1], p[2], now));
         announceWormhole(client, p[0], p[1], p[2], describe(info));
 
-        if (autoWormholeEnabled && canStartTask()) {
+        if (autoWormholeEnabled) {
             retryAttempts = 0;
             wormholeDetectedAt = now;
-            startWormhole(client, new Vec3d(p[0], p[1], p[2]));
+            pendingWormhole = new Vec3d(p[0], p[1], p[2]);
+            pendingWormholeAt = now;
+            startPendingWormhole(client);
+            if (pendingWormhole != null) autoLog("WORMHOLE queued - busy right now (task=" + task + ")");
         }
+    }
+
+    /** Starts the wormhole we are waiting to go to as soon as nothing important is going on. */
+    private void startPendingWormhole(MinecraftClient client) {
+        if (pendingWormhole == null || client.player == null) return;
+        long now = System.currentTimeMillis();
+        if (now - pendingWormholeAt > 25000) {            // no sign of life for a while: it has closed
+            autoLog("WORMHOLE closed before I could start");
+            pendingWormhole = null;
+            return;
+        }
+        if (task == Task.CLEAN || task == Task.HOOPA) {   // those can wait, a wormhole can't
+            autoLog("WORMHOLE takes over from " + task);
+            abortCurrent(client, "A wormhole opened - leaving that for later.");
+        }
+        if (!canStartTask()) return;
+        Vec3d pos = pendingWormhole;
+        pendingWormhole = null;
+        startWormhole(client, pos);
     }
 
     /** Short label for the alert: the matching effect name, e.g. "us_portal_rift_red". */
@@ -1041,11 +1135,20 @@ public class RadiantAlertClient implements ClientModInitializer {
         // don't chase Pokémon around a clean-up (wormholes are unaffected)
         if (lower.contains("ground items") && lower.contains("cleared")) {
             boolean warning = lower.contains("will be cleared");
-            autoLog("CLEAR message (" + (warning ? "warning - ignored" : "it happened") + ")");
-            if (!warning) {
-                // the clean-up has just happened: the Pokémon we were after are gone
+            autoLog("CLEAR message (" + (warning ? "warning" : "it happened") + ")");
+            if (warning) {
+                // Pokémon are going to be cleared: go into a battle with the shiny / radiant we are after (R), then Esc and throw
+                clearWarnAt = System.currentTimeMillis();
+                if (task == Task.CATCH && !ubCatch && !killMode && !battleStarted && !battleFirst) {
+                    battleFirst = true;
+                    battleRTicks = 0;
+                    say(MinecraftClient.getInstance(), "Pokémon are about to be cleared - going into a battle with " + targetName + " first.");
+                }
+            } else {
+                clearWarnAt = 0;
                 clearBlockUntil = System.currentTimeMillis() + 8000;
-                if (task == Task.CATCH && !ubCatch) {
+                // the clean-up has just happened: the Pokémon we were after are gone - unless we are already in a battle with it
+                if (task == Task.CATCH && !ubCatch && !battleStarted) {
                     MinecraftClient client = MinecraftClient.getInstance();
                     stopAuto(client, "Wild Pokémon were just cleared - stopping the catch and going home.");
                     sendHome(client);
@@ -1093,6 +1196,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
         if (task == Task.CATCH) {
             ubCatch = false;
+            noHomeOnStop = true;
             stopAuto(client, "The server changed - stopping the catch.");
         } else if (task == Task.WORMHOLE && (respawnPending || now - lastRespawnAt < 6000)) {
             autoLog("HOP ignored (just respawned)");
@@ -1111,7 +1215,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     if (wStage == WStage.ENCOUNTER || now - wArrivedAt > 8000) {
                         wStage = WStage.FINISHED;
                         wTicks = 0;
-                        say(client, "Left the wormhole - sending /" + HOME_COMMAND + " shortly.");
+                        say(client, "Left the wormhole - sending /" + homeCommand() + " shortly.");
                     }
                 }
                 default -> { }
@@ -1138,12 +1242,16 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (client.player == null) return;
         restoreSwaps(client);
         long now = System.currentTimeMillis();
+        if (areaZeroMode) {                      // Area Zero: stay in the same spot
+            autoLog("HOME skipped - area zero, staying here");
+            return;
+        }
         if (now - lastHomeSentAt < 5000) return; // already sent a moment ago
         lastHomeSentAt = now;
         homeCooldownUntil = now + HOME_COOLDOWN_MS;
-        client.player.networkHandler.sendChatCommand(HOME_COMMAND);
-        autoLog("SENT /" + HOME_COMMAND);
-        say(client, "Sent /" + HOME_COMMAND);
+        client.player.networkHandler.sendChatCommand(homeCommand());
+        autoLog("SENT /" + homeCommand());
+        say(client, "Sent /" + homeCommand());
     }
 
     // ============================== Catching ==============================
@@ -1168,6 +1276,17 @@ public class RadiantAlertClient implements ClientModInitializer {
         target = e;
         targetName = e.getPokemon().getSpecies().getName();
         allowPremiumBalls = radiant;
+        Pokemon pk = e.getPokemon();
+        allowMasterLast = pk.getShiny() && !radiant && !ultraBeast && MASTER_BALL_SPECIES.contains(normalizedName(pk));
+        killMode = !ultraBeast && isAlphaOrParadox(e);
+        battleFirst = !ultraBeast && !killMode && clearWarningActive();
+        battleStarted = ultraBeast;              // the Ultra Beast battle is already on
+        turnReady = false;
+        turnWait = 0;
+        battleRTicks = 0;
+        attacksDone = 0;
+        sawBattleScreen = false;
+        weaponReady = false;
         catchTicks = 0;
         throwsDone = 0;
         throwCooldown = 0;
@@ -1185,6 +1304,9 @@ public class RadiantAlertClient implements ClientModInitializer {
             say(client, "Heading to " + (radiant ? "Radiant " : "Shiny ") + targetName
                 + (radiant ? " (Master/Ancient Origin balls allowed)." : " (no Master/Ancient Origin balls).")
                 + " Open chat and run /radiantalert stop to cancel.");
+            if (killMode) say(client, "It's an Alpha/Paradox: I'll hit it until the battle starts, then Esc out of the menu and throw balls.");
+            if (allowMasterLast) say(client, "No ball limit for this one; a Master Ball only once every other ball is used up.");
+            if (battleFirst) say(client, "Pokémon are about to be cleared: I'll go into a battle with it first.");
         }
     }
 
@@ -1214,6 +1336,21 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (throwCooldown > 0) throwCooldown--;
         if (zoneOverrideTicks > 0) zoneOverrideTicks--;
 
+        // Alpha / Paradox: hit it until the battle starts. About to be cleared: go into a battle with it first (R).
+        if ((killMode || battleFirst) && !battleStarted) {
+            boolean tried = (killMode && attacksDone > 0) || (battleFirst && battleRTicks > 0);
+            if (tried && battleActive()) {
+                battleStarted = true;
+                turnReady = false;
+                turnWait = 0;
+                autoLog("CATCH a battle with " + targetName + " is on");
+                say(client, "In battle with " + targetName + ".");
+            } else {
+                if (killMode) killTick(client, player, current); else battleFirstTick(client, player, current);
+                return;
+            }
+        }
+
         if (inThrowZone(player, current) || zoneOverrideTicks > 0) {
             // close enough, not too close, and in view: stand still and throw
             releaseKeys(client);
@@ -1238,11 +1375,17 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private void throwTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
         if (throwCooldown > 0) return;
-        if (!allowPremiumBalls && !ubCatch && throwsDone >= MAX_BALLS_SHINY) {
+        if (!allowPremiumBalls && !ubCatch && !allowMasterLast && throwsDone >= MAX_BALLS_SHINY) {
             // a plain shiny only gets MAX_BALLS_SHINY balls; then give up and go home
             stopAuto(client, "Used " + MAX_BALLS_SHINY + " balls on " + targetName + " - giving up.");
             sendHome(client);
             return;
+        }
+        // in a battle the Pokémon uses moves too: only throw once the turn has finished (the battle menu coming back = a new turn)
+        if (battleCatch() && !turnReady) {
+            if (++turnWait < TURN_TIMEOUT_TICKS) return;
+            autoLog("CATCH waited long enough for the turn - throwing anyway");
+            turnReady = true;
         }
         if (switchWait > 0) { switchWait--; return; }
         if (angleError(player, current) > 4.0f) return; // wait until we're aimed at it
@@ -1262,6 +1405,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (slot < 0) {
             stopAuto(client, ubCatch
                 ? "No Beast Ball anywhere in your inventory!"
+                : allowMasterLast
+                    ? "No ball of any kind left in your inventory."
                 : allowPremiumBalls
                     ? "No usable ball anywhere in your inventory."
                     : "No usable ball anywhere in your inventory (Master/Ancient Origin balls are not used for shinies).");
@@ -1298,6 +1443,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         ball = null;
         captureStarted = false;
         ownHitTicks = 0;
+        turnReady = false;
+        turnWait = 0;
         autoLog("THROW #" + throwsDone);
         say(client, "Threw ball #" + throwsDone + " at " + targetName + ". Waiting for the result...");
     }
@@ -1324,8 +1471,23 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (s.isEmpty()) continue;
             String id = Registries.ITEM.getId(s.getItem()).toString();
             if (!id.startsWith("cobblemon:") || !id.endsWith("_ball")) continue;
-            if (!allowPremiumBalls && (id.endsWith("master_ball") || id.endsWith("ancient_origin_ball"))) continue;
+            if (id.endsWith("beast_ball")) continue;                       // Beast Balls are for Ultra Beasts only
+            if (id.endsWith("master_ball") || id.endsWith("ancient_origin_ball")) continue; // premium balls: handled below
             return i;
+        }
+        // premium balls: a radiant may use them; a starter / Ralts shiny only falls back to the Master Ball, last of all
+        if (allowPremiumBalls) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (s.isEmpty()) continue;
+                String id = Registries.ITEM.getId(s.getItem()).toString();
+                if (id.endsWith("master_ball") || id.endsWith("ancient_origin_ball")) return i;
+            }
+        } else if (allowMasterLast) {
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getStack(i);
+                if (!s.isEmpty() && Registries.ITEM.getId(s.getItem()).toString().endsWith("master_ball")) return i;
+            }
         }
         return -1;
     }
@@ -1401,14 +1563,56 @@ public class RadiantAlertClient implements ClientModInitializer {
         autoLog("RESULT caught");
         String name = targetName;
         int balls = throwsDone;
+        int outSlot = outPartySlot(client);   // a Pokémon of ours is out (a battle catch): it has to be brought back
+        if (outSlot >= 0) noHomeOnStop = true; // stopAuto must not send /home before the recall
+        ubCatch = false;                      // we send the home command ourselves, after the recall
         stopAuto(client, "✔ Caught " + name + " with ball #" + balls + "!");
         if (client.player != null) client.player.playSound(SoundEvents.ENTITY_PLAYER_LEVELUP, 1.0f, 1.0f);
-        sendHome(client);
+        if (outSlot >= 0 && client.player != null) {
+            long now = System.currentTimeMillis();
+            recallSlot = outSlot;
+            pendingRecallAtMs = now + 300;    // look at the ground first, then press R
+            pendingHomeAtMs = now + 1800;
+            homeCooldownUntil = areaZeroMode ? now + 3000 : now + 20000;  // nothing else starts meanwhile
+            client.player.setPitch(85.0f);
+            autoLog("RECALL will bring back party slot " + (outSlot + 1) + " before going home");
+            say(client, "Recalling your Pokémon before going home.");
+        } else {
+            sendHome(client);
+        }
+    }
+
+    /** Party slot of the Pokémon of ours that is out (not a shoulder one), or -1. */
+    private int outPartySlot(MinecraftClient client) {
+        if (client.player == null || client.world == null) return -1;
+        try {
+            List<Pokemon> party = readParty();
+            for (PokemonEntity pe : client.world.getEntitiesByClass(PokemonEntity.class,
+                    client.player.getBoundingBox().expand(48),
+                    x -> client.player.getUuid().equals(x.getOwnerUuid()) && !x.isRemoved() && !isShoulderSpecies(x.getPokemon()))) {
+                for (int i = 0; i < party.size(); i++) {
+                    Pokemon p = party.get(i);
+                    if (p != null && p.getUuid().equals(pe.getPokemon().getUuid())) return i;
+                }
+            }
+        } catch (Throwable ignored) {
+            // can't tell
+        }
+        return -1;
     }
 
     private void stopAuto(MinecraftClient client, String message) {
-        boolean goHome = ubCatch; // an Ultra Beast catch always ends by going home, however it ended
+        boolean goHome = !noHomeOnStop;   // a catch always ends by going home, however it ended - except when stopped by hand / by a server change
+        noHomeOnStop = false;
         ubCatch = false;
+        killMode = false;
+        battleFirst = false;
+        battleStarted = false;
+        turnReady = true;
+        allowMasterLast = false;
+        sawBattleScreen = false;
+        weaponReady = false;
+        attacksDone = 0;
         task = Task.IDLE;
         target = null;
         phase = Phase.READY;
@@ -1463,7 +1667,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                     stopWormhole(client, "Reached the wormhole but wasn't teleported.");
                     return;
                 }
-                // walk toward the centre and jump exactly once when we're right at it
+                // walk toward the centre and jump when we're right at it; if nothing happens (it may still be opening) jump again every 2 s
+                if (wormholeJumped && wTicks % 40 == 0) wormholeJumped = false;
                 double hd = Math.hypot(player.getX() - wormholePos.x, player.getZ() - wormholePos.z);
                 float yaw = (float) Math.toDegrees(Math.atan2(wormholePos.z - player.getZ(), wormholePos.x - player.getX())) - 90.0f;
                 player.setYaw(MathHelper.lerpAngleDegrees(0.5f, player.getYaw(), yaw));
@@ -1621,7 +1826,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (found < 0) {
             if (chestAttempts++ % 10 == 0) {
                 autoLog("CHEST no chestplate found in the inventory");
-                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory! (Run /radiantalert items to see what you carry.)");
+                say(client, "You're not wearing a chestplate and I couldn't find one in your inventory!");
             }
             return;
         }
@@ -2597,8 +2802,13 @@ public class RadiantAlertClient implements ClientModInitializer {
                     noPokemonTicks = 100;
                     reviveCooldownUntil = now + 5000;
                 } else if (reviveTicks > 80) {
-                    reviveCooldownUntil = now + 30000;
-                    endRevive(client, "The revive didn't seem to work - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+                    if (reviveRetries++ < 1) {          // try the menu once more
+                        reviveStage = 2;
+                        reviveTicks = 0;
+                    } else {
+                        reviveCooldownUntil = now + 30000;
+                        endRevive(client, "The revive didn't seem to work - see radiantalert-auto.txt (REVIVE and DUMP lines).");
+                    }
                 }
             }
             default -> { }
@@ -2653,23 +2863,102 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
     }
 
+    /** In the menu that asks which Pokémon to use the revive on: find the entry for that Pokémon and press it. */
     private boolean tryClickPartySlot(Screen screen, int slot) {
         try {
             List<Pokemon> party = readParty();
             Pokemon wanted = slot >= 0 && slot < party.size() ? party.get(slot) : null;
             if (wanted == null) return false;
-            for (Object o : reachableObjects(screen, 4)) {
-                if (o == screen || !holdsPokemon(o, wanted)) continue;
-                double[] c = centerOf(o);
-                if (c != null) {
-                    screen.mouseClicked(c[0], c[1], 0);
-                    screen.mouseReleased(c[0], c[1], 0);
-                    return true;
+            String species = wanted.getSpecies().getName().toLowerCase(Locale.ROOT);
+            String nick = wanted.getNickname() != null ? wanted.getNickname().getString().toLowerCase(Locale.ROOT) : "";
+
+            // 0) a button on the screen whose text is the Pokémon's name
+            for (var child : screen.children()) {
+                if (!(child instanceof net.minecraft.client.gui.widget.ClickableWidget cw)) continue;
+                String text = cw.getMessage().getString().toLowerCase(Locale.ROOT);
+                if (text.isEmpty()) continue;
+                if (text.contains(species) || (!nick.isEmpty() && text.contains(nick))) {
+                    autoLog("REVIVE button with text '" + text + "'");
+                    if (pressMenuEntry(screen, cw)) return true;
                 }
-                if (invokeOptionAction(o)) return true;
             }
+
+            List<Object> objects = reachableObjects(screen, 5);
+
+            // 1) the menu entry that holds this very Pokémon
+            for (Object o : objects) {
+                if (o == screen || !holdsPokemon(o, wanted)) continue;
+                autoLog("REVIVE entry holding the Pokémon: " + o.getClass().getName());
+                if (pressMenuEntry(screen, o)) return true;
+            }
+            // 2) an entry whose text mentions the Pokémon (its name)
+            for (Object o : objects) {
+                if (o == screen) continue;
+                if (optionLabel(o).contains(species)) {
+                    autoLog("REVIVE entry mentioning '" + species + "': " + o.getClass().getName());
+                    if (pressMenuEntry(screen, o)) return true;
+                }
+            }
+            // 3) an entry that knows its party slot number
+            for (Object o : objects) {
+                if (o == screen || !hasSlotNumber(o, slot)) continue;
+                autoLog("REVIVE entry with slot number " + slot + ": " + o.getClass().getName());
+                if (pressMenuEntry(screen, o)) return true;
+            }
+            // 4) a row of clickable things of the same kind - one per Pokémon (or one per fainted Pokémon): take the one in our slot's place
+            Map<Class<?>, List<Object>> groups = new LinkedHashMap<>();
+            for (Object o : objects) {
+                if (o == screen || centerOf(o) == null) continue;
+                groups.computeIfAbsent(o.getClass(), k -> new ArrayList<>()).add(o);
+            }
+            List<Integer> faintedSlots = new ArrayList<>();
+            for (int i = 0; i < party.size(); i++) {
+                if (party.get(i) != null && party.get(i).getCurrentHealth() <= 0) faintedSlots.add(i);
+            }
+            StringBuilder seen = new StringBuilder();
+            for (Map.Entry<Class<?>, List<Object>> e : groups.entrySet()) {
+                List<Object> g = e.getValue();
+                seen.append(e.getKey().getSimpleName()).append('x').append(g.size()).append(' ');
+                if (g.size() < 2) continue;
+                int idx = g.size() == party.size() ? slot : g.size() == faintedSlots.size() ? faintedSlots.indexOf(slot) : -1;
+                if (idx < 0 || idx >= g.size()) continue;
+                autoLog("REVIVE group " + e.getKey().getName() + " x" + g.size() + ": taking entry " + (idx + 1));
+                if (pressMenuEntry(screen, g.get(idx))) return true;
+            }
+            autoLog("REVIVE nothing matched. Clickable things on the screen: " + seen);
         } catch (Throwable t) {
             autoLog("REVIVE click failed: " + t);
+        }
+        return false;
+    }
+
+    /** Presses a menu entry: with the mouse in its middle if it has a position on screen, otherwise by running its click action. */
+    private boolean pressMenuEntry(Screen screen, Object entry) {
+        double[] c = centerOf(entry);
+        if (c != null) {
+            screen.mouseMoved(c[0], c[1]);
+            screen.mouseClicked(c[0], c[1], 0);
+            screen.mouseReleased(c[0], c[1], 0);
+            return true;
+        }
+        return invokeOptionAction(entry);
+    }
+
+    /** Does this object have an int field called slot / index / position that equals the number? */
+    private static boolean hasSlotNumber(Object o, int slot) {
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            if (k.getName().startsWith("net.minecraft")) break;
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers()) || f.getType() != int.class) continue;
+                String n = f.getName().toLowerCase(Locale.ROOT);
+                if (!(n.contains("slot") || n.contains("index") || n.contains("position"))) continue;
+                try {
+                    f.setAccessible(true);
+                    if (f.getInt(o) == slot) return true;
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
         }
         return false;
     }
@@ -2695,15 +2984,149 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** The middle of a widget on screen (via its x / y / width / height getters), or null. */
     private static double[] centerOf(Object widget) {
+        // a normal widget: ask it directly (looking up "getX" by name does not work on Minecraft's own classes in the real game)
+        if (widget instanceof net.minecraft.client.gui.widget.ClickableWidget cw) {
+            return new double[]{cw.getX() + cw.getWidth() / 2.0, cw.getY() + cw.getHeight() / 2.0};
+        }
         try {
             double x = ((Number) invoke(widget, "getX")).doubleValue();
             double y = ((Number) invoke(widget, "getY")).doubleValue();
             double w = ((Number) invoke(widget, "getWidth")).doubleValue();
             double h = ((Number) invoke(widget, "getHeight")).doubleValue();
             return new double[]{x + w / 2.0, y + h / 2.0};
-        } catch (Throwable t) {
-            return null;
+        } catch (Throwable ignored) {
+            // fall through
         }
+        // a mod's own object with plain x / y / width / height fields
+        double x = numberField(widget, "x");
+        double y = numberField(widget, "y");
+        double w = numberField(widget, "width");
+        double h = numberField(widget, "height");
+        if (Double.isNaN(x) || Double.isNaN(y) || Double.isNaN(w) || Double.isNaN(h) || w <= 0 || h <= 0) return null;
+        return new double[]{x + w / 2.0, y + h / 2.0};
+    }
+
+    /** A number stored in a field with this name (searching the class and its parents), or NaN. */
+    private static double numberField(Object o, String name) {
+        for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+            try {
+                Field f = k.getDeclaredField(name);
+                if (Modifier.isStatic(f.getModifiers())) return Double.NaN;
+                f.setAccessible(true);
+                Object v = f.get(o);
+                return v instanceof Number n ? n.doubleValue() : Double.NaN;
+            } catch (NoSuchFieldException e) {
+                // try the parent
+            } catch (Throwable t) {
+                return Double.NaN;
+            }
+        }
+        return Double.NaN;
+    }
+
+    // ============================== Alphas, Paradoxes and clean-ups ==============================
+
+    private static String normalizedName(Pokemon p) {
+        return p.getSpecies().getName().toLowerCase(Locale.ROOT).replace(" ", "").replace("-", "");
+    }
+
+    /** An Alpha (has the "alpha" aspect) or a Paradox Pokémon: it has to be beaten down in melee before the battle starts. */
+    private static boolean isAlphaOrParadox(PokemonEntity e) {
+        Pokemon p = e.getPokemon();
+        for (String aspect : p.getAspects()) {
+            if (aspect.toLowerCase(Locale.ROOT).contains("alpha")) return true;
+        }
+        return PARADOX_SPECIES.contains(normalizedName(p));
+    }
+
+    /** A "will be cleared" warning came in recently and the clean-up hasn't happened yet. */
+    private boolean clearWarningActive() {
+        return clearWarnAt != 0 && System.currentTimeMillis() - clearWarnAt < 40000;
+    }
+
+    /** A battle is on with the Pokémon we are catching: Esc out of the menu, then throw (one throw per turn). */
+    private boolean battleCatch() {
+        return ubCatch || battleStarted;
+    }
+
+    /** Alpha / Paradox: walk up to it and hit it (camera on it) until the battle starts. */
+    private void killTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        lookAtPoint(player, current.getX(), current.getY() + current.getHeight() * 0.6, current.getZ(), 0.5f);
+        double hd = Math.hypot(current.getX() - player.getX(), current.getZ() - player.getZ());
+        if (hd > 2.6) {
+            followPath(client, player, current.getPos(), current.getEyeY(), false); // get right next to it
+            return;
+        }
+        releaseKeys(client);
+        if (client.interactionManager == null) return;
+        if (!weaponReady) {
+            weaponReady = equipBestWeapon(client, player);
+            return;
+        }
+        if (player.getAttackCooldownProgress(0.5f) >= 0.95f) {
+            client.interactionManager.attackEntity(player, current);
+            player.swingHand(Hand.MAIN_HAND);
+            attacksDone++;
+            if (attacksDone == 1) autoLog("KILL hitting " + targetName);
+        }
+    }
+
+    /** Pokémon are about to be cleared: get close, aim at it and press R (send out) to start a battle with it. */
+    private void battleFirstTick(MinecraftClient client, ClientPlayerEntity player, PokemonEntity current) {
+        lookAtPoint(player, current.getX(), current.getEyeY(), current.getZ(), 0.5f);
+        double hd = Math.hypot(current.getX() - player.getX(), current.getZ() - player.getZ());
+        if (hd > 6.0 || !player.canSee(current)) {
+            followPath(client, player, current.getPos(), current.getEyeY(), true);
+            return;
+        }
+        releaseKeys(client);
+        if (angleError(player, current) > 6.0f) return;
+        if (battleRTicks++ % 60 == 0) {                // now, then every 3 seconds until the battle starts
+            int slot = firstHealthyPartySlot();
+            lastSentOutSlot = slot;
+            autoLog("BATTLE-FIRST pressing R (party slot " + (slot + 1) + ") at " + targetName);
+            say(client, "Sending out party slot " + (slot + 1) + " to start a battle with " + targetName + ".");
+            trySelectPartySlot(slot);
+            pressSendOutKey();
+        }
+    }
+
+    private static int weaponScore(ItemStack s) {
+        if (s.isEmpty()) return 0;
+        String id = itemIdOf(s);
+        String name = itemNameOf(s).toLowerCase(Locale.ROOT);
+        int material = id.contains("netherite") ? 6 : id.contains("diamond") ? 5 : id.contains("iron") ? 4
+            : id.contains("stone") ? 3 : id.contains("golden") ? 2 : id.contains("wooden") ? 1 : 0;
+        if (id.endsWith("_sword")) return 100 + material;
+        if (id.equals("minecraft:mace")) return 98;
+        if (id.equals("minecraft:trident")) return 90;
+        if (id.endsWith("_axe")) return 80 + material;
+        if (name.contains("sword") || name.contains("blade")) return 70;
+        return 0;
+    }
+
+    /** Puts the best melee weapon in your hand (swapped in from the inventory if needed; put back at the end). */
+    private boolean equipBestWeapon(MinecraftClient client, ClientPlayerEntity player) {
+        int best = -1;
+        int bestScore = 0;
+        for (int i = 0; i < 36; i++) {
+            int score = weaponScore(player.getInventory().getStack(i));
+            if (score > bestScore) { bestScore = score; best = i; }
+        }
+        if (best < 0) {
+            autoLog("KILL no weapon found - hitting with whatever is in hand");
+            return true;
+        }
+        if (catchPrevSlot < 0) catchPrevSlot = player.getInventory().selectedSlot;
+        if (best >= 9) {
+            ballSwaps.add(new int[]{best, player.getInventory().selectedSlot});
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, best,
+                player.getInventory().selectedSlot, SlotActionType.SWAP, player);
+        } else {
+            player.getInventory().selectedSlot = best;
+        }
+        autoLog("KILL equipped " + itemIdOf(player.getInventory().getStack(best)) + " (inventory slot " + best + ")");
+        return true;
     }
 
     // ============================== A clear shot ==============================
@@ -2774,6 +3197,27 @@ public class RadiantAlertClient implements ClientModInitializer {
     private long lastBattleCheck = 0;
 
     /** Already in a battle when we need to walk somewhere: end it with /endbattle (at most once every 4 seconds). */
+    /**
+     * Nothing is going on (for example waiting for a wormhole), but if a battle starts anyway - something attacked us,
+     * or a Pokémon was bumped - get out of it: Esc for the battle screen, then /endbattle. Only while an automatic
+     * feature is switched on, so a battle you start yourself with everything off is left alone.
+     */
+    private void idleBattleWatch(MinecraftClient client) {
+        if (!(autoCatchEnabled || autoWormholeEnabled || autoCleanEnabled || autoHoopaEnabled)) return;
+        if (client.player == null || client.world == null) return;
+        Screen screen = client.currentScreen;
+        if (screen != null) {
+            String cls = screen.getClass().getName();
+            if (cls.startsWith("com.cobblemon") && cls.toLowerCase(Locale.ROOT).contains("battle")) {
+                unblockScreen(client);          // Esc after 3 ticks, /endbattle after 10 (at most every 4 s)
+            }
+            return;
+        }
+        lastUnblockClass = "";
+        screenOpenTicks = 0;
+        endBattleIfNeeded(client);              // no screen, but a battle is still on: /endbattle (checked twice a second)
+    }
+
     private void endBattleIfNeeded(MinecraftClient client) {
         long now = System.currentTimeMillis();
         if (now - lastBattleCheck < 500 || client.player == null) return;
@@ -2824,20 +3268,30 @@ public class RadiantAlertClient implements ClientModInitializer {
         if (battle) {
             // Ultra Beast (catching it, or looking for it at the end of a wormhole): only back out of the battle
             // screen - then you can walk around and throw the ball
-            boolean escOnly = ubCatch || (task == Task.WORMHOLE && wStage == WStage.FINISHED);
+            // a battle with the Pokémon we are after has started (an Alpha / Paradox beaten down, or going in before a clean-up)
+            if (task == Task.CATCH && (killMode || battleFirst) && !battleStarted) {
+                battleStarted = true;
+                turnReady = false;
+                turnWait = 0;
+                autoLog("CATCH the battle has started");
+                say(client, "The battle has started - backing out of the menu to throw balls.");
+            }
+            boolean catchBattle = task == Task.CATCH && (ubCatch || battleStarted);
+            if (catchBattle) sawBattleScreen = true;
+            boolean escOnly = catchBattle || (task == Task.WORMHOLE && wStage == WStage.FINISHED);
             if (escOnly) {
                 dismiss(client, screen, 5);
                 return;
             }
             boolean mayEnd = task != Task.WORMHOLE || wStage == WStage.WALK || wStage == WStage.PUSH;
             long now = System.currentTimeMillis();
-            if (mayEnd && screenOpenTicks >= 20 && now - lastEndBattleAt > 4000 && client.player != null) {
+            if (mayEnd && screenOpenTicks >= 10 && now - lastEndBattleAt > 4000 && client.player != null) {
                 lastEndBattleAt = now;
                 client.player.networkHandler.sendChatCommand("endbattle");
                 autoLog("MENU battle screen in the way: sent /endbattle (" + cls + ")");
                 say(client, "In a battle - sending /endbattle so I can carry on.");
             }
-            if (mayEnd) dismiss(client, screen, 40);
+            if (mayEnd) dismiss(client, screen, 3);   // Esc first to get rid of the battle screen, then /endbattle (above)
             return;
         }
 
@@ -2899,6 +3353,196 @@ public class RadiantAlertClient implements ClientModInitializer {
             + " wild Pokémon nearby: " + found);
     }
 
+    // ============================== Rejoining after a restart ==============================
+
+    /**
+     * When the server closes on us (the nightly restart) the game shows a "disconnected" screen. While that screen is
+     * up and auto-rejoin is on, try to join the same server again: first after 20 s, then once a minute until it works.
+     * Once in, go home a few seconds later. Leaving on purpose (title screen, Disconnect button) is left alone.
+     */
+    private void rejoinTick(MinecraftClient client) {
+        long now = System.currentTimeMillis();
+        if (client.world != null && client.player != null) {
+            ServerInfo info = client.getCurrentServerEntry();
+            if (info != null && info.address != null && !info.address.isBlank()) lastServerAddress = info.address;
+            if (!wasInGame) {
+                wasInGame = true;
+                if (rejoinAttempts > 0) {                      // this is the rejoin working
+                    autoLog("REJOIN back in the game after " + rejoinAttempts + " attempt(s)");
+                    say(client, "Rejoined the server - going home in a few seconds.");
+                    rejoinHomeAtMs = now + REJOIN_HOME_DELAY_MS;
+                    homeCooldownUntil = rejoinHomeAtMs + 15000;   // nothing else starts meanwhile
+                    rejoinAttempts = 0;
+                }
+            }
+            if (rejoinHomeAtMs != 0 && now >= rejoinHomeAtMs && client.currentScreen == null) {
+                rejoinHomeAtMs = 0;
+                sendHome(client);
+            }
+            return;
+        }
+
+        if (!(client.currentScreen instanceof DisconnectedScreen)) return;   // not kicked: a normal load, or you left on purpose
+
+        if (wasInGame) {                                   // we have just been thrown out
+            wasInGame = false;
+            nextRejoinAt = now + REJOIN_FIRST_DELAY_MS;
+            rejoinHomeAtMs = 0;
+            pendingWormhole = null;
+            pendingRecallAtMs = 0;
+            pendingHomeAtMs = 0;
+            try {
+                noHomeOnStop = true;
+                abortCurrent(client, "Disconnected.");
+            } catch (Throwable t) {
+                task = Task.IDLE;
+            }
+            noHomeOnStop = false;
+            ubCatch = false;
+            killMode = false;
+            battleFirst = false;
+            battleStarted = false;
+            autoLog("REJOIN disconnected from " + lastServerAddress + (autoRejoinEnabled ? " - will try to rejoin" : " (auto-rejoin is off)"));
+        }
+        if (!autoRejoinEnabled || now < nextRejoinAt) return;
+
+        nextRejoinAt = now + REJOIN_INTERVAL_MS;
+        rejoinAttempts++;
+        autoLog("REJOIN attempt " + rejoinAttempts + " to " + lastServerAddress);
+        try {
+            ServerAddress address = ServerAddress.parse(lastServerAddress);
+            ServerInfo info = new ServerInfo("Cobblemon Delta", lastServerAddress, ServerInfo.ServerType.OTHER);
+            ConnectScreen.connect(new TitleScreen(), client, address, info, false, null);
+        } catch (Throwable t) {
+            autoLog("REJOIN could not start: " + t);
+        }
+    }
+
+    // ============================== Switching modes ==============================
+
+    /**
+     * A clean slate: every automatic feature off and whatever is going on cancelled (without any trip home).
+     * /radiantalert stop uses it, and so do areazero and ultraspace before they switch on their own set - so
+     * running one while the other is active replaces it completely.
+     */
+    private void resetAllFeatures(MinecraftClient c, String why) {
+        areaZeroMode = false;
+        autoCatchEnabled = false;
+        autoWormholeEnabled = false;
+        autoCleanEnabled = false;
+        autoHoopaEnabled = false;
+        autoRejoinEnabled = false;
+        pendingWormhole = null;
+        hoopaDueAt = 0;
+        retryKind = RetryKind.NONE;
+        retryAt = 0;
+        retryAttempts = 0;
+        pendingRecallAtMs = 0;
+        pendingHomeAtMs = 0;
+        rejoinHomeAtMs = 0;
+        ubCatch = false;
+        hoopaReturn = false;
+        noHomeOnStop = true;
+        try {
+            abortCurrent(c, why);
+        } finally {
+            noHomeOnStop = false;
+        }
+        if (c.player != null) restoreSwaps(c);
+        autoLog("MODE reset: " + why);
+    }
+
+    // ============================== Area Zero centre ==============================
+
+    private int centerNumber = 4;                       // /warp center4 unless changed with /radiantalert center <1-6>
+
+    private String warpCommand() {
+        return "warp center" + centerNumber;
+    }
+
+    private static Path centerFile() {
+        return FabricLoader.getInstance().getConfigDir().resolve("radiantalert-center.txt");
+    }
+
+    private void loadCenterNumber() {
+        try {
+            Path file = centerFile();
+            if (Files.exists(file)) {
+                int n = Integer.parseInt(Files.readString(file).trim());
+                if (n >= 1 && n <= 6) centerNumber = n;
+            }
+        } catch (Throwable t) {
+            LOG.warn("RadiantAlert: could not read the saved centre number", t);
+        }
+    }
+
+    /** /radiantalert center <1-6>: which centre Area Zero warps back to after a clean-up. Remembered. */
+    private void setCenterNumber(MinecraftClient client, int n) {
+        centerNumber = n;
+        try {
+            Files.writeString(centerFile(), Integer.toString(n));
+        } catch (IOException e) {
+            LOG.warn("RadiantAlert: could not save the centre number", e);
+        }
+        autoLog("CENTER set to " + n);
+        say(client, "Area Zero will warp back with /" + warpCommand() + " after a clean-up.");
+    }
+
+    /** Area Zero: after the clean-up, go back to the centre warp. */
+    private void sendWarpCenter(MinecraftClient client) {
+        if (client.player == null) return;
+        restoreSwaps(client);
+        long now = System.currentTimeMillis();
+        if (now - lastHomeSentAt < 5000) return;        // already sent a moment ago
+        lastHomeSentAt = now;
+        homeCooldownUntil = now + HOME_COOLDOWN_MS;
+        client.player.networkHandler.sendChatCommand(warpCommand());
+        autoLog("SENT /" + warpCommand());
+        say(client, "Sent /" + warpCommand());
+    }
+
+    // ============================== Which home ==============================
+
+    private String homeName = DEFAULT_HOME_NAME;
+
+    /** The command used for every automatic trip home, without the slash. */
+    private String homeCommand() {
+        return "home " + homeName;
+    }
+
+    private static Path homeFile() {
+        return FabricLoader.getInstance().getConfigDir().resolve("radiantalert-home.txt");
+    }
+
+    private void loadHomeName() {
+        try {
+            Path file = homeFile();
+            if (Files.exists(file)) {
+                String name = Files.readString(file).trim();
+                if (name.matches("[A-Za-z0-9_-]{1,32}")) homeName = name;
+            }
+        } catch (Throwable t) {
+            LOG.warn("RadiantAlert: could not read the saved home name", t);
+        }
+    }
+
+    /** /radiantalert home <name>: changes which home automatic trips go to, and remembers it. */
+    private void setHomeName(MinecraftClient client, String name) {
+        if (!name.matches("[A-Za-z0-9_-]{1,32}")) {
+            say(client, "That isn't a valid home name (letters, numbers, - and _ only).");
+            return;
+        }
+        homeName = name;
+        try {
+            Files.writeString(homeFile(), name);
+        } catch (IOException e) {
+            LOG.warn("RadiantAlert: could not save the home name", e);
+        }
+        autoLog("HOME name set to " + name);
+        say(client, "Automatic trips now use /" + homeCommand() + ". (Change it back any time with /radiantalert home "
+            + DEFAULT_HOME_NAME + ".)");
+    }
+
     // ============================== Idle checks ==============================
 
     private static Pattern namePattern(String regex) {
@@ -2935,10 +3579,21 @@ public class RadiantAlertClient implements ClientModInitializer {
             startClean(client, true);
             return;
         }
-        if (autoHoopaEnabled && isUltraWildServer() && hoopaDueAt != 0 && now >= hoopaDueAt && now >= hoopaCooldownUntil
-                && now - hoopaMountedAt > HOOPA_RECHECK_MS) {
-            hoopaDueAt = 0;
-            startHoopa(client, false);
+        if (autoHoopaEnabled && hoopaDueAt != 0 && now >= hoopaDueAt) {
+            if (now > hoopaDueAt + 120000) {
+                hoopaDueAt = 0;
+                autoLog("AUTOHOOPA gave up (nothing worked within 2 minutes of arriving)");
+            } else if (now >= hoopaCooldownUntil && now - hoopaMountedAt > HOOPA_RECHECK_MS) {
+                if (!isUltraWildServer() && !inUltraSpace(client)) {
+                    hoopaDueAt = 0;
+                    autoLog("AUTOHOOPA not in the Ultra Wild area (server=" + lastServerName + ")");
+                } else {
+                    startHoopa(client, false);
+                    autoLog("AUTOHOOPA tried on " + lastServerName + ": result=" + shoulderResult);
+                    // only keep trying (every 5 s) if the party couldn't be read - the server may still be sending it
+                    hoopaDueAt = shoulderResult == SR_PARTY_UNREADABLE ? now + 5000 : 0;
+                }
+            }
         }
     }
 
@@ -3445,7 +4100,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         int n = dropsDone;
         cleanCooldownUntil = System.currentTimeMillis() + CLEAN_COOLDOWN_MS;
         stopClean(client, "Dropped " + n + " item action(s).");
-        if (RETURN_HOME_AFTER_CLEAN) sendHome(client);
+        if (areaZeroMode) sendWarpCenter(client);      // Area Zero: back to the centre warp, not home
+        else if (RETURN_HOME_AFTER_CLEAN) sendHome(client);
     }
 
     private void stopClean(MinecraftClient client, String message) {
@@ -3483,11 +4139,11 @@ public class RadiantAlertClient implements ClientModInitializer {
         ClientPlayerEntity player = client.player;
         if (player == null) return false;
         if (task != Task.IDLE && !(returnToWormhole && task == Task.WORMHOLE)) {
+            shoulderResult = SR_BUSY;
             if (manual) say(client, "Busy with something else right now.");
             return false;
         }
         String label = species.substring(0, 1).toUpperCase(Locale.ROOT) + species.substring(1);
-        if (!returnToWormhole) hoopaCooldownUntil = System.currentTimeMillis() + 60000;
 
         List<Pokemon> party;
         try {
@@ -3496,6 +4152,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             say(client, "Couldn't read your party: " + t);
             autoLog("SHOULDER party read failed: " + t);
             logPartyApi();
+            shoulderResult = SR_PARTY_UNREADABLE;
             return false;
         }
         int slot = -1;
@@ -3506,13 +4163,16 @@ public class RadiantAlertClient implements ClientModInitializer {
             if (match) { slot = i; break; }
         }
         if (slot < 0) {
-            if (manual) say(client, "No " + (normalOnly ? "normal " : "") + label + " in your party (run /radiantalert party to see what it found).");
+            shoulderResult = SR_NOT_IN_PARTY;
+            if (manual) say(client, "No " + (normalOnly ? "normal " : "") + label + " in your party.");
             return false;
         }
+        if (!returnToWormhole) hoopaCooldownUntil = System.currentTimeMillis() + 60000;
 
         String state = pokemonState(party.get(slot));
         if (state.toLowerCase(Locale.ROOT).contains("shoulder")) {
             autoLog("SHOULDER " + label + " already on the shoulder (state=" + state + ")");
+            shoulderResult = SR_ALREADY;
             if (manual) say(client, "Your " + label + " is already on your shoulder.");
             return false;
         }
@@ -3528,6 +4188,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         hWheelClicked = false;
         hEntity = findOwnHoopa(client);
         resetRoute(client);
+        shoulderResult = SR_STARTED;
         task = Task.HOOPA;
         hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
         autoLog("HOOPA start " + label + " slot=" + (slot + 1) + " state=" + state + " alreadyOut=" + (hEntity != null)

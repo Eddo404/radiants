@@ -3970,6 +3970,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private Vec3d dPlanGoal = null;
     private double dStuckX = 0, dStuckZ = 0;
     private boolean dUseSteer = false;
+    private int dAlignTicks = 0;
     private final Set<Long> dBlocked = new HashSet<>();
 
     private static boolean inAreaZero(MinecraftClient client) {
@@ -4305,7 +4306,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /**
      * Rides (or walks) along the planned route. The camera is turned toward the next waypoint (a mount normally follows it);
-     * if the mount's own heading stays off while the camera is already right, A / D are used to steer it as well.
+     * A / D are never pressed (they do not steer a ridden Pokémon).
      * Returns 0 = on the way, 1 = arrived, 2 = no route, 3 = stuck for good.
      */
     private int dowseWalk(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double arriveRadius) {
@@ -4411,16 +4412,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         player.setPitch(MathHelper.lerp(0.3f, player.getPitch(), 8.0f));
         float bodyYaw = mount != null ? mount.getYaw() : player.getYaw();
         float err = MathHelper.wrapDegrees(desiredYaw - bodyYaw);
-        float camVsBody = Math.abs(MathHelper.wrapDegrees(player.getYaw() - bodyYaw));
-        if (mount != null && Math.abs(err) > 25 && camVsBody < 20) dSteerTicks++;      // camera is right but the mount is not
-        else if (Math.abs(err) < 15) dSteerTicks = 0;
-        if (dSteerTicks > 15 && !dUseSteer) {
-            dUseSteer = true;
-            autoLog("DOWSE the mount does not follow the camera - steering with A / D as well");
-        }
-        boolean steerLeft = dUseSteer && err < -10;
-        boolean steerRight = dUseSteer && err > 10;
-        boolean forward = Math.abs(err) < (dUseSteer ? 75 : 55);
+        // A and D do not steer a ridden Pokémon - it turns with the camera - so only W (and S to back out) are ever used
+        if (Math.abs(err) < 55) dAlignTicks = 0;
+        else dAlignTicks++;
+        boolean forward = Math.abs(err) < 55 || dAlignTicks > 40;      // if it never lines up, go anyway after 2 seconds
 
         Entity mover = mount != null ? mount : player;
         Vec3d vel = mover.getVelocity();
@@ -4431,8 +4426,8 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         client.options.forwardKey.setPressed(forward);
         client.options.backKey.setPressed(false);
-        client.options.leftKey.setPressed(steerLeft);
-        client.options.rightKey.setPressed(steerRight);
+        client.options.leftKey.setPressed(false);
+        client.options.rightKey.setPressed(false);
         client.options.sprintKey.setPressed(false);
         client.options.jumpKey.setPressed(jump);
         keysHeld = true;
@@ -5301,7 +5296,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     return;
                 }
                 if (hTicks >= 60) {
-                    stopHoopa(client, "Couldn't put " + shoulderLabel + " on your shoulder. See radiantalert-auto.txt (lines starting with HOOPA and DUMP).");
+                    stopHoopa(client, rideMode
+                        ? "Couldn't get on " + shoulderLabel + ". See radiantalert-auto.txt (lines starting with HOOPA and DUMP)."
+                        : "Couldn't put " + shoulderLabel + " on your shoulder. See radiantalert-auto.txt (lines starting with HOOPA and DUMP).");
                 }
             }
         }
@@ -5401,7 +5398,7 @@ public class RadiantAlertClient implements ClientModInitializer {
         // the wheel builds its buttons a moment after opening, so keep trying for a few ticks
         if (!hWheelClicked && (hGuiTicks == 3 || hGuiTicks == 6 || hGuiTicks == 9)) {
             hWheelClicked = tryClickShoulderOption(screen);
-            autoLog("HOOPA wheel: shoulder button pressed=" + hWheelClicked + " (tick " + hGuiTicks + ")");
+            autoLog("HOOPA wheel: " + (rideMode ? "ride" : "shoulder") + " button pressed=" + hWheelClicked + " (tick " + hGuiTicks + ")");
         }
         if (hGuiTicks >= 16) {                 // still open: close it so we are not stuck behind it
             hGuiTicks = 0;
@@ -5452,7 +5449,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             for (Object o : reachable) {
                 if (o == screen) continue;
                 String label = optionLabel(o);
-                if (!(rideMode ? (label.contains("ride") || label.contains("mount")) : label.contains("shoulder"))) continue;
+                if (!(rideMode ? (label.contains("interact.ride") || label.contains("icon_ride")) && !label.contains("shoulder") : label.contains("shoulder"))) continue;
                 autoLog("HOOPA wheel: candidate " + o.getClass().getName() + " (" + label.trim() + ")");
                 if (invokeOptionAction(o)) return true;
             }

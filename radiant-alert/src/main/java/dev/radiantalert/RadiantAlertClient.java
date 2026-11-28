@@ -91,7 +91,8 @@ import java.util.stream.Stream;
  * go and deal with them for you.
  *
  *  /radiantalert ultraspace   switch on everything that runs by itself: auto-catch, wormholes, auto-clean, auto-Hoopa and rejoin
- *  /radiantalert areazero     auto-catch and auto-clean; after a catch you stay in the same spot (no home teleport),
+ *  /radiantalert areazero     rides Ursaluna with the Zygarde Cube in hand around Area Zero hunting dowsing spots, plus auto-catch and
+ *                             auto-clean; after a catch you stay in the same spot (no home teleport),
  *                             after a clean-up you warp back with /warp center<N>
  *  /radiantalert center <1-6> which centre Area Zero warps back to (starts as 4, so /warp center4)
  *  /radiantalert scan         Area Zero dowsing: shows the bar as warmer / colder and points at the actual spawn spot (the
@@ -323,6 +324,8 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     // --- Hoopa on your shoulder (auto-Hoopa, or /radiantalert hoopa) ---
     private static final String HOOPA_SPECIES = "hoopa";
+    /** Area Zero: the Pokémon that is ridden while hunting dowsing spots. */
+    private static final String RIDE_SPECIES = "ursaluna";
     /** Terapagos goes on the shoulder only while you are inside a wormhole (right after the first teleport). */
     private static final String TERAPAGOS_SPECIES = "terapagos";
     private static final boolean TERAPAGOS_IN_WORMHOLES = true;
@@ -356,7 +359,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private static final Pattern IDENTITY_OP = Pattern.compile("\"op\"\\s*:\\s*\"identity\"");
     private static final Pattern SERVER_NAME = Pattern.compile("\"server\"\\s*:\\s*\"([^\"]+)\"");
 
-    private enum Task { IDLE, CATCH, WORMHOLE, CLEAN, HOOPA }
+    private enum Task { IDLE, CATCH, WORMHOLE, CLEAN, HOOPA, DOWSE }
     private enum Phase { READY, WAIT_BALL, WAIT_RESULT }
     private enum WStage { WALK, PUSH, ARRIVED, ENCOUNTER, FINISHED }
 
@@ -440,6 +443,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean sneakHeld = false;
     private boolean hWheelClicked = false;
     private String shoulderSpecies = HOOPA_SPECIES;
+    private boolean rideMode = false;      // the wheel step is "ride" instead of "shoulder"
     private String shoulderLabel = "Hoopa";
     private boolean hoopaReturn = false;       // the shoulder routine was started from inside a wormhole run
     private boolean terapagosTried = false;
@@ -464,7 +468,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private int noPokemonTicks = 0;
     private long pendingRecallAtMs = 0, pendingHomeAtMs = 0;
     private boolean autoRejoinEnabled = false;
-    private boolean areaZeroMode = false;   // auto-catch only; after a catch (or any end) stay where you are - no home teleport
+    private volatile boolean areaZeroMode = false;   // auto-catch only; after a catch (or any end) stay where you are - no home teleport
     private boolean wasInGame = false;
     private int rejoinAttempts = 0;
     private long nextRejoinAt = 0, rejoinHomeAtMs = 0;
@@ -585,7 +589,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                     areaZeroMode = true;
                     autoCatchEnabled = true;
                     autoCleanEnabled = true;
-                    say(c, "Area Zero mode ON (everything else is off): auto-catch and auto-clean. After a catch I stay where I am (no home teleport); "
+                    say(c, "Area Zero mode ON (everything else is off): I'll get on Ursaluna with the Zygarde Cube in hand and ride around looking for dowsing spots, "
+                        + "catch radiants/shinies and clean up. After a catch I stay where I am (no home teleport); "
                         + "after a clean-up I warp back with /" + warpCommand() + ". Stop with /radiantalert stop.");
                     return 1;
                 }))
@@ -664,7 +669,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
         if (client.player == null || client.world == null) { pending.clear(); return; }
 
-        if (scanning) scanTick(client);
+        if (scanning || areaZeroMode) scanTick(client);
 
         if (pendingWormhole != null) {
             if (!autoWormholeEnabled) pendingWormhole = null;
@@ -785,6 +790,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     if ((radiant || shiny) && canStartTask()) {
                         if (autoCatchEnabled && System.currentTimeMillis() >= clearBlockUntil) {
                             retryAttempts = 0;
+                            if (task == Task.DOWSE) stopDowse(client, "A shiny / radiant showed up - catching it first.");
                             startCatch(client, e, radiant);
                         }
                     }
@@ -799,7 +805,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private boolean canStartTask() {
-        return task == Task.IDLE && System.currentTimeMillis() >= homeCooldownUntil;
+        return (task == Task.IDLE || task == Task.DOWSE) && System.currentTimeMillis() >= homeCooldownUntil;
     }
 
     /** Start of every tick: drives whatever the bot is currently doing. */
@@ -860,6 +866,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             case WORMHOLE -> wormholeTick(client, player);
             case CLEAN -> cleanTick(client, player);
             case HOOPA -> hoopaTick(client, player);
+            case DOWSE -> dowseTick(client, player);
             default -> { }
         }
     }
@@ -969,6 +976,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             case WORMHOLE -> stopWormhole(client, message);
             case CLEAN -> stopClean(client, message);
             case HOOPA -> stopHoopa(client, message);
+            case DOWSE -> stopDowse(client, message);
             default -> { }
         }
     }
@@ -2240,7 +2248,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean replan(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring) {
         planTargetPos = goal;
         routeStart = player.getPos();
-        Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes, dangerZones(client)).search();
+        Plan plan = new Pathfinder(client.world, player, goal, goalEyeY, ring, blockedNodes, dangerZones(client), 0, 2, null).search();
         autoLog("PLAN " + plan.status() + " steps=" + plan.nodes().size());
 
         switch (plan.status()) {
@@ -2308,9 +2316,14 @@ public class RadiantAlertClient implements ClientModInitializer {
         private final List<double[]> avoid;
         private final Map<Long, Boolean> standCache = new HashMap<>();
         private final Map<Long, Boolean> goalCache = new HashMap<>();
+        private final int margin, height;      // free blocks needed around / above a spot (a mount is wider and taller than a player)
+        private final Vec3d startPos;           // where the route starts (null = where the player is)
 
         Pathfinder(ClientWorld world, ClientPlayerEntity player, Vec3d goal, double goalEyeY, boolean ring, Set<Long> blocked,
-                   List<double[]> avoid) {
+                   List<double[]> avoid, int margin, int height, Vec3d startPos) {
+            this.margin = margin;
+            this.height = height;
+            this.startPos = startPos;
             this.avoid = avoid;
             this.world = world;
             this.player = player;
@@ -2323,7 +2336,8 @@ public class RadiantAlertClient implements ClientModInitializer {
         }
 
         Plan search() {
-            BlockPos start = BlockPos.ofFloored(player.getX(), player.getY() + 0.05, player.getZ());
+            BlockPos start = startPos != null ? BlockPos.ofFloored(startPos.x, startPos.y + 0.05, startPos.z)
+                : BlockPos.ofFloored(player.getX(), player.getY() + 0.05, player.getZ());
             if (isGoal(start)) return new Plan(Status.AT_GOAL, List.of());
 
             PriorityQueue<Entry> open = new PriorityQueue<>(Comparator.comparingDouble(Entry::f));
@@ -2503,6 +2517,16 @@ public class RadiantAlertClient implements ClientModInitializer {
             boolean ok = y > world.getBottomY() + 1 && y < world.getTopY() - 3
                 && !blocked.contains(key)
                 && passable(x, y, z) && passable(x, y + 1, z) && hasGround(x, y - 1, z);
+            if (ok && (margin > 0 || height > 2)) {       // room for something wider / taller than a player
+                check:
+                for (int ddx = -margin; ddx <= margin; ddx++) {
+                    for (int ddz = -margin; ddz <= margin; ddz++) {
+                        for (int ddy = 0; ddy < height; ddy++) {
+                            if (!passable(x + ddx, y + ddy, z + ddz)) { ok = false; break check; }
+                        }
+                    }
+                }
+            }
             standCache.put(key, ok);
             return ok;
         }
@@ -2587,7 +2611,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                     Identifier type = Registries.PARTICLE_TYPE.getId(pp.getParameters().getType());
                     info = new Info("particle:" + type, List.of(), new double[]{pp.getX(), pp.getY(), pp.getZ()}, pp.getCount());
                 }
-                if (scanning) scanPacket(msg, info);
+                if (scanning || areaZeroMode) scanPacket(msg, info);
                 if (info != null) {
                     boolean rec = recording;
                     boolean wormhole = ALERT_WORMHOLE && matchesWormhole(info);
@@ -2716,7 +2740,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     private static boolean isShoulderSpecies(Pokemon p) {
         String name = p.getSpecies().getName();
-        return name.equalsIgnoreCase(HOOPA_SPECIES) || name.equalsIgnoreCase(TERAPAGOS_SPECIES);
+        return name.equalsIgnoreCase(HOOPA_SPECIES) || name.equalsIgnoreCase(TERAPAGOS_SPECIES) || name.equalsIgnoreCase(RIDE_SPECIES);
     }
 
     /** Inventory index of a Max Revive (preferred) or Revive, or -1. */
@@ -3205,7 +3229,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private boolean wantsToMove() {
         return (task == Task.CATCH && phase == Phase.READY)
             || (task == Task.WORMHOLE && (wStage == WStage.WALK || wStage == WStage.PUSH))
-            || task == Task.HOOPA;
+            || task == Task.HOOPA || task == Task.DOWSE;
     }
 
     private long lastBattleCheck = 0;
@@ -3447,6 +3471,12 @@ public class RadiantAlertClient implements ClientModInitializer {
         autoHoopaEnabled = false;
         autoRejoinEnabled = false;
         pendingWormhole = null;
+        dowseStarted = false;
+        dowseGoal = null;
+        scanExact = null;
+        scanEstimate = null;
+        scanBarActive = false;
+        scanSamples.clear();
         hoopaDueAt = 0;
         retryKind = RetryKind.NONE;
         retryAt = 0;
@@ -3513,8 +3543,12 @@ public class RadiantAlertClient implements ClientModInitializer {
     }
 
     private void scanLog(String line) {
-        if (scanLines++ > SCAN_MAX_LINES) return;
+        if (!scanning || scanLines++ > SCAN_MAX_LINES) return;
         appendToFile(SCAN_FILE, String.format("[+%.2fs] %s", (System.currentTimeMillis() - scanStart) / 1000.0, line));
+    }
+
+    private void scanSay(MinecraftClient client, String message) {
+        if (scanning) say(client, message);
     }
 
     private static String xyz(Vec3d v) {
@@ -3559,8 +3593,10 @@ public class RadiantAlertClient implements ClientModInitializer {
             appendToFile(SCAN_FILE, "x" + sorted.get(i).getValue()[0] + "  " + sorted.get(i).getKey());
         }
         appendToFile(SCAN_FILE, "SPAWN SPOT " + (scanExact == null ? "never seen" : xyz(scanExact)));
-        scanExact = null;
-        scanEstimate = null;
+        if (!areaZeroMode) {
+            scanExact = null;
+            scanEstimate = null;
+        }
         say(client, "Scan stopped. Send me " + SCAN_FILE + " from your Minecraft folder.");
     }
 
@@ -3642,7 +3678,7 @@ public class RadiantAlertClient implements ClientModInitializer {
 
     /** Main thread: handle one thing the server sent. */
     private void scanRecord(String kind, String key, String text, double[] pos) {
-        if (!scanning) return;
+        if (!scanning && !areaZeroMode) return;
         MinecraftClient client = MinecraftClient.getInstance();
         long now = System.currentTimeMillis();
         scanCounts.computeIfAbsent(kind + " " + (key.length() > 120 ? key.substring(0, 120) : key), x -> new int[1])[0]++;
@@ -3677,7 +3713,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 scanLog(String.format("CAL progress=%.2f%s distance=%.1f", smp[2], smp[3] > 0 ? " (edge of range)" : "",
                     Math.hypot(smp[0] - spot.x, smp[1] - spot.z)));
             }
-            say(client, "Spawn spot found: " + xyz(spot) + dist + ". It is shown above your hotbar.");
+            scanSay(client, "Spawn spot found: " + xyz(spot) + dist + ". It is shown above your hotbar.");
             scanLastDowsingLogAt = now;
         } else if (now - scanLastDowsingLogAt > 5000) {
             scanLastDowsingLogAt = now;
@@ -3713,7 +3749,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             scanBarPrevProgress = -1;
             if (reached) {
                 scanFoundAt = now;                                          // the spot is used up: the pointer goes in a few seconds
-                say(client, "The bar is gone - you've reached the spot.");
+                scanSay(client, "The bar is gone - you've reached the spot.");
             } else if (client.player != null && !scanSamples.isEmpty()) {
                 double[] last = scanSamples.get(scanSamples.size() - 1);
                 if (Math.hypot(last[0] - client.player.getX(), last[1] - client.player.getZ()) < 40) {   // (a teleport would put us far away)
@@ -3885,7 +3921,7 @@ public class RadiantAlertClient implements ClientModInitializer {
                 ? (scanBarProgress > scanBarPrevProgress ? ", warmer" : ", colder") : "";
             barText = String.format("  [bar %.1f %s%s]", scanBarProgress, scanBarColor.toLowerCase(Locale.ROOT), trend);
         }
-        if (target != null) {
+        if (scanning && target != null) {
             double dx = target.x - client.player.getX();
             double dz = target.z - client.player.getZ();
             double dy = target.y - client.player.getY();
@@ -3895,7 +3931,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             String what = scanExact != null ? "Spawn spot" : "Rough spot";
             client.inGameHud.setOverlayMessage(Text.literal(String.format("%s %.0f, %.0f, %.0f - %.0f blocks, %s (height %+.0f)%s",
                 what, target.x, target.y, target.z, dist, scanTurnWords(diff), dy, barText)).formatted(Formatting.GREEN), false);
-        } else if (!barText.isEmpty()) {
+        } else if (scanning && !barText.isEmpty()) {
             client.inGameHud.setOverlayMessage(Text.literal("Dowsing" + barText + " - keep riding, the spawn spot shows up within about 20 blocks")
                 .formatted(Formatting.YELLOW), false);
         }
@@ -3905,6 +3941,502 @@ public class RadiantAlertClient implements ClientModInitializer {
                 client.player.getZ(), scanBarProgress < 0 ? "none" : String.format("%.2f", scanBarProgress),
                 scanExact == null ? "none" : xyz(scanExact), scanEstimate == null ? "none" : xyz(scanEstimate)));
         }
+    }
+
+    // ============================== Area Zero: ride Ursaluna and hunt dowsing spots ==============================
+    //
+    // /radiantalert areazero: send out Ursaluna and get on it (the "ride" button in the same wheel as "shoulder"), hold the
+    // Zygarde Cube, then ride around Area Zero until the dowsing bar shows up, follow it to the spawn spot (the particle gives
+    // the exact coordinates once you are within about 20 blocks) and ride onto it. Then on to the next one. The route planner
+    // is told how much bigger Ursaluna with a rider is than a player, so it keeps to places that are wide and high enough.
+
+    private static final double DOWSE_CELL = 120;       // the bar shows up within ~98 blocks, so cell centres this far apart cover everything
+    private static final double DOWSE_RADIUS = 450;     // how far from where it started it explores
+    private boolean dowseStarted = false;
+    private double dowseOriginX = 0, dowseOriginZ = 0;
+    private final Set<Long> dowseVisited = new HashSet<>();
+    private final Set<Long> dowseBadCells = new HashSet<>();
+    private Vec3d dowseGoal = null;                      // where it is wandering to
+    private long dowseGoalAt = 0, dowseRideRetryAt = 0, dowseTrackStart = 0, dowseLastFound = 0, dowseForceUntil = 0, dowseSpotWaitSince = 0;
+    private boolean dowseRideDisabled = false, dowseCubeWarned = false, dowseOutsideWarned = false;
+    private int dowseCount = 0, dowseStuckResets = 0;
+    private int dTicks = 0;
+    private String dMode = "";
+    private String dForceMode = "";
+    // walking
+    private List<BlockPos> dPath = List.of();
+    private int dPathIndex = 0, dReplanIn = 0, dFailedPlans = 0, dStuckTicks = 0, dStuckStrikes = 0, dBackTicks = 0, dSteerTicks = 0, dPlanCount = 0;
+    private int dProbeSign = 1;
+    private Vec3d dPlanGoal = null;
+    private double dStuckX = 0, dStuckZ = 0;
+    private boolean dUseSteer = false;
+    private final Set<Long> dBlocked = new HashSet<>();
+
+    private static boolean inAreaZero(MinecraftClient client) {
+        return client.world != null && client.world.getRegistryKey().getValue().getNamespace().equals("areazero");
+    }
+
+    private static boolean isZygardeCube(ItemStack s) {
+        if (s.isEmpty()) return false;
+        return itemIdOf(s).contains("zygarde_cube") || itemNameOf(s).toLowerCase(Locale.ROOT).contains("zygarde cube");
+    }
+
+    /** Puts the Zygarde Cube in your hand (swapped into the hotbar if it is in the inventory). False if you don't have one. */
+    private boolean holdZygardeCube(MinecraftClient client, ClientPlayerEntity player) {
+        int found = -1;
+        for (int i = 0; i < 36; i++) {
+            if (isZygardeCube(player.getInventory().getStack(i))) { found = i; break; }
+        }
+        if (found < 0) return false;
+        if (found < 9) {
+            if (player.getInventory().selectedSlot != found) player.getInventory().selectedSlot = found;
+            return true;
+        }
+        int target = -1;
+        for (int i = 0; i < 9; i++) {
+            if (player.getInventory().getStack(i).isEmpty()) { target = i; break; }
+        }
+        if (target < 0) target = player.getInventory().selectedSlot;
+        if (client.interactionManager != null) {
+            client.interactionManager.clickSlot(player.playerScreenHandler.syncId, found, target, SlotActionType.SWAP, player);
+        }
+        player.getInventory().selectedSlot = target;
+        autoLog("DOWSE Zygarde Cube moved from inventory slot " + found + " into the hotbar (slot " + (target + 1) + ")");
+        return true;
+    }
+
+    /** Sends Ursaluna out and gets on it, using the same machinery as the shoulder routine (the wheel's "ride" button). */
+    private boolean startRide(MinecraftClient client, boolean manual) {
+        ClientPlayerEntity player = client.player;
+        if (player == null || player.hasVehicle()) return false;
+        if (task != Task.IDLE && task != Task.DOWSE) return false;
+        List<Pokemon> party;
+        try {
+            party = readParty();
+        } catch (Throwable t) {
+            autoLog("RIDE could not read the party: " + t);
+            return false;
+        }
+        int slot = -1;
+        for (int i = 0; i < party.size(); i++) {
+            Pokemon p = party.get(i);
+            if (p != null && p.getSpecies().getName().equalsIgnoreCase(RIDE_SPECIES)) { slot = i; break; }
+        }
+        if (slot < 0) {
+            dowseRideDisabled = true;
+            autoLog("RIDE no Ursaluna in the party");
+            return false;
+        }
+        shoulderSpecies = RIDE_SPECIES;
+        shoulderLabel = "Ursaluna";
+        rideMode = true;
+        hoopaReturn = false;
+        hSlot = slot;
+        hAttempts = 2;                 // no shortcut message for riding: straight to the wheel
+        hTicks = 0;
+        hPrevSlot = -1;
+        hGuiTicks = 0;
+        hWheelClicked = false;
+        hEntity = findOwnHoopa(client);
+        resetRoute(client);
+        task = Task.HOOPA;
+        hStage = hEntity != null ? HStage.APPROACH : HStage.SELECT;
+        autoLog("RIDE start Ursaluna slot=" + (slot + 1) + " alreadyOut=" + (hEntity != null));
+        say(client, hEntity != null ? "Getting on your Ursaluna." : "Sending out your Ursaluna (party slot " + (slot + 1) + ") to ride it.");
+        return true;
+    }
+
+    private void startDowse(MinecraftClient client) {
+        ClientPlayerEntity player = client.player;
+        if (player == null) return;
+        if (!dowseStarted) {
+            dowseStarted = true;
+            dowseOriginX = player.getX();
+            dowseOriginZ = player.getZ();
+            dowseVisited.clear();
+            dowseBadCells.clear();
+            dowseCount = 0;
+            dowseStuckResets = 0;
+            dowseRideDisabled = false;
+            dowseCubeWarned = false;
+            dowseRideRetryAt = 0;
+            autoLog(String.format("DOWSE start: exploring around %.0f, %.0f (radius %.0f)", dowseOriginX, dowseOriginZ, DOWSE_RADIUS));
+            say(client, "Area Zero: getting on Ursaluna with the Zygarde Cube in hand and looking for dowsing spots. Stop with /radiantalert stop.");
+        }
+        task = Task.DOWSE;
+        dTicks = 0;
+        dowseGoal = null;
+        dMode = "";
+        dPath = List.of();
+        dPathIndex = 0;
+        dPlanGoal = null;
+        dReplanIn = 0;
+        dFailedPlans = 0;
+        dStuckTicks = 0;
+        dStuckStrikes = 0;
+        dBackTicks = 0;
+        dStuckX = player.getX();
+        dStuckZ = player.getZ();
+        dBlocked.clear();
+    }
+
+    private void stopDowse(MinecraftClient client, String message) {
+        task = Task.IDLE;
+        releaseKeys(client);
+        dPath = List.of();
+        autoLog("DOWSE stop: " + message);
+        if (message != null && !message.isEmpty()) say(client, message);
+    }
+
+    private static long cellKey(double x, double z) {
+        long ix = (long) Math.floor(x / DOWSE_CELL);
+        long iz = (long) Math.floor(z / DOWSE_CELL);
+        return (ix << 32) ^ (iz & 0xffffffffL);
+    }
+
+    /** The next place to explore: the nearest grid cell not visited yet (its centre), inside the area. */
+    private Vec3d pickWanderGoal(MinecraftClient client, Vec3d base) {
+        double minX = dowseOriginX - DOWSE_RADIUS;
+        double maxX = dowseOriginX + DOWSE_RADIUS;
+        double minZ = dowseOriginZ - DOWSE_RADIUS;
+        double maxZ = dowseOriginZ + DOWSE_RADIUS;
+        try {
+            var border = client.world.getWorldBorder();
+            if (border.getSize() < 20000) {                          // a real border: stay inside it
+                minX = Math.max(minX, border.getBoundWest() + 15);
+                maxX = Math.min(maxX, border.getBoundEast() - 15);
+                minZ = Math.max(minZ, border.getBoundNorth() + 15);
+                maxZ = Math.min(maxZ, border.getBoundSouth() - 15);
+            }
+        } catch (Throwable ignored) {
+            // no border information
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            Vec3d best = null;
+            double bestScore = Double.MAX_VALUE;
+            for (double cx = (Math.floor(minX / DOWSE_CELL) + 0.5) * DOWSE_CELL; cx <= maxX; cx += DOWSE_CELL) {
+                for (double cz = (Math.floor(minZ / DOWSE_CELL) + 0.5) * DOWSE_CELL; cz <= maxZ; cz += DOWSE_CELL) {
+                    long key = cellKey(cx, cz);
+                    if (dowseVisited.contains(key) || dowseBadCells.contains(key)) continue;
+                    double score = Math.hypot(cx - base.x, cz - base.z) * (0.85 + 0.3 * Math.random());
+                    if (score < bestScore) { bestScore = score; best = new Vec3d(cx, base.y, cz); }
+                }
+            }
+            if (best != null) return best;
+            dowseVisited.clear();                                    // everything has been seen: start over
+            dowseBadCells.clear();
+        }
+        return new Vec3d(dowseOriginX, base.y, dowseOriginZ);
+    }
+
+    private void dowseTick(MinecraftClient client, ClientPlayerEntity player) {
+        if (!areaZeroMode || !autoCatchEnabled) { stopDowse(client, "Area Zero mode is off."); return; }
+        if (!inAreaZero(client)) {
+            if (!dowseOutsideWarned) {
+                dowseOutsideWarned = true;
+                say(client, "Not in Area Zero - not looking for dowsing spots here.");
+            }
+            stopDowse(client, "");
+            return;
+        }
+        dowseOutsideWarned = false;
+        dTicks++;
+        long now = System.currentTimeMillis();
+        Entity mount = player.getVehicle();
+        Vec3d base = mount != null ? mount.getPos() : player.getPos();
+
+        if (Math.hypot(base.x - dowseOriginX, base.z - dowseOriginZ) > DOWSE_RADIUS + 150) {   // warped somewhere else: explore around here
+            dowseOriginX = base.x;
+            dowseOriginZ = base.z;
+            dowseVisited.clear();
+            dowseBadCells.clear();
+            dowseGoal = null;
+            autoLog(String.format("DOWSE new exploring centre %.0f, %.0f", base.x, base.z));
+        }
+        if (dTicks % 20 == 0) dowseVisited.add(cellKey(base.x, base.z));
+
+        // the Zygarde Cube stays in hand
+        if (dTicks % 20 == 7 && !holdZygardeCube(client, player) && !dowseCubeWarned) {
+            dowseCubeWarned = true;
+            say(client, "No Zygarde Cube found in your inventory - looking without it.");
+        }
+
+        // Ursaluna: get on (again) when not riding
+        if (!dowseRideDisabled && mount == null && dTicks > 10 && now >= dowseRideRetryAt) {
+            dowseRideRetryAt = now + 30000;
+            releaseKeys(client);
+            if (startRide(client, false)) return;                    // runs as its own task; the hunt restarts when it is done
+            if (dowseRideDisabled) say(client, "No Ursaluna in your party - going on foot.");
+        }
+
+        // a spot was just collected
+        if (scanFoundAt != 0 && scanFoundAt != dowseLastFound) {
+            dowseLastFound = scanFoundAt;
+            dowseCount++;
+            autoLog("DOWSE collected spot #" + dowseCount + " (the bar went away at the spot)");
+            say(client, "Dowsing spot #" + dowseCount + " collected. Looking for the next one.");
+            dowseGoal = null;
+            dowseSpotWaitSince = 0;
+        }
+
+        // what to head for: the exact spawn spot, else where the bar says it is, else keep exploring
+        Vec3d goal;
+        double arrive;
+        String mode;
+        if (scanExact != null) {
+            goal = scanExact;
+            arrive = 1.8;
+            mode = "spot";
+        } else if (scanBarActive && scanEstimate != null && !(now < dowseForceUntil && !dForceMode.isEmpty())) {
+            goal = new Vec3d(scanEstimate.x, base.y, scanEstimate.z);
+            arrive = 6;
+            mode = "bar";
+        } else if (scanBarActive) {
+            // the bar is there but no position yet: ride sideways so the readings come from different places
+            mode = "probe";
+            arrive = 8;
+            if (dowseGoal == null || !"probe".equals(dMode) || now - dowseGoalAt > 8000
+                    || Math.hypot(dowseGoal.x - base.x, dowseGoal.z - base.z) < 8) {
+                double yaw = Math.toRadians(mount != null ? mount.getYaw() : player.getYaw());
+                double fx = -Math.sin(yaw);
+                double fz = Math.cos(yaw);
+                dProbeSign = -dProbeSign;
+                dowseGoal = new Vec3d(base.x + (-fz * dProbeSign + fx * 0.4) * 45, base.y, base.z + (fx * dProbeSign + fz * 0.4) * 45);
+                dowseGoalAt = now;
+            }
+            goal = dowseGoal;
+        } else {
+            mode = "wander";
+            arrive = 35;
+            if (dowseGoal == null || !"wander".equals(dMode) || now - dowseGoalAt > 70000) {
+                dowseGoal = pickWanderGoal(client, base);
+                dowseGoalAt = now;
+                autoLog(String.format("DOWSE wandering to %.0f, %.0f (%d cells visited)", dowseGoal.x, dowseGoal.z, dowseVisited.size()));
+            }
+            goal = dowseGoal;
+        }
+        if (!mode.equals(dMode)) {
+            autoLog("DOWSE mode " + dMode + " -> " + mode);
+            dMode = mode;
+            dPlanGoal = null;
+            dPath = List.of();
+            dowseTrackStart = now;
+            dowseSpotWaitSince = 0;
+        }
+        if (!"wander".equals(mode) && now - dowseTrackStart > 180000) {      // followed one for 3 minutes without result: forget it
+            autoLog("DOWSE gave up following " + mode);
+            scanEstimate = null;
+            scanExact = null;
+            scanSamples.clear();
+            dowseTrackStart = now;
+            return;
+        }
+
+        int result = dowseWalk(client, player, goal, arrive);
+        switch (result) {
+            case 1 -> {                                                      // arrived
+                if ("wander".equals(mode)) {
+                    dowseVisited.add(cellKey(goal.x, goal.z));
+                    dowseGoal = null;
+                } else if ("probe".equals(mode)) {
+                    dowseGoal = null;
+                } else if ("bar".equals(mode)) {                             // at the estimate but no particle: ride around it
+                    autoLog("DOWSE reached the bar estimate without seeing the spot - probing around it");
+                    dForceMode = "probe";
+                    dowseForceUntil = now + 12000;
+                } else {                                                     // at the spot: the pickup happens by itself
+                    if (dowseSpotWaitSince == 0) dowseSpotWaitSince = now;
+                    if (now - dowseSpotWaitSince > 8000) {
+                        autoLog("DOWSE waited 8 s at the spot and nothing happened - dropping it");
+                        scanExact = null;
+                        dowseSpotWaitSince = 0;
+                    }
+                }
+            }
+            case 2 -> {                                                      // no way there
+                autoLog("DOWSE no route to " + mode + " goal");
+                if ("wander".equals(mode)) {
+                    if (dowseGoal != null) dowseBadCells.add(cellKey(dowseGoal.x, dowseGoal.z));
+                    dowseGoal = null;
+                } else {
+                    dForceMode = "probe";
+                    dowseForceUntil = now + 12000;
+                    dowseGoal = null;
+                }
+            }
+            case 3 -> {                                                      // stuck for good
+                dowseStuckResets++;
+                dowseGoal = null;
+                autoLog("DOWSE stuck for good (" + dowseStuckResets + ")");
+                if (dowseStuckResets >= 3) {
+                    dowseStuckResets = 0;
+                    say(client, "Stuck again - warping back to /" + warpCommand() + ".");
+                    sendWarpCenter(client);
+                }
+            }
+            default -> { }
+        }
+    }
+
+    /** Plans a route that has room for a mount: 0 = route found, 1 = already there, 2 = no route. */
+    private int dowsePlan(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, Vec3d base, Entity mount) {
+        dPlanGoal = goal;
+        int margin = 0;
+        int height = 2;
+        if (mount != null) {
+            margin = MathHelper.clamp((int) Math.ceil((mount.getWidth() - 1.0) / 2.0), 0, 2);
+            height = MathHelper.clamp((int) Math.ceil(player.getBoundingBox().maxY - mount.getY()), 2, 5);
+        }
+        Plan plan = new Pathfinder(client.world, player, goal, goal.y + 1.6, false, dBlocked, dangerZones(client), margin, height, base).search();
+        if (plan.status() == Status.FAIL && (margin > 0 || height > 2)) {     // no room for something that big there: allow a tighter fit
+            plan = new Pathfinder(client.world, player, goal, goal.y + 1.6, false, dBlocked, dangerZones(client),
+                Math.max(0, margin - 1), Math.max(2, height - 1), base).search();
+            autoLog("DOWSE no roomy route - tried a tighter one: " + plan.status());
+        }
+        if (dPlanCount++ % 10 == 0 || plan.status() == Status.FAIL) {
+            autoLog("DOWSE plan " + plan.status() + " steps=" + plan.nodes().size() + " margin=" + margin + " height=" + height);
+        }
+        switch (plan.status()) {
+            case AT_GOAL -> { dPath = List.of(); dPathIndex = 0; return 1; }
+            case PATH, PARTIAL -> { dPath = plan.nodes(); dPathIndex = 0; return 0; }
+            default -> { dPath = List.of(); dPathIndex = 0; return 2; }
+        }
+    }
+
+    /**
+     * Rides (or walks) along the planned route. The camera is turned toward the next waypoint (a mount normally follows it);
+     * if the mount's own heading stays off while the camera is already right, A / D are used to steer it as well.
+     * Returns 0 = on the way, 1 = arrived, 2 = no route, 3 = stuck for good.
+     */
+    private int dowseWalk(MinecraftClient client, ClientPlayerEntity player, Vec3d goal, double arriveRadius) {
+        Entity mount = player.getVehicle();
+        Vec3d base = mount != null ? mount.getPos() : player.getPos();
+        if (Math.hypot(goal.x - base.x, goal.z - base.z) < arriveRadius) {
+            releaseKeys(client);
+            dPath = List.of();
+            return 1;
+        }
+
+        // backing out of a jam
+        if (dBackTicks > 0) {
+            dBackTicks--;
+            client.options.forwardKey.setPressed(false);
+            client.options.backKey.setPressed(true);
+            client.options.leftKey.setPressed(false);
+            client.options.rightKey.setPressed(false);
+            client.options.jumpKey.setPressed(false);
+            player.setYaw(player.getYaw() + 3.0f * dProbeSign);
+            keysHeld = true;
+            return 0;
+        }
+
+        if (dReplanIn > 0) dReplanIn--;
+        boolean noPath = dPath.isEmpty() || dPathIndex >= dPath.size();
+        boolean goalMoved = dPlanGoal == null || goal.squaredDistanceTo(dPlanGoal) > 64;
+        if ((noPath || goalMoved) && dReplanIn <= 0) {
+            dReplanIn = 25;
+            int status = dowsePlan(client, player, goal, base, mount);
+            if (status == 1) return 1;
+            if (status == 2) {
+                if (++dFailedPlans >= 3) {
+                    dFailedPlans = 0;
+                    releaseKeys(client);
+                    return 2;
+                }
+            } else {
+                dFailedPlans = 0;
+            }
+            noPath = dPath.isEmpty() || dPathIndex >= dPath.size();
+        }
+        if (noPath) {
+            releaseKeys(client);
+            return 0;
+        }
+
+        // on to the next waypoint once we are at it, or have already run past it
+        BlockPos wp = dPath.get(dPathIndex);
+        while (true) {
+            double hd = Math.hypot(wp.getX() + 0.5 - base.x, wp.getZ() + 0.5 - base.z);
+            boolean reached = hd < 1.5 && Math.abs(wp.getY() - base.y) < 1.8;
+            boolean passed = false;
+            if (!reached && dPathIndex + 1 < dPath.size()) {
+                BlockPos next = dPath.get(dPathIndex + 1);
+                passed = next.getY() == wp.getY() && hd < 2.5
+                    && Math.hypot(next.getX() + 0.5 - base.x, next.getZ() + 0.5 - base.z) < hd;
+            }
+            if (!reached && !passed) break;
+            dPathIndex++;
+            if (dPathIndex >= dPath.size()) {
+                dPath = List.of();
+                return 0;
+            }
+            wp = dPath.get(dPathIndex);
+        }
+
+        // hardly moved in 1.5 seconds: avoid the square ahead, re-plan; every second time back up a little
+        if (++dStuckTicks >= 30) {
+            double moved = Math.hypot(base.x - dStuckX, base.z - dStuckZ);
+            dStuckTicks = 0;
+            dStuckX = base.x;
+            dStuckZ = base.z;
+            if (moved < 1.5) {
+                dStuckStrikes++;
+                autoLog(String.format("DOWSE stuck %d at %.1f, %.1f", dStuckStrikes, base.x, base.z));
+                double ax = wp.getX() + 0.5 - base.x;
+                double az = wp.getZ() + 0.5 - base.z;
+                double len = Math.max(0.001, Math.hypot(ax, az));
+                dBlocked.add(BlockPos.asLong(MathHelper.floor(base.x + ax / len * 1.5), MathHelper.floor(base.y + 0.05),
+                    MathHelper.floor(base.z + az / len * 1.5)));
+                dPath = List.of();
+                dReplanIn = 0;
+                releaseKeys(client);
+                if (dStuckStrikes % 2 == 0) {
+                    dBackTicks = 30;
+                    dProbeSign = -dProbeSign;
+                }
+                if (dStuckStrikes >= 6) {
+                    dStuckStrikes = 0;
+                    return 3;
+                }
+                return 0;
+            }
+            dStuckStrikes = 0;
+        }
+
+        // steer toward the waypoint
+        double dx = wp.getX() + 0.5 - base.x;
+        double dz = wp.getZ() + 0.5 - base.z;
+        float desiredYaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0f;
+        player.setYaw(MathHelper.lerpAngleDegrees(0.35f, player.getYaw(), desiredYaw));
+        player.setPitch(MathHelper.lerp(0.3f, player.getPitch(), 8.0f));
+        float bodyYaw = mount != null ? mount.getYaw() : player.getYaw();
+        float err = MathHelper.wrapDegrees(desiredYaw - bodyYaw);
+        float camVsBody = Math.abs(MathHelper.wrapDegrees(player.getYaw() - bodyYaw));
+        if (mount != null && Math.abs(err) > 25 && camVsBody < 20) dSteerTicks++;      // camera is right but the mount is not
+        else if (Math.abs(err) < 15) dSteerTicks = 0;
+        if (dSteerTicks > 15 && !dUseSteer) {
+            dUseSteer = true;
+            autoLog("DOWSE the mount does not follow the camera - steering with A / D as well");
+        }
+        boolean steerLeft = dUseSteer && err < -10;
+        boolean steerRight = dUseSteer && err > 10;
+        boolean forward = Math.abs(err) < (dUseSteer ? 75 : 55);
+
+        Entity mover = mount != null ? mount : player;
+        Vec3d vel = mover.getVelocity();
+        boolean barely = vel.x * vel.x + vel.z * vel.z < 0.0025;
+        double dy = wp.getY() - base.y;
+        boolean jump = mover.isOnGround()
+            && ((dy > 0.6 && Math.hypot(dx, dz) < 2.5) || (mover.horizontalCollision && barely && forward));
+
+        client.options.forwardKey.setPressed(forward);
+        client.options.backKey.setPressed(false);
+        client.options.leftKey.setPressed(steerLeft);
+        client.options.rightKey.setPressed(steerRight);
+        client.options.sprintKey.setPressed(false);
+        client.options.jumpKey.setPressed(jump);
+        keysHeld = true;
+        return 0;
     }
 
     // ============================== Area Zero centre ==============================
@@ -4031,6 +4563,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             }
         }
         if (autoCleanEnabled && now >= cleanCooldownUntil && freeSlots(client.player) <= INVENTORY_FREE_THRESHOLD) {
+            if (task == Task.DOWSE) stopDowse(client, "Inventory nearly full - cleaning up first.");
             startClean(client, true);
             return;
         }
@@ -4050,6 +4583,8 @@ public class RadiantAlertClient implements ClientModInitializer {
                 }
             }
         }
+        // Area Zero: ride Ursaluna with the Zygarde Cube in hand and hunt dowsing spots whenever nothing else is going on
+        if (areaZeroMode && autoCatchEnabled && task == Task.IDLE && inAreaZero(client)) startDowse(client);
     }
 
     // ============================== Party ==============================
@@ -4760,9 +5295,9 @@ public class RadiantAlertClient implements ClientModInitializer {
                     autoLog(String.format("HOOPA crouch + right-click: distance=%.1f sneaking=%s result=%s",
                         (double) player.distanceTo(hEntity), player.isSneaking(), result));
                 }
-                if (hTicks > 4 && hEntity.isRemoved()) {
-                    hoopaMountedAt = System.currentTimeMillis();
-                    stopHoopa(client, shoulderLabel + " is on your shoulder.");
+                if (hTicks > 4 && (rideMode ? player.hasVehicle() : hEntity.isRemoved())) {
+                    if (!rideMode) hoopaMountedAt = System.currentTimeMillis();
+                    stopHoopa(client, rideMode ? "Riding " + shoulderLabel + "." : shoulderLabel + " is on your shoulder.");
                     return;
                 }
                 if (hTicks >= 60) {
@@ -4856,6 +5391,10 @@ public class RadiantAlertClient implements ClientModInitializer {
         hGuiTicks++;
         Screen screen = client.currentScreen;
         if (screen == null) { hGuiTicks = 0; return; }
+        if (rideMode && sneakHeld && hGuiTicks == 1) {   // the wheel is open: let go of crouch, or getting on would dismount us again
+            client.options.sneakKey.setPressed(false);
+            sneakHeld = false;
+        }
         if (hGuiTicks == 1) {
             dumpObject("WHEEL", screen, 0, Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>()), new int[]{0});
         }
@@ -4913,7 +5452,7 @@ public class RadiantAlertClient implements ClientModInitializer {
             for (Object o : reachable) {
                 if (o == screen) continue;
                 String label = optionLabel(o);
-                if (!label.contains("shoulder")) continue;
+                if (!(rideMode ? (label.contains("ride") || label.contains("mount")) : label.contains("shoulder"))) continue;
                 autoLog("HOOPA wheel: candidate " + o.getClass().getName() + " (" + label.trim() + ")");
                 if (invokeOptionAction(o)) return true;
             }
@@ -5032,6 +5571,7 @@ public class RadiantAlertClient implements ClientModInitializer {
     private void stopHoopa(MinecraftClient client, String message) {
         boolean backToWormhole = hoopaReturn;
         hoopaReturn = false;
+        rideMode = false;
         task = Task.IDLE;
         hEntity = null;
         releaseKeys(client);
